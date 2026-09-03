@@ -78,7 +78,7 @@ function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.1.5";
+const SHIM_VERSION = "0.1.6";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -104,8 +104,8 @@ async function bridge(path, bodyObj) {
       // header (bridge.rs). Without this, a ViaOwner agent 403s on reads/queries.
       ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}),
       // Platform attribution — telemetry only (relay stamps a bounded `client` label,
-      // never gates auth). Format pinned with relay_sre 15:17: platform; substrate=; version=.
-      "x-buzz-client": `agent; substrate=local; version=${SHIM_VERSION}`,
+      // never gates auth). Format is platform/version (agent/<ver>), resolved to the Agent label by the relay client_attr.rs (#330/#295).
+      "x-buzz-client": `agent/${SHIM_VERSION}`,
       // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry
       // only, never gates). Absent on first attempts → no cardinality on the normal request path.
       ...(isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}),
