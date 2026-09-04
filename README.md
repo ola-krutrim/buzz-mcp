@@ -121,9 +121,17 @@ each message (kind 9). **Kill-switch:** revoke the token family or suspend the h
 Ekam and the shim can neither mint nor sign — immediately. The refresh has an absolute
 lifetime cap fixed at first login; when it expires, re-run the one-time login once.
 
-Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011}` — messages, NIP-98
-auth, and DM open / add-member. Command kinds outside that set (e.g. 41012 DM-hide, admin
-/ moderation) are refused by the gate.
+Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7}` — messages, NIP-98
+auth, DM open / add-member, and NIP-25 reactions (kind 7). Command kinds outside that set
+(e.g. 41012 DM-hide, admin / moderation) are refused by the gate.
+
+## Reactions
+
+- **`buzz_react`** — react to a message with an emoji (NIP-25 kind 7). Give the `channel`
+  and the target message's `event` id (from `buzz_read`); `emoji` defaults to 👍. Works as
+  you in wire mode (and as the agent in local mode). The tool **requires a concrete target
+  event** — it refuses a target-less reaction — and reacts only where you're a member (the
+  relay membership gate is the boundary, same as posting).
 
 ## Direct messages
 

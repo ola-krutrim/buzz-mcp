@@ -120,7 +120,25 @@ export function makeWireTokenProvider(env, fetchFn) {
 //   27235 = NIP-98 HTTP auth — THIS shim's per-request transport auth event
 //   41010 = DM_OPEN, 41011 = DM_ADD_MEMBER — DM membership commands (v199, ekam #322).
 //           NOTE command kinds, not messages; server refuses 41012/41001/other commands.
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011]);
+//   7     = NIP-25 reaction (ekam #325 / v203) — a low-sensitivity ack, not a command.
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7]);
+
+// Build a NIP-25 reaction (kind 7) template, ENFORCING a concrete target event id — the
+// condition ekam + security set when Ekam stayed content-agnostic for kind 7 (#325): a
+// target-less reaction never reaches the signer. e-tag = the message reacted to; k-tag =
+// its kind; h-tag routes it to the channel (relay membership gate = WHERE boundary); p-tag
+// (author) is added only when it's a valid pubkey. content = the emoji (default "+").
+export function reactionTemplate({ targetId, targetAuthor, targetKind, channelId, emoji } = {}) {
+  const id = String(targetId || "").trim();
+  if (!id) throw new Error("buzz_react: a concrete target event id is required — refusing a target-less reaction (kind 7 must carry an `e` tag)");
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_react: a channel is required to route the reaction (h-tag)");
+  const tags = [["e", id], ["k", String(targetKind || 9)], ["h", chan]];
+  const author = String(targetAuthor || "").trim().toLowerCase();
+  if (/^[0-9a-f]{64}$/.test(author)) tags.push(["p", author]);
+  const content = String(emoji ?? "").trim() || "+";
+  return { kind: 7, tags, content };
+}
 
 function normalizePubkey(v) {
   const s = (v || "").trim();
@@ -209,7 +227,7 @@ export async function resolveSigner(opts = {}) {
       ekamBase: () => base,
       async sign(template) {
         if (!WIRE_ALLOWLIST.has(template.kind))
-          throw new Error(`wire mode refuses kind ${template.kind} (allowlist {9, 22242, 27235})`);
+          throw new Error(`wire mode refuses kind ${template.kind} (allowlist {${[...WIRE_ALLOWLIST].sort((a, b) => a - b).join(", ")}})`);
         const token = await tokens.get(false);
         try {
           return await wireSign(base, token, template, fetchFn);

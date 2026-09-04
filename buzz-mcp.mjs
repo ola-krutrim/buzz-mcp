@@ -5,7 +5,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner } from "./signer.mjs";
+import { resolveSigner, reactionTemplate } from "./signer.mjs";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir, hostname } from "node:os";
@@ -82,7 +82,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.2";
+const SHIM_VERSION = "0.2.3";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -292,6 +292,7 @@ const TOOLS = [
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
   { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered).", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" } }, required: ["channel", "text"] } },
+  { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is 👍.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to 👍" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
   { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
@@ -365,9 +366,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
-        return `[${t}] ${who}: ${e.content}`;
+        // include a short event id so buzz_react has a target to point at (react by this id).
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
       });
-      return ok(`#${ch.name} (${rows.length} msgs):\n` + (rows.join("\n") || "(empty)"));
+      return ok(`#${ch.name} (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
     }
 
     if (name === "buzz_post") {
@@ -399,6 +401,49 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}: ${a.text}`);
     }
 
+    if (name === "buzz_react") {
+      if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${EXPECTED_PK.slice(0, 16)}…. Not reacting as the wrong identity.` }], isError: true };
+      const ch = await resolveChannel(a.channel);
+      // Resolve the target: accept a full event id OR the short <id> prefix that buzz_read
+      // prints. Try an exact id lookup first; if that misses, treat the input as a prefix and
+      // find the unique recent message in this channel whose id starts with it. This makes
+      // "react to what I just read" work, since buzz_read surfaces the 8-char prefix.
+      let targetId = String(a.event || "").trim();
+      if (!targetId) throw new Error("buzz_react needs a target event id (the <id> shown by buzz_read) — refusing a target-less reaction");
+      const isFullId = /^[0-9a-f]{64}$/i.test(targetId);
+      // Resolve the target IN the named channel and FAIL CLOSED if it isn't there. Both paths
+      // query with "#h":[ch.id], so a resolved hit is proven to belong to the channel we're
+      // reacting in — the shim never signs a reaction to an unproven or cross-channel target
+      // (stronger than "has some e tag"; not relying on relay rejection after Ekam signs). [codex_kavach]
+      let hit = null;
+      if (isFullId) {
+        // full event id → channel-scoped exact lookup (works for any age; not a recency scan)
+        hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — reactions must target a message in the channel you name`);
+      } else {
+        // short <id> prefix from buzz_read → scan THIS channel and match by prefix.
+        // NEVER put a prefix in an `ids` filter — the relay rejects a non-64-hex id.
+        const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
+        const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        hit = pref[0];
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+      }
+      // Belt-and-braces: assert the resolved target carries h = this channel before signing.
+      if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
+        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel reaction`);
+      targetId = hit.id;
+      const author = hit.pubkey || "", tkind = hit.kind || 9;
+      const emoji = (a.emoji && String(a.emoji).trim()) || "👍";
+      // reactionTemplate REFUSES a target-less reaction (throws) → surfaced as a tool error.
+      const tmpl = reactionTemplate({ targetId, targetAuthor: author, targetKind: tkind, channelId: ch.id, emoji });
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);   // owner attestation (agent mode; absent in wire mode)
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      const who = author ? ((await profiles())[author] || author.slice(0, 8)) : "";
+      return ok(`reacted ${emoji} to ${who ? `${who}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
+    }
+
     // ---- DM tools (v0.2.1) ----
     const dmRefuse = () => ({ content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not acting as the wrong identity.` }], isError: true });
 
@@ -426,9 +471,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
-        return `[${t}] ${who}: ${e.content}`;
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
       });
-      return ok(`DM [${chan}] (${rows.length} msgs):\n` + (rows.join("\n") || "(empty)"));
+      return ok(`DM [${chan}] (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
     }
 
     if (name === "buzz_dm_open") {

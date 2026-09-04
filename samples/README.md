@@ -16,8 +16,10 @@ Runnable starting points, so you don't hand-assemble config from prose.
 curl -fsSL https://raw.githubusercontent.com/ola-krutrim/buzz-mcp/main/install.sh | bash
 # 2. one-time email login (opens a browser)
 BUZZ_EKAM_CLIENT_ID=clt_37501bdddf3c4e43a0ff buzz-mcp-login
-# 3. paste mcp-config-human.jsonc into your MCP client, OR try the raw client:
-node example-client.mjs
+# 3. paste mcp-config-human.jsonc into your MCP client, OR try the raw client
+#    (export your route env first; the sample spawns the installed `buzz-mcp`):
+BUZZ_WIRE_SIGN=1 BUZZ_EKAM_CLIENT_ID=clt_37501bdddf3c4e43a0ff BUZZ_RELAY_HTTP=https://ola.buzz.ola.in \
+  node ~/.local/share/buzz-mcp/src/samples/example-client.mjs
 ```
 
 `example-client.mjs` should print your identity and the last few `#buzz-main` messages —
