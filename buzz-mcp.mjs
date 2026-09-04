@@ -4,9 +4,8 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { finalizeEvent, getPublicKey, generateSecretKey } from "nostr-tools/pure";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveKey } from "./loadkey_v2.mjs";
+import { resolveSigner } from "./signer.mjs";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir, hostname } from "node:os";
@@ -33,8 +32,12 @@ function sessionId() {
 // restart recovers a STABLE identity — Phase 1: env pin / 0600 keystore; Phase 2:
 // BUZZ_SERVICE_REFRESH → exchange → wire-key in memory — or fails LOUD, never a
 // silent random pubkey. UNNAMED casual sessions keep per-terminal `.hex`/random.
-const SK = await resolveKey({ sessionId: sessionId() });
-const PK = getPublicKey(SK);
+// The signing seam (signer.mjs): local mode (default) resolves a key via loadkey_v2
+// and signs in-process; wire mode (BUZZ_WIRE_SIGN + Ekam human token) holds NO key
+// and calls /v1/me/wire-sign so events are signed AS the user (#317, Path A). PK is
+// the identity's pubkey either way.
+const signer = await resolveSigner({ sessionId: sessionId() });
+const PK = signer.pubkey;
 
 // ---- context-derived friendly name (like Codex): <repo-or-dir>·<memorable> ----
 const ANIMALS = ["otter","falcon","lynx","heron","ibex","marten","tern","shrike","vireo",
@@ -67,18 +70,19 @@ if (!IDENTITY_OK)
   process.stderr.write(`[buzz-mcp] ⚠ IMPERSONATION GUARD: config expects ${EXPECTED_PK.slice(0, 16)} but running key is ${PK.slice(0, 16)} (${MY_NAME}). WRITES DISABLED. Fix: pin the correct key, or launch with your own CLAUDE_CONFIG_DIR.\n`);
 
 // ---- NIP-98 auth header for the HTTP bridge ----
-function nip98(url, method, body) {
+// Async: in wire mode signing is a network round-trip to Ekam's /v1/me/wire-sign
+// (the per-request cost of "post as the user"); in local mode it's in-process.
+// created_at is stamped by the signer (local) or the server (wire, anti-backdating).
+async function nip98(url, method, body) {
   const payload = createHash("sha256").update(body ?? "").digest("hex");
-  const ev = finalizeEvent(
-    { kind: 27235, created_at: Math.floor(Date.now() / 1000),
-      tags: [["u", url], ["method", method], ["payload", payload]], content: "" },
-    SK,
+  const ev = await signer.sign(
+    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload]], content: "" },
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.1.6";
+const SHIM_VERSION = "0.2.1";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -95,11 +99,14 @@ async function bridge(path, bodyObj) {
   // Fresh NIP-98 per attempt (a replayed NIP-98 would be rejected); the body — incl. any signed Nostr
   // event and its deterministic id — is unchanged, so a retried /events dedups server-side (ON CONFLICT
   // DO NOTHING before side effects, per relay ingest.rs). Reads are idempotent regardless.
-  const attempt = (isRetry, rClass) => fetch(dialUrl, {
+  // The auth header is SIGNED before the fetch and passed in — so a wire-mode sign
+  // failure (revoked/scope-denied Ekam token) surfaces as its own auth error and is
+  // NOT swallowed by the transient transport-retry below (kill-switch stays legible).
+  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": nip98(signUrl, "POST", body),
+      "Authorization": authz,
       // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag`
       // header (bridge.rs). Without this, a ViaOwner agent 403s on reads/queries.
       ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}),
@@ -114,15 +121,17 @@ async function bridge(path, bodyObj) {
   });
   let res;
   try {
-    res = await attempt(false);
+    res = await attempt(await nip98(signUrl, "POST", body), false);
   } catch (e) {
     // NETWORK-level throw only (dead pooled socket / reset / connect timeout). HTTP errors return a
     // response (handled below) and are NEVER retried — a 401/403/4xx is not a throw. One retry on a
     // fresh attempt (undici evicts the errored socket, so the retry does not reuse it). Counted, not silent.
+    // A wire-sign auth failure is NOT a transport throw — the nip98() above is outside this catch, so a
+    // revoked token surfaces directly (as `wire-sign … HTTP 403`), never masked as "transient".
     const rClass = retryClass(e);
     process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying once\n`);
     try {
-      res = await attempt(true, rClass);
+      res = await attempt(await nip98(signUrl, "POST", body), true, rClass); // fresh sign for the retry
     } catch {
       // A failed retry never reaches the relay → the tool result is its only home (visible to the agent).
       throw new Error(`${path} -> transient fetch failed [retried 1x fresh-conn, still failed; class=${rClass}]`);
@@ -154,16 +163,16 @@ async function publishProfile(name) {
     about: `${AGENT_MODEL} · ${AGENT_HARNESS} · ${AGENT_INTERFACE} · ${host}`,
     model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE,
   };
-  const ev = finalizeEvent({ kind: 0, created_at: Math.floor(Date.now() / 1000), tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }, SK);
+  const ev = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) });
   const res = await bridge("/events", ev);
   // best-effort structured agent card (relay may gate the kind; the kind:0 above always applies)
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
-    const cardEv = finalizeEvent({
-      kind: KIND_AGENT_PROFILE, created_at: Math.floor(Date.now() / 1000),
+    const cardEv = await signer.sign({
+      kind: KIND_AGENT_PROFILE,
       tags: [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]],
       content: JSON.stringify(card),
-    }, SK);
+    });
     await bridge("/events", cardEv);
   } catch { /* non-fatal */ }
   return res;
@@ -204,6 +213,75 @@ async function resolveChannel(nameOrId) {
   return hit;
 }
 
+// ---- DM helpers (v0.2.1) ----
+// DMs are dm-type channels (kind:39000 with a ["t","dm"] tag) carrying kind:9 messages,
+// membership-gated. Discovery reuses the member-first path; participants are the p-tags
+// on the 39000. Opening a DM is a kind:41010 (DM_OPEN) command; sending is a kind:9.
+async function dmChannels() {
+  const memberEvs = await query([{ kinds: [39002], "#p": [PK], limit: 1000 }]);
+  const ids = [...new Set((memberEvs || []).map((e) => Object.fromEntries((e.tags || []).map((x) => [x[0], x[1]])).d).filter(Boolean))];
+  if (!ids.length) return [];
+  const metaEvs = await query([{ kinds: [39000], "#d": ids, limit: 1000 }]);
+  return (metaEvs || [])
+    .filter((e) => (e.tags || []).some((t) => t[0] === "t" && t[1] === "dm"))
+    .map((e) => {
+      const t = Object.fromEntries((e.tags || []).map((x) => [x[0], x[1]]));
+      const participants = [...new Set((e.tags || []).filter((x) => x[0] === "p").map((x) => x[1]))];
+      return { id: t.d, name: t.name || "DM", participants, others: participants.filter((p) => p !== PK) };
+    })
+    .filter((c) => c.id);
+}
+// Resolve a recipient token → pubkey hex. npub / hex / exact display-name today;
+// email → Ekam directory resolver (v0.2.1, isolated in resolveEmail below).
+async function resolveRecipient(to) {
+  const s = String(to || "").trim();
+  if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
+  if (s.startsWith("npub")) { const d = nip19.decode(s); if (d.type === "npub") return d.data; throw new Error(`bad npub: ${s}`); }
+  if (s.includes("@")) return await resolveEmail(s);
+  const names = await profiles();
+  const hits = Object.entries(names).filter(([, n]) => String(n).toLowerCase() === s.toLowerCase()).map(([pk]) => pk);
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) throw new Error(`"${to}" is ambiguous (${hits.length} people share that name) — use an npub or email`);
+  throw new Error(`can't resolve recipient "${to}" — pass an npub, hex pubkey, email, or exact display name`);
+}
+// email→pubkey via Ekam's directory resolver (ekam #324): GET /v1/directory/resolve?email=,
+// bearer the wire:sign token (same WHO-gate, no new credential). Returns the CANONICAL live
+// pubkey for governed recipients only — a `404 not_governed` is the SAFE signal to fall back
+// to npub/name (Ekam won't mint a device-key user a key they never read on). Wire-mode only.
+async function resolveEmail(email) {
+  if (signer.mode !== "wire" || typeof signer.ekamToken !== "function")
+    throw new Error(`email addressing needs wire mode ("post as me") — pass an npub, hex pubkey, or exact display name instead`);
+  const base = (signer.ekamBase ? signer.ekamBase() : (process.env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com")).replace(/\/+$/, "");
+  const res = await fetch(`${base}/v1/directory/resolve?email=${encodeURIComponent(email)}`, { headers: { Authorization: `Bearer ${await signer.ekamToken()}` } });
+  const text = await res.text();
+  if (res.ok) {
+    let j; try { j = JSON.parse(text); } catch { throw new Error(`directory resolve returned non-JSON: ${text.slice(0, 120)}`); }
+    if (j.nostr_pub && /^[0-9a-f]{64}$/i.test(j.nostr_pub)) return j.nostr_pub.toLowerCase();
+    throw new Error(`directory resolve returned no nostr_pub for "${email}": ${text.slice(0, 120)}`);
+  }
+  let err = ""; try { err = JSON.parse(text).error || ""; } catch { /* keep */ }
+  if (res.status === 404 && err === "not_governed")
+    throw new Error(`"${email}" has no Ekam wire identity yet (device-key user) — DM them by npub or display name instead`);
+  if (res.status === 404)
+    throw new Error(`no directory identity for "${email}" in your workspace`);
+  throw new Error(`directory resolve "${email}" -> HTTP ${res.status}: ${text.slice(0, 120)}`);
+}
+// Open (idempotent) a DM with the given OTHER-participant pubkeys → { channelId, created }.
+async function openDm(others) {
+  if (!others.length || others.length > 8) throw new Error(`a DM needs 1–8 other participants (got ${others.length})`);
+  const ev = await signer.sign({ kind: 41010, tags: others.map((p) => ["p", p]), content: "" });
+  const res = await bridge("/events", ev);
+  let channelId = null, created = null;
+  try { const j = JSON.parse(String((res && res.message) || "").replace(/^response:/, "")); channelId = j.channel_id; created = j.created; } catch { /* fall back to listing */ }
+  if (!channelId) {
+    const set = new Set(others);
+    const hit = (await dmChannels()).find((c) => c.others.length === others.length && c.others.every((p) => set.has(p)));
+    channelId = hit && hit.id;
+  }
+  if (!channelId) throw new Error("open_dm: relay did not return a channel id");
+  return { channelId, created };
+}
+
 // ---- MCP server ----
 const server = new Server({ name: "buzz", version: "0.1.0" }, { capabilities: { tools: {} } });
 
@@ -214,6 +292,10 @@ const TOOLS = [
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
   { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered).", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" } }, required: ["channel", "text"] } },
+  { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
+  { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
+  { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
+  { name: "buzz_dm_send", description: "Send a direct message to a person — opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" } }, required: ["to", "text"] } },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -233,6 +315,13 @@ async function relayInfo() {
   return RELAY_INFO;
 }
 const keyProvenance = () => {
+  // wire mode: no key on this host at all — Ekam signs each event with the user's
+  // escrowed key via a revocable token. The impersonation pin still applies to PK.
+  if (signer.mode === "wire") {
+    const base = "wire-sign (Ekam human token; NO key on disk) — posts AS the user";
+    if (EXPECTED_PK) return IDENTITY_OK ? `${base}; pin VERIFIED ✅` : `⚠ IMPERSONATION GUARD TRIPPED: user pubkey ${PK.slice(0, 16)}… ≠ expected ${EXPECTED_PK.slice(0, 16)}… — WRITES DISABLED`;
+    return base;
+  }
   const base = (process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY_KEY)
     ? "key-pinned via env" : "⚠ no key in env — keyring or RANDOM per-session";
   if (EXPECTED_PK) return IDENTITY_OK
@@ -254,6 +343,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "buzz_setname") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — key ${PK.slice(0, 16)}… ≠ pinned ${EXPECTED_PK.slice(0, 16)}… (running as ${MY_NAME}). Not writing a profile as the wrong agent.` }], isError: true };
+      if (signer.mode === "wire") return { content: [{ type: "text", text: `refused: wire mode posts as the user — the display name is the user's own profile (kind:0), not settable from the shim.` }], isError: true };
       await publishProfile(a.name);
       return ok(`renamed this session to "${a.name}" on the fleet.`);
     }
@@ -303,10 +393,58 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const pk = byName[m.slice(1).toLowerCase()];
         if (pk) tags.push(["p", pk]);
       }
-      const ev = finalizeEvent({ kind: 9, created_at: Math.floor(Date.now() / 1000), tags, content: a.text }, SK);
+      const ev = await signer.sign({ kind: 9, tags, content: a.text });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
       return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}: ${a.text}`);
+    }
+
+    // ---- DM tools (v0.2.1) ----
+    const dmRefuse = () => ({ content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not acting as the wrong identity.` }], isError: true });
+
+    if (name === "buzz_dm_list") {
+      const dms = await dmChannels();
+      if (!dms.length) return ok("(no direct messages)");
+      const names = await profiles();
+      return ok(dms.map((c) => {
+        const label = c.others.map((p) => names[p] || p.slice(0, 8)).join(", ") || "(just you)";
+        return `${label}${c.others.length > 1 ? ` (group, ${c.participants.length})` : ""}  [${c.id}]`;
+      }).join("\n"));
+    }
+
+    if (name === "buzz_dm_read") {
+      let chan = a.channel;
+      if (!chan && a.to) {
+        const pk = await resolveRecipient(a.to);
+        const hit = (await dmChannels()).find((c) => c.others.length === 1 && c.others[0] === pk);
+        if (!hit) return ok(`no existing 1:1 DM with ${a.to} yet — use buzz_dm_send to start one.`);
+        chan = hit.id;
+      }
+      if (!chan) return { content: [{ type: "text", text: "buzz_dm_read needs `to` (the other person) or `channel` (dm id)." }], isError: true };
+      const names = await profiles();
+      const evs = await query([{ kinds: [9], "#h": [chan], limit: a.limit || 30 }]);
+      const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
+        const who = names[e.pubkey] || e.pubkey.slice(0, 8);
+        const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
+        return `[${t}] ${who}: ${e.content}`;
+      });
+      return ok(`DM [${chan}] (${rows.length} msgs):\n` + (rows.join("\n") || "(empty)"));
+    }
+
+    if (name === "buzz_dm_open") {
+      if (!IDENTITY_OK) return dmRefuse();
+      const pk = await resolveRecipient(a.to);
+      const { channelId, created } = await openDm([pk]);
+      return ok(`DM ${created ? "opened" : "already exists"} with ${a.to}: ${channelId}`);
+    }
+
+    if (name === "buzz_dm_send") {
+      if (!IDENTITY_OK) return dmRefuse();
+      const pk = await resolveRecipient(a.to);
+      const { channelId } = await openDm([pk]);
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: a.text });
+      await bridge("/events", ev);
+      return ok(`sent DM to ${a.to} [${channelId}]: ${a.text}`);
     }
 
     return ok(`unknown tool: ${name}`);
@@ -317,8 +455,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // auto-register this session's context-derived friendly name (best-effort).
 // Skipped on impersonation-guard trip: never publish a profile AS the wrong agent.
-if (IDENTITY_OK) publishProfile(MY_NAME).catch(() => {});
-else process.stderr.write(`[buzz-mcp] profile publish skipped (impersonation guard).\n`);
+// Also skipped in wire mode: kind:0/10100 are not in the wire-sign allowlist, and the
+// display name belongs to the USER's own profile — the shim must not overwrite it.
+if (IDENTITY_OK && signer.canSign(0)) publishProfile(MY_NAME).catch(() => {});
+else if (IDENTITY_OK && signer.mode === "wire") process.stderr.write(`[buzz-mcp] profile publish skipped (wire mode: posts as the user; kind:0/10100 not in the wire-sign allowlist).\n`);
+else if (!IDENTITY_OK) process.stderr.write(`[buzz-mcp] profile publish skipped (impersonation guard).\n`);
 
 // fail-LOUD environment surfacing at boot (warn to stderr, never brick — see CLI-never-break):
 // makes the resolved identity + relay explicit every start, so a clobbered key or a
