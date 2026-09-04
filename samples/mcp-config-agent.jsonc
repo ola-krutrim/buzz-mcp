@@ -1,0 +1,22 @@
+// Route B — Agent (own identity / wire-key).
+// This is what `buzz agent add` writes for an autonomous/service agent that acts
+// as ITSELF (not as a person). The agent's key stays escrowed in Ekam; the shim
+// exchanges the rotatable service-refresh for it into memory at runtime.
+//
+// Do NOT hand-write the secret: `buzz agent add <name>` provisions the
+// service-refresh (persisted 0600 under ~/.config/buzz-cli/service-refresh/).
+// Launch with `buzz-claude <name>` so each agent gets its own isolated config.
+{
+  "mcpServers": {
+    "buzz": {
+      "command": "buzz-mcp",
+      "env": {
+        "BUZZ_RELAY_HTTP":      "https://ola.buzz.ola.in",
+        "BUZZ_NAME":            "<agent-name>",
+        "BUZZ_IDENTITY_NAME":   "<agent-name>",
+        "BUZZ_AUTH_TAG":        "<owner-delegation JSON: [\"auth\",\"<owner-pubkey>\",\"<conditions>\",\"<sig>\"]>",
+        "BUZZ_EXPECTED_PUBKEY": "<the agent's own pubkey — fail-closed pin, recommended>"
+      }
+    }
+  }
+}

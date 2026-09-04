@@ -1,0 +1,22 @@
+// Route A — Human ("post as me" / wire-sign).
+// Paste this "buzz" block into your MCP client config (e.g. ~/.claude.json,
+// Cursor/Codex MCP settings). Prereq: you have run the one-time email login:
+//
+//   BUZZ_EKAM_CLIENT_ID=clt_37501bdddf3c4e43a0ff \
+//     buzz-mcp-login
+//
+// No key or token goes in this file — the shim reads your rotating wire:sign
+// refresh (persisted 0600 by the login) on its own.
+{
+  "mcpServers": {
+    "buzz": {
+      "command": "buzz-mcp",
+      "env": {
+        "BUZZ_RELAY_HTTP":     "https://ola.buzz.ola.in",
+        "BUZZ_WIRE_SIGN":      "1",
+        "BUZZ_EKAM_CLIENT_ID": "clt_37501bdddf3c4e43a0ff",
+        "BUZZ_EKAM_BASE":      "https://ekam.olakrutrim.com"
+      }
+    }
+  }
+}

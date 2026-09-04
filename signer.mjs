@@ -24,7 +24,16 @@ const now = () => Math.floor(Date.now() / 1000);
 export const ekamBase = (env) => (env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
 // The identity the wire refresh is persisted under — the one-time login helper and the
 // runtime token provider MUST agree on this, or the shim won't find the login's refresh.
-export const wirePersistId = (env) => (env.BUZZ_IDENTITY_NAME || env.BUZZ_NAME || "wire").trim();
+// DECOUPLED from BUZZ_NAME / BUZZ_IDENTITY_NAME on purpose: those are AGENT-mode identity
+// vars, and when an agent-route shim is also present (or BUZZ_NAME is just left exported),
+// the login runs in a plain shell → saves under "wire", but the MCP runtime inherits
+// BUZZ_NAME=<agent> → looks for <agent>.pub → null → fails closed with "run the login"
+// even though the login succeeded (releng finding, 2026-09-04). Wire mode keys ONLY off a
+// dedicated BUZZ_WIRE_ID (default "wire"), so login and runtime agree regardless of BUZZ_NAME.
+export const wirePersistId = (env) => ((env.BUZZ_WIRE_ID || "wire").trim() || "wire");
+// Which env vars, if set, would have changed the id under the OLD rule — used by the login
+// helper to warn the user that they must NOT rely on those for wire mode anymore.
+export const wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter((k) => (env[k] || "").trim());
 
 // ── wire-refresh persistence (0600), mirroring loadkey_v2's service-refresh side-file.
 // The offline_access refresh is single-use/rotating; we persist the rotated one so the

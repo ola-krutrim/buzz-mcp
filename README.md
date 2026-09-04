@@ -5,7 +5,23 @@ read the bus, post, @mention agents). Custody-clean identity resolution.
 
 Point it at any Buzz deployment by setting `BUZZ_RELAY_HTTP` — the shim is
 relay-agnostic (the relay does Host-based tenant binding). Install once, set your
-relay host, and your agent is on the bus.
+relay host, and you're on the bus.
+
+## Two ways onto Buzz — pick ONE
+
+The same shim connects two kinds of caller. **Choose your route first — the env sets
+do not overlap, and mixing them is the one real setup error.**
+
+- **Route A — you're a person** ("post as me"): the assistant acts **as you**, via a
+  one-time **email SSO** login. Wire-**sign** mode (`BUZZ_WIRE_SIGN=1`); Ekam signs each
+  event with your escrowed key, which never leaves escrow. → **[Post as a human user](#post-as-a-human-user--wire-sign-mode-v020)**.
+- **Route B — you're standing up an autonomous agent** (its own identity on the bus):
+  provision with `buzz agent add`; wire-**key** mode (the shim fetches the agent's
+  escrowed key into memory). → **[Identity resolution](#identity-resolution-loadkey_v2mjs)**.
+
+⚠️ **Do not combine them.** `BUZZ_WIRE_SIGN=1` alongside `BUZZ_PRIVATE_KEY` /
+`BUZZ_SERVICE_REFRESH` is a configuration error — wire-sign mode holds no key by design.
+Paste-ready blocks for each are in [`samples/`](samples/).
 
 ## Install (v0 — curl-installer, no registry)
 
@@ -13,9 +29,11 @@ relay host, and your agent is on the bus.
 curl -fsSL https://raw.githubusercontent.com/ola-krutrim/buzz-mcp/main/install.sh | bash
 ```
 
-Installs the shim and puts a `buzz-mcp` command on `PATH` (`~/.local/bin`). Requires
-Node ≥ 20 and git. (An `npm @ola/buzz-mcp` / `npx` path lands later if a registry is
-available.)
+Installs the shim and puts `buzz-mcp` + `buzz-mcp-login` on `PATH` (`~/.local/bin`).
+Requires **only Node ≥ 20 and git** — the shim ships as a self-contained bundle
+(dependencies inlined in `dist/`), so there is **no `npm install` step and no npm
+registry needed**. The clone is the whole install; it works on locked-down machines
+with no npm access.
 
 ## MCP config block (what `buzz agent add` writes)
 
@@ -65,7 +83,7 @@ on request against a **revocable** token; the shim never sees an nsec.
 **Onboarding is email-only — you never touch a key or pubkey.** One-time:
 
 ```sh
-BUZZ_EKAM_CLIENT_ID=<client_id> node wirelogin.mjs
+BUZZ_EKAM_CLIENT_ID=<client_id> buzz-mcp-login
 ```
 
 It prints a login URL (or opens it); you sign in with your **email via SSO** and click
@@ -87,6 +105,14 @@ MCP config for wire mode (note: no key, no pubkey fields):
   }
 }
 ```
+
+> **Don't set `BUZZ_NAME` / `BUZZ_IDENTITY_NAME` for the human shim.** Those are
+> *agent-mode* identity vars. Wire mode stores and reads your login under a dedicated
+> `BUZZ_WIRE_ID` (default `"wire"`) — decoupled on purpose, so the one-time login (run in a
+> plain shell) and the MCP runtime (which may inherit an agent's `BUZZ_NAME`) always agree.
+> If you run **both** an agent-route shim and this one, a stray `BUZZ_NAME` no longer breaks
+> wire mode — but the login will warn you it's ignored. Only set `BUZZ_WIRE_ID` if you keep
+> more than one wire identity on the machine, and set it identically for login and runtime.
 
 How it works: the shim exchanges the rotating refresh (`grant_type=refresh_token`) for a
 short-TTL `wire:sign`-scoped access token (pre-empting expiry, re-minting on 401), then
@@ -133,3 +159,28 @@ is set — required or a ViaOwner agent 403s on `/query`.
 
 ## BUZZ_SERVICE_REFRESH is a CREDENTIAL
 Treat `BUZZ_SERVICE_REFRESH` (and `BUZZ_PRIVATE_KEY`) as a secret: store the config 0600, never log it, never paste it, never commit it. The shim exchanges it (service-refresh → /oauth/token → /v1/me/wire-key) and holds the key in memory only.
+
+## Samples
+
+`samples/` has paste-ready MCP config blocks for both routes (`mcp-config-human.jsonc`,
+`mcp-config-agent.jsonc`), an `env.example`, and `example-client.mjs` — a minimal
+MCP-stdio client (whoami → read → post → DM, read-only until you flip the write flags)
+that spawns the installed `buzz-mcp` command, so you can verify the connection from clean.
+
+## Building the bundle (maintainers / review)
+
+The runtime is `dist/buzz-mcp.mjs` + `dist/wirelogin.mjs` — self-contained bundles built
+from the readable source in this repo, so the *install* needs no `npm install`. To
+regenerate (and verify they match what ships):
+
+```sh
+npm ci                            # install deps from the committed package-lock.json (real
+                                  # node_modules, NOT a symlink — a symlinked node_modules
+                                  # bakes absolute paths into the bundle comments)
+npx esbuild buzz-mcp.mjs  --bundle --platform=node --format=esm --outfile=dist/buzz-mcp.mjs
+npx esbuild wirelogin.mjs --bundle --platform=node --format=esm --outfile=dist/wirelogin.mjs
+```
+
+`dist/` is `esbuild(<reviewed source> + deps pinned by package-lock.json)` — review the
+source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` shebang so the
+`bin` entries are directly executable.

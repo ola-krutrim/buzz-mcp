@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // wirelogin.mjs — one-time "post as me" consent (loadkey_v2 Phase-2 login helper).
 //
 // Runs the browser authcode+PKCE flow ONCE to obtain the rotating wire:sign refresh
@@ -12,7 +13,7 @@
 
 import http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireSign } from "./signer.mjs";
+import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireBleedVars, wireSign } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
@@ -108,7 +109,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 <h2 style="margin:0 0 .5rem">✅ Buzz is now connected as you</h2>
 <p>Sign-in complete. The Buzz tool can now post and DM under your identity through Ekam's revocable signer — your key was never shared with it.</p>
 <p style="color:#666">You can safely close this tab.</p></body>`);
-      console.error(`[wire-login] success — wire:sign refresh persisted 0600 (id=${wirePersistId(env)}). The shim is now autonomous. access expires_in=${tok.expires_in || "?"}s`);
+      const pid = wirePersistId(env);
+      console.error(`[wire-login] success — wire:sign refresh persisted 0600 (id=${pid}). The shim is now autonomous. access expires_in=${tok.expires_in || "?"}s`);
+      // The runtime resolves the SAME id (BUZZ_WIRE_ID default "wire") independent of
+      // BUZZ_NAME, so no matching config is needed. But warn if the caller set agent-mode
+      // identity vars — under the pre-0.2.2 rule those changed the id and silently broke
+      // wire mode ("run the login" after a login that worked). They're ignored now; flag
+      // it so a copy-pasted agent config doesn't leave someone chasing a phantom.
+      const bleed = wireBleedVars(env);
+      if (bleed.length)
+        console.error(`[wire-login] note: ${bleed.join(", ")} is set but IGNORED for wire mode (it keys off BUZZ_WIRE_ID, default "wire"). Do NOT set BUZZ_IDENTITY_NAME=<agent> for the human "post as me" shim — that was the old footgun.`);
       setTimeout(() => { try { srv.close(); } catch {} process.exit(0); }, 200);
     } catch (e) {
       res.writeHead(400, { "Content-Type": "text/plain" });
