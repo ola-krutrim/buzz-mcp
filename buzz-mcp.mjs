@@ -88,7 +88,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.8";
+const SHIM_VERSION = "0.2.9";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -151,24 +151,30 @@ async function bridge(path, bodyObj) {
   });
   const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
   let res;
+  // Sign OUTSIDE the transport try/catch. A wire-mode mint/auth failure (revoked token, rotating-
+  // refresh family-revoke, scope-denied) throws HERE and propagates VERBATIM with its own legible
+  // message ("… re-run the one-time login") — it must never be mislabeled unknown_transport, and
+  // never retried, since a mint retry re-presents a spent single-use refresh and compounds the
+  // revoke. ONLY the relay fetch/rawPost throw below is transport-retryable. [releng 05:48 BUG 1]
+  const authz = await nip98(signUrl, "POST", body);
   try {
     // If we've already seen a wedge this process, skip the doomed undici attempt and go straight
     // to the fresh-socket path — so a wedged process keeps working without a restart.
-    if (TRANSPORT_WEDGED) {
-      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, "wedged_reroute"), body);
-    } else {
-      res = await attempt(await nip98(signUrl, "POST", body), false);
-    }
+    res = TRANSPORT_WEDGED
+      ? await rawPost(dialUrl, headersFor(authz, true, "wedged_reroute"), body)
+      : await attempt(authz, false);
   } catch (e) {
     // NETWORK-level throw only (dead pooled socket / reset / connect timeout). HTTP errors return a
     // response (handled below) and are NEVER retried — a 401/403/4xx is not a throw. The retry goes
-    // over a FRESH node:https socket (not the wedged undici pool), and we mark the pool wedged so
-    // every later call reroutes too. A wire-sign auth failure is NOT a transport throw (nip98() is
-    // outside this catch), so a revoked token surfaces directly, never masked as "transient".
+    // over a FRESH node:https socket (not the wedged undici pool), and marks the pool wedged so every
+    // later call reroutes too.
     const rClass = retryClass(e);
     process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket\n`);
+    // Fresh sign for the retry — hoisted out of the inner try so an auth failure here ALSO
+    // propagates verbatim rather than being swallowed as transport. (Cached access → no re-mint.)
+    const authz2 = await nip98(signUrl, "POST", body);
     try {
-      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, rClass), body);
+      res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true; // the raw retry worked where undici didn't → the pool is wedged; reroute from here on
     } catch {
       throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client — reconnect and the shim's own retry do NOT clear a wedged connection pool.`);

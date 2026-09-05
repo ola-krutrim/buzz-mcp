@@ -19495,7 +19495,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.8";
+var SHIM_VERSION = "0.2.9";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19532,9 +19532,9 @@ async function bridge(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
-  const headersFor = (authz, isRetry, rClass) => ({
+  const headersFor = (authz2, isRetry, rClass) => ({
     "Content-Type": "application/json",
-    "Authorization": authz,
+    "Authorization": authz2,
     // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag` header (bridge.rs).
     ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
     // Platform attribution — telemetry only (relay stamps a bounded `client` label, never gates auth).
@@ -19542,20 +19542,18 @@ async function bridge(path, bodyObj) {
     // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
     ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
   });
-  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
+  const attempt = (authz2, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz2, isRetry, rClass), body });
   let res;
+  const authz = await nip98(signUrl, "POST", body);
   try {
-    if (TRANSPORT_WEDGED) {
-      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, "wedged_reroute"), body);
-    } else {
-      res = await attempt(await nip98(signUrl, "POST", body), false);
-    }
+    res = TRANSPORT_WEDGED ? await rawPost(dialUrl, headersFor(authz, true, "wedged_reroute"), body) : await attempt(authz, false);
   } catch (e) {
     const rClass = retryClass(e);
     process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket
 `);
+    const authz2 = await nip98(signUrl, "POST", body);
     try {
-      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, rClass), body);
+      res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true;
     } catch {
       throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client \u2014 reconnect and the shim's own retry do NOT clear a wedged connection pool.`);
