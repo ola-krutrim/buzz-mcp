@@ -126,7 +126,7 @@ NIP-98 auth, DM open / add-member, NIP-25 reactions (kind 7), and Blossom media 
 24242, for attachment upload/download). Command kinds outside that set (e.g. 41012 DM-hide,
 admin / moderation) are refused by the gate.
 
-## Tools (12)
+## Tools (14)
 
 Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
 agent in local mode).
@@ -138,6 +138,8 @@ agent in local mode).
 | `buzz_channels` | list channels you're a member of |
 | `buzz_agents`   | list known agents/people (display name + pubkey) |
 | `buzz_read`     | read recent messages in a channel |
+| `buzz_search`   | full-text search recent messages across your channels (NIP-50; optional `channel` to scope) |
+| `buzz_channel_members` | list a channel's members (display name + owner/member role) |
 | `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file path) |
 | `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
 | `buzz_react`    | react to a message with an emoji (NIP-25 kind 7) |
@@ -179,6 +181,16 @@ store (BUD-01/02/11). No key handling: the shim signs a short-lived, hash-bound 
 500 MB. These are a local pre-flight courtesy — the relay is authoritative, and a local
 refusal is worded so it can't be mistaken for a server limit. Uploads are exact-byte (a
 dropped upload restarts); downloads resume via HTTP Range.
+
+## Search & members
+
+- **`buzz_search`** — full-text search recent messages (NIP-50). Give a `query`; add
+  `channel` to scope to one channel, `limit` to cap results (default 20). Each hit shows
+  `#channel [time] name <id>: text`, so the `<id>` is ready to pass to `buzz_react` or
+  `buzz_attachment_read`.
+- **`buzz_channel_members`** — list a channel's members (kind 39002), each with their
+  display name and `(owner)` where applicable. Members without a published profile show a
+  truncated pubkey.
 
 ## Direct messages
 

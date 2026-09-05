@@ -19367,7 +19367,7 @@ async function resolveSigner(opts = {}) {
 }
 
 // buzz-mcp.mjs
-import { createHash } from "node:crypto";
+import { createHash, randomBytes as randomBytes2 } from "node:crypto";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, appendFileSync, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync3, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
 import { homedir as homedir3, hostname, tmpdir } from "node:os";
@@ -19435,11 +19435,11 @@ if (!IDENTITY_OK)
 async function nip98(url, method, body) {
   const payload = createHash("sha256").update(body ?? "").digest("hex");
   const ev = await signer.sign(
-    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload]], content: "" }
+    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes2(12).toString("hex")]], content: "" }
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.5";
+var SHIM_VERSION = "0.2.6";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19701,6 +19701,8 @@ var TOOLS = [
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
+  { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
+  { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
   { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
   { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
@@ -19785,6 +19787,40 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       });
       return ok(`#${ch.name} (${rows.length} msgs) \u2014 <id> = react target:
 ` + (rows.join("\n") || "(empty)"));
+    }
+    if (name === "buzz_search") {
+      const q = String(a.query || "").trim();
+      if (!q) throw new Error("buzz_search needs a `query` string");
+      const names = await profiles();
+      const cs = await channels();
+      const chById = Object.fromEntries(cs.map((c) => [c.id, c.name]));
+      const filt = { kinds: [9], search: q, limit: Math.min(a.limit || 20, 100) };
+      let scope = "";
+      if (a.channel) {
+        const ch = await resolveChannel(a.channel);
+        filt["#h"] = [ch.id];
+        scope = ` in #${ch.name}`;
+      }
+      const evs = await query([filt]);
+      const rows = (evs || []).sort((x, y) => y.created_at - x.created_at).map((e) => {
+        const who = names[e.pubkey] || e.pubkey.slice(0, 8);
+        const hTag = (e.tags || []).find((t2) => t2[0] === "h");
+        const chan = hTag ? chById[hTag[1]] || hTag[1].slice(0, 8) : "?";
+        const t = new Date(e.created_at * 1e3).toISOString().slice(0, 16).replace("T", " ");
+        return `#${chan} [${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+      });
+      return ok(`search "${q}"${scope} \u2192 ${rows.length} result(s):
+` + (rows.join("\n") || "(none)"));
+    }
+    if (name === "buzz_channel_members") {
+      const ch = await resolveChannel(a.channel);
+      const names = await profiles();
+      const evs = await query([{ kinds: [39002], "#d": [ch.id], limit: 5 }]);
+      const seen = /* @__PURE__ */ new Map();
+      for (const e of evs || []) for (const tg of e.tags || []) if (tg[0] === "p" && tg[1] && !seen.has(tg[1])) seen.set(tg[1], tg[3] || "member");
+      const rows = [...seen].map(([pk, role]) => `${names[pk] || pk.slice(0, 12) + "\u2026"}${role === "owner" ? " (owner)" : ""}`);
+      return ok(`#${ch.name} \u2014 ${rows.length} member(s):
+` + (rows.join("\n") || "(none)"));
     }
     if (name === "buzz_post") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${EXPECTED_PK.slice(0, 16)}\u2026. Not posting as the wrong agent. Fix your pin, or launch with your own CLAUDE_CONFIG_DIR.` }], isError: true };
