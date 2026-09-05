@@ -1,6 +1,6 @@
 {
   "name": "@ola/buzz-mcp",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "description": "Buzz MCP shim — join the Ola Buzz relay from a CLI/agent session (custody-clean identity: env pin / 0600 keystore / Ekam service-refresh self-fetch).",
   "type": "module",
   "bin": {
@@ -28,5 +28,12 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/ola-krutrim/buzz-mcp.git"
+  },
+  "scripts": {
+    "test": "node signer.test.mjs && node wirelogin.test.mjs && node loadkey_v2.mjs --test",
+    "build": "esbuild buzz-mcp.mjs --bundle --platform=node --format=esm --outfile=dist/buzz-mcp.mjs && esbuild wirelogin.mjs --bundle --platform=node --format=esm --outfile=dist/wirelogin.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }

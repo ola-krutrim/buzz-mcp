@@ -19019,7 +19019,7 @@ async function resolveKey(opts = {}) {
   return sk;
 }
 if (process.argv.includes("--test")) {
-  const { rmSync, statSync } = await import("node:fs");
+  const { rmSync, statSync: statSync2 } = await import("node:fs");
   let pass = 0, fail = 0;
   const ok = (c, m) => c ? (pass++, console.log("  \u2705 " + m)) : (fail++, console.log("  \u274C " + m));
   console.log("resolve \u2014 pin caches + keystore recovery (the churn fix):");
@@ -19028,7 +19028,7 @@ if (process.argv.includes("--test")) {
   ok(skToHex(a) === pin, "named + pin \u2192 uses pin (and caches to keystore)");
   const b = await resolveKey({ env: { BUZZ_NAME: "smoke_governed" }, sessionId: "x" });
   ok(skToHex(b) === pin, "named, pin lost \u2192 RECOVERED from keystore (no random)");
-  const mode = statSync(identityFile("smoke_governed")).mode & 511;
+  const mode = statSync2(identityFile("smoke_governed")).mode & 511;
   ok(mode === 384, `keystore file is 0600 \u2014 no Keychain argv leak (SEC-1)`);
   try {
     rmSync(identityFile("smoke_governed"));
@@ -19186,7 +19186,7 @@ function makeWireTokenProvider(env, fetchFn) {
     }
   };
 }
-var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7]);
+var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242]);
 function reactionTemplate({ targetId, targetAuthor, targetKind, channelId, emoji: emoji2 } = {}) {
   const id = String(targetId || "").trim();
   if (!id) throw new Error("buzz_react: a concrete target event id is required \u2014 refusing a target-less reaction (kind 7 must carry an `e` tag)");
@@ -19197,6 +19197,80 @@ function reactionTemplate({ targetId, targetAuthor, targetKind, channelId, emoji
   if (/^[0-9a-f]{64}$/.test(author)) tags.push(["p", author]);
   const content = String(emoji2 ?? "").trim() || "+";
   return { kind: 7, tags, content };
+}
+var BLOSSOM_AUTH_KIND = 24242;
+var BLOSSOM_MAX_TTL = 300;
+var BLOSSOM_CONTENT = { upload: "Upload buzz-media", get: "Get buzz-media" };
+function blossomAuthTemplate({ verb, sha256: sha2562, ttlSeconds, now: now2 } = {}) {
+  if (verb !== "upload" && verb !== "get")
+    throw new Error(`blossom auth: verb must be "upload" or "get" (got ${JSON.stringify(verb)})`);
+  const ttl = Number.isFinite(ttlSeconds) ? ttlSeconds : BLOSSOM_MAX_TTL;
+  if (!(ttl > 0 && ttl <= BLOSSOM_MAX_TTL))
+    throw new Error(`blossom auth: expiration TTL must be 1..${BLOSSOM_MAX_TTL}s (got ${ttlSeconds})`);
+  const nowS = Math.floor((now2 ?? Date.now()) / 1e3);
+  const tags = [["t", verb], ["expiration", String(nowS + ttl)]];
+  const hash = String(sha2562 || "").trim().toLowerCase();
+  if (verb === "upload") {
+    if (!/^[0-9a-f]{64}$/.test(hash))
+      throw new Error("blossom upload auth: a 64-hex sha256 `x` (the exact file hash) is required");
+    tags.push(["x", hash]);
+  } else if (hash) {
+    if (!/^[0-9a-f]{64}$/.test(hash))
+      throw new Error("blossom get auth: sha256 must be 64-hex when provided");
+    tags.push(["x", hash]);
+  }
+  return { kind: BLOSSOM_AUTH_KIND, tags, content: BLOSSOM_CONTENT[verb] };
+}
+function parseImeta(tag) {
+  if (!Array.isArray(tag) || tag[0] !== "imeta") return null;
+  const d = {};
+  for (const part of tag.slice(1)) {
+    const s = String(part);
+    const i2 = s.indexOf(" ");
+    if (i2 < 0) continue;
+    const k = s.slice(0, i2);
+    if (!(k in d)) d[k] = s.slice(i2 + 1);
+  }
+  if (!d.url) return null;
+  return {
+    url: d.url,
+    mime: d.m || null,
+    sha256: d.x ? d.x.toLowerCase() : null,
+    size: d.size != null && /^\d+$/.test(d.size) ? Number(d.size) : null,
+    filename: d.filename || null,
+    dim: d.dim || null
+  };
+}
+function messageAttachments(ev) {
+  return (ev && ev.tags || []).filter((t) => Array.isArray(t) && t[0] === "imeta").map(parseImeta).filter(Boolean);
+}
+function buildImeta({ url, mime, sha256: sha2562, size, filename } = {}) {
+  const u = String(url || "").trim();
+  const x = String(sha2562 || "").trim().toLowerCase();
+  if (!u) throw new Error("imeta: url is required");
+  if (!/^[0-9a-f]{64}$/.test(x)) throw new Error("imeta: a 64-hex sha256 is required");
+  const parts = [`url ${u}`, `x ${x}`];
+  if (mime) parts.push(`m ${mime}`);
+  if (Number.isFinite(size) && size >= 0) parts.push(`size ${size}`);
+  if (filename) parts.push(`filename ${filename}`);
+  return ["imeta", ...parts];
+}
+var MEDIA_MB = 1024 * 1024;
+var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
+var MEDIA_MIME_BY_EXT = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml", ".log": "text/plain", ".zip": "application/zip", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
+function mediaMimeForPath(p) {
+  return MEDIA_MIME_BY_EXT[(String(p).match(/\.[^.\/]+$/) || [""])[0].toLowerCase()] || "application/octet-stream";
+}
+function mediaCapKind(mime) {
+  return mime === "image/gif" ? "gif" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file";
+}
+function mediaCapCheck(filename, size) {
+  const mime = mediaMimeForPath(filename);
+  const kind = mediaCapKind(mime);
+  const cap = MEDIA_CAPS[kind];
+  if (size > cap)
+    throw new Error(`buzz_post: attachment declined LOCALLY \u2014 ${String(filename).split("/").pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${cap / MEDIA_MB | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
+  return { mime, cap, kind };
 }
 function normalizePubkey(v) {
   const s = (v || "").trim();
@@ -19294,8 +19368,10 @@ async function resolveSigner(opts = {}) {
 
 // buzz-mcp.mjs
 import { createHash } from "node:crypto";
-import { homedir as homedir3, hostname } from "node:os";
-import { join as join4, basename } from "node:path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, appendFileSync, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync3, statSync, createReadStream } from "node:fs";
+import { Readable } from "node:stream";
+import { homedir as homedir3, hostname, tmpdir } from "node:os";
+import { join as join4, basename, extname } from "node:path";
 import { execSync } from "node:child_process";
 var RELAY = process.env.BUZZ_RELAY_HTTP || "http://localhost:3000";
 var SIGN_BASE = process.env.BUZZ_SIGN_BASE || RELAY;
@@ -19363,7 +19439,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.3";
+var SHIM_VERSION = "0.2.5";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19413,6 +19489,80 @@ async function bridge(path, bodyObj) {
   }
 }
 var query = (filters) => bridge("/query", filters);
+var MB = MEDIA_MB;
+var TEXT_MIME = /^(text\/|application\/(json|xml|.*\+xml|x-yaml|yaml))/;
+function sha256File(p) {
+  return new Promise((res, rej) => {
+    const h = createHash("sha256");
+    const s = createReadStream(p);
+    s.on("error", rej);
+    s.on("data", (c) => h.update(c));
+    s.on("end", () => res(h.digest("hex")));
+  });
+}
+async function blossomAuthHeader(verb, sha) {
+  const ev = await signer.sign(blossomAuthTemplate({ verb, sha256: sha }));
+  return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
+}
+var DOWNLOAD_CHUNK = 16 * MB;
+async function blossomUpload(filePath) {
+  let st;
+  try {
+    st = statSync(filePath);
+  } catch {
+    throw new Error(`attachment not found: ${filePath}`);
+  }
+  if (!st.isFile()) throw new Error(`attachment is not a file: ${filePath}`);
+  const { mime } = mediaCapCheck(basename(filePath), st.size);
+  const sha = await sha256File(filePath);
+  const res = await fetch(`${RELAY}/upload`, {
+    method: "PUT",
+    headers: { Authorization: await blossomAuthHeader("upload", sha), "X-SHA-256": sha, "Content-Type": mime, "Content-Length": String(st.size), ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {} },
+    body: Readable.toWeb(createReadStream(filePath)),
+    duplex: "half"
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`upload ${basename(filePath)} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let d = {};
+  try {
+    d = JSON.parse(text);
+  } catch {
+  }
+  return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename(filePath) };
+}
+async function blossomDownload(shaExt, destPath) {
+  const sha = String(shaExt).split(".")[0].toLowerCase();
+  const part = destPath + ".part";
+  let start = 0;
+  try {
+    start = statSync(part).size;
+  } catch {
+  }
+  let total = Infinity;
+  while (start < total) {
+    const res = await fetch(`${RELAY}/media/${shaExt}`, { headers: { Authorization: await blossomAuthHeader("get", sha), Range: `bytes=${start}-${start + DOWNLOAD_CHUNK - 1}`, ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {} } });
+    if (res.status === 200) {
+      const buf2 = Buffer.from(await res.arrayBuffer());
+      writeFileSync3(part, buf2);
+      start = buf2.length;
+      total = buf2.length;
+      break;
+    }
+    if (res.status !== 206) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`download <${sha.slice(0, 8)}> -> HTTP ${res.status}: ${t.slice(0, 160)}`);
+    }
+    const cr = res.headers.get("content-range") || "";
+    const m = cr.match(/\/(\d+)\s*$/);
+    if (m) total = Number(m[1]);
+    const buf = Buffer.from(await res.arrayBuffer());
+    start === 0 ? writeFileSync3(part, buf) : appendFileSync(part, buf);
+    start += buf.length;
+    if (!buf.length) break;
+  }
+  renameSync(part, destPath);
+  return destPath;
+}
 var AGENT_MODEL = process.env.BUZZ_MODEL || process.env.ANTHROPIC_MODEL || "anthropic:claude";
 var AGENT_HARNESS = process.env.BUZZ_HARNESS || "claude-code";
 var AGENT_INTERFACE = process.env.BUZZ_INTERFACE || "terminal";
@@ -19552,7 +19702,8 @@ var TOOLS = [
   { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
-  { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered).", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" } }, required: ["channel", "text"] } },
+  { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
+  { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is \u{1F44D}.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to \u{1F44D}" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
@@ -19628,7 +19779,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1e3).toISOString().slice(11, 16);
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+        const atts = messageAttachments(e);
+        const att = atts.length ? " " + atts.map((x) => `\u{1F4CE}${x.filename || x.mime || "file"}`).join("") : "";
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
       });
       return ok(`#${ch.name} (${rows.length} msgs) \u2014 <id> = react target:
 ` + (rows.join("\n") || "(empty)"));
@@ -19655,10 +19808,58 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const pk = byName[m.slice(1).toLowerCase()];
         if (pk) tags.push(["p", pk]);
       }
-      const ev = await signer.sign({ kind: 9, tags, content: a.text });
+      let attached = null, content = a.text;
+      if (a.attachment) {
+        const up = await blossomUpload(String(a.attachment));
+        tags.push(buildImeta(up));
+        content = content ? `${content}
+${up.url}` : up.url;
+        attached = up;
+      }
+      const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}: ${a.text}`);
+      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${a.text}`);
+    }
+    if (name === "buzz_attachment_read") {
+      const ch = await resolveChannel(a.channel);
+      const targetId = String(a.event || "").trim();
+      if (!targetId) throw new Error("buzz_attachment_read needs the message <id> (from buzz_read)");
+      const isFull = /^[0-9a-f]{64}$/i.test(targetId);
+      let hit = null;
+      if (isFull) hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
+      else {
+        const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
+        const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) \u2014 use more characters`);
+        hit = pref[0];
+      }
+      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}\u2026 in #${ch.name} \u2014 use the <id> from buzz_read`);
+      const atts = messageAttachments(hit);
+      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${ch.name} has no attachments.`);
+      const idx = Number.isInteger(a.index) ? a.index : 0;
+      const att = atts[idx];
+      if (!att) throw new Error(`attachment index ${idx} out of range \u2014 message has ${atts.length} (0..${atts.length - 1})`);
+      if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) \u2014 refusing to fetch an unverifiable blob`);
+      const shaExt = basename(new URL(att.url).pathname);
+      const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
+      const dest = join4(tmpdir(), `buzz-att-${att.sha256.slice(0, 16)}${ext}`);
+      await blossomDownload(shaExt, dest);
+      const got = await sha256File(dest);
+      if (got !== att.sha256) throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}\u2026 \u2260 imeta ${att.sha256.slice(0, 12)}\u2026 \u2014 discarded`);
+      const size = statSync(dest).size;
+      const isText = att.mime && TEXT_MIME.test(att.mime) || /\.(md|txt|csv|json|ya?ml|log|tsv)$/i.test(att.filename || shaExt);
+      if (isText) {
+        const full = readFileSync3(dest, "utf8");
+        const CAP = 200 * 1024;
+        const body = full.length > CAP ? `${full.slice(0, CAP)}
+\u2026[truncated ${full.length - CAP} chars \u2014 full file at ${dest}]` : full;
+        return ok(`\u{1F4CE} ${att.filename || shaExt} (${att.mime || "text"}, ${(size / 1024).toFixed(0)} KB) from #${ch.name}:
+
+${body}`);
+      }
+      return ok(`\u{1F4CE} saved ${att.filename || shaExt} \u2192 ${dest}
+   (${att.mime || "binary"}, ${(size / MB).toFixed(2)} MB, sha ${att.sha256.slice(0, 12)}\u2026) \u2014 not text; open the file to view.`);
     }
     if (name === "buzz_react") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${EXPECTED_PK.slice(0, 16)}\u2026. Not reacting as the wrong identity.` }], isError: true };
@@ -19713,7 +19914,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1e3).toISOString().slice(11, 16);
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+        const atts = messageAttachments(e);
+        const att = atts.length ? " " + atts.map((x) => `\u{1F4CE}${x.filename || x.mime || "file"}`).join("") : "";
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
       });
       return ok(`DM [${chan}] (${rows.length} msgs) \u2014 <id> = react target:
 ` + (rows.join("\n") || "(empty)"));

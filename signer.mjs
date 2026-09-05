@@ -121,7 +121,9 @@ export function makeWireTokenProvider(env, fetchFn) {
 //   41010 = DM_OPEN, 41011 = DM_ADD_MEMBER — DM membership commands (v199, ekam #322).
 //           NOTE command kinds, not messages; server refuses 41012/41001/other commands.
 //   7     = NIP-25 reaction (ekam #325 / v203) — a low-sensitivity ack, not a command.
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7]);
+//   24242 = Blossom media auth (ekam #326 / v204) — signs upload/get auth for attachments;
+//           the shim only ever builds these via blossomAuthTemplate() (fail-closed shape).
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242]);
 
 // Build a NIP-25 reaction (kind 7) template, ENFORCING a concrete target event id — the
 // condition ekam + security set when Ekam stayed content-agnostic for kind 7 (#325): a
@@ -138,6 +140,100 @@ export function reactionTemplate({ targetId, targetAuthor, targetKind, channelId
   if (/^[0-9a-f]{64}$/.test(author)) tags.push(["p", author]);
   const content = String(emoji ?? "").trim() || "+";
   return { kind: 7, tags, content };
+}
+
+// ── Blossom (BUD-01/02/11) media auth (kind 24242) — for attachment upload/download.
+// Ekam v204 signs kind 24242, staying content-agnostic; per the security gate (codex_kavach)
+// the SHIM owns the constraints. This builder FAILS CLOSED: verb must be exactly upload|get,
+// content is a FIXED non-empty literal (BUD-11 requires a "human readable string" — an empty
+// content is rejected by the relay's verify_blossom_auth_event before any other check; a fixed
+// literal is as constrained as empty while being valid, and no caller-supplied/free-form text
+// ever rides the field), expiration is present and short (≤ BLOSSOM_MAX_TTL), and an upload
+// MUST carry the exact 64-hex file sha256 as its `x` tag (BUD-11 hash-binding). A `get` may
+// bind the target hash too (preferred — resolve it from a visible message's imeta, never a
+// user-supplied URL). The relay verifies content + BUD-11 (X-SHA-256 == an `x`) + NIP-43 membership.
+export const BLOSSOM_AUTH_KIND = 24242;
+export const BLOSSOM_MAX_TTL = 300; // seconds — ≤5 min per the security gate
+// Fixed, non-caller-supplied content literals (mirror the desktop reference; BUD-11 §"human readable").
+export const BLOSSOM_CONTENT = { upload: "Upload buzz-media", get: "Get buzz-media" };
+export function blossomAuthTemplate({ verb, sha256, ttlSeconds, now } = {}) {
+  if (verb !== "upload" && verb !== "get")
+    throw new Error(`blossom auth: verb must be "upload" or "get" (got ${JSON.stringify(verb)})`);
+  const ttl = Number.isFinite(ttlSeconds) ? ttlSeconds : BLOSSOM_MAX_TTL;
+  if (!(ttl > 0 && ttl <= BLOSSOM_MAX_TTL))
+    throw new Error(`blossom auth: expiration TTL must be 1..${BLOSSOM_MAX_TTL}s (got ${ttlSeconds})`);
+  const nowS = Math.floor((now ?? Date.now()) / 1000);
+  const tags = [["t", verb], ["expiration", String(nowS + ttl)]];
+  const hash = String(sha256 || "").trim().toLowerCase();
+  if (verb === "upload") {
+    if (!/^[0-9a-f]{64}$/.test(hash))
+      throw new Error("blossom upload auth: a 64-hex sha256 `x` (the exact file hash) is required");
+    tags.push(["x", hash]);
+  } else if (hash) {
+    if (!/^[0-9a-f]{64}$/.test(hash))
+      throw new Error("blossom get auth: sha256 must be 64-hex when provided");
+    tags.push(["x", hash]); // target-bound get
+  }
+  return { kind: BLOSSOM_AUTH_KIND, tags, content: BLOSSOM_CONTENT[verb] };
+}
+
+// ── NIP-92 `imeta` media descriptor (how a Buzz kind:9 carries an attachment).
+// A single tag: ["imeta","url <U>","m <mime>","x <sha256>","size <bytes>",("dim WxH"|"filename <name>")…]
+// — each value after the tag name is a space-joined "key value" pair (first key wins).
+export function parseImeta(tag) {
+  if (!Array.isArray(tag) || tag[0] !== "imeta") return null;
+  const d = {};
+  for (const part of tag.slice(1)) {
+    const s = String(part);
+    const i = s.indexOf(" ");
+    if (i < 0) continue;
+    const k = s.slice(0, i);
+    if (!(k in d)) d[k] = s.slice(i + 1); // first value wins
+  }
+  if (!d.url) return null;
+  return {
+    url: d.url,
+    mime: d.m || null,
+    sha256: d.x ? d.x.toLowerCase() : null,
+    size: d.size != null && /^\d+$/.test(d.size) ? Number(d.size) : null,
+    filename: d.filename || null,
+    dim: d.dim || null,
+  };
+}
+// All attachment descriptors on a message event (in tag order).
+export function messageAttachments(ev) {
+  return ((ev && ev.tags) || []).filter((t) => Array.isArray(t) && t[0] === "imeta").map(parseImeta).filter(Boolean);
+}
+// Build a NIP-92 `imeta` tag from an upload result — the exact-hash binding the security
+// gate wants (the tag's `x`/`url` must match what was uploaded). Requires url + 64-hex sha.
+export function buildImeta({ url, mime, sha256, size, filename } = {}) {
+  const u = String(url || "").trim();
+  const x = String(sha256 || "").trim().toLowerCase();
+  if (!u) throw new Error("imeta: url is required");
+  if (!/^[0-9a-f]{64}$/.test(x)) throw new Error("imeta: a 64-hex sha256 is required");
+  const parts = [`url ${u}`, `x ${x}`];
+  if (mime) parts.push(`m ${mime}`);
+  if (Number.isFinite(size) && size >= 0) parts.push(`size ${size}`);
+  if (filename) parts.push(`filename ${filename}`);
+  return ["imeta", ...parts];
+}
+
+// ── Media size caps (mirror the relay per-type defaults: image 50 / gif 10 / file 100 /
+// video 500 MB). A PRE-FLIGHT COURTESY — the relay's 413 is authoritative; this only saves
+// a doomed upload, and its refusal is worded so it can't be mistaken for a server verdict.
+export const MEDIA_MB = 1024 * 1024;
+export const MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
+const MEDIA_MIME_BY_EXT = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml", ".log": "text/plain", ".zip": "application/zip", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
+export function mediaMimeForPath(p) { return MEDIA_MIME_BY_EXT[(String(p).match(/\.[^.\/]+$/) || [""])[0].toLowerCase()] || "application/octet-stream"; }
+export function mediaCapKind(mime) { return mime === "image/gif" ? "gif" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file"; }
+// Throws a DISTINGUISHABLE local-refusal error if `size` exceeds the per-type cap; else returns {mime,cap,kind}.
+export function mediaCapCheck(filename, size) {
+  const mime = mediaMimeForPath(filename);
+  const kind = mediaCapKind(mime);
+  const cap = MEDIA_CAPS[kind];
+  if (size > cap)
+    throw new Error(`buzz_post: attachment declined LOCALLY — ${String(filename).split("/").pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${(cap / MEDIA_MB) | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
+  return { mime, cap, kind };
 }
 
 function normalizePubkey(v) {

@@ -1,11 +1,8 @@
 // Route B — Agent (own identity / wire-key).
 // This is what `buzz agent add` writes for an autonomous/service agent that acts
-// as ITSELF (not as a person). The agent's key stays escrowed in Ekam; the shim
-// exchanges the rotatable service-refresh for it into memory at runtime.
-//
-// Do NOT hand-write the secret: `buzz agent add <name>` provisions the
-// service-refresh (persisted 0600 under ~/.config/buzz-cli/service-refresh/).
-// Launch with `buzz-claude <name>` so each agent gets its own isolated config.
+// as ITSELF (not as a person). Launch with `buzz-claude <name>` so each agent gets
+// its own isolated config. Do NOT hand-write the credential — `buzz agent add <name>`
+// provisions it (persisted 0600 under ~/.config/buzz-cli/).
 {
   "mcpServers": {
     "buzz": {
@@ -15,7 +12,18 @@
         "BUZZ_NAME":            "<agent-name>",
         "BUZZ_IDENTITY_NAME":   "<agent-name>",
         "BUZZ_AUTH_TAG":        "<owner-delegation JSON: [\"auth\",\"<owner-pubkey>\",\"<conditions>\",\"<sig>\"]>",
-        "BUZZ_EXPECTED_PUBKEY": "<the agent's own pubkey — fail-closed pin, recommended>"
+        "BUZZ_EXPECTED_PUBKEY": "<the agent's own pubkey — fail-closed pin, recommended>",
+
+        // Phase 1 (DEFAULT TODAY): the agent's key, read directly — nsec hex, on disk
+        // (0600 config + keystore). This is what `buzz agent add` writes right now.
+        "BUZZ_PRIVATE_KEY":     "<agent nsec hex>"
+
+        // Phase 2 (custody-clean; ROLLING OUT — replaces BUZZ_PRIVATE_KEY): a rotatable
+        // service-refresh. The shim exchanges it -> short-TTL agent token -> /v1/me/wire-key
+        // -> key in memory, NEVER on disk (only the rotated refresh persists, 0600). Not the
+        // default provisioning yet; uncomment only if `buzz agent add` handed you a refresh.
+        // "BUZZ_SERVICE_REFRESH": "ekam_srt_…",
+        // "BUZZ_EKAM_BASE":       "https://<your-ekam-base>"   // optional; your Ekam identity host
       }
     }
   }

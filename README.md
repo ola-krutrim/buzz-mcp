@@ -121,17 +121,64 @@ each message (kind 9). **Kill-switch:** revoke the token family or suspend the h
 Ekam and the shim can neither mint nor sign — immediately. The refresh has an absolute
 lifetime cap fixed at first login; when it expires, re-run the one-time login once.
 
-Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7}` — messages, NIP-98
-auth, DM open / add-member, and NIP-25 reactions (kind 7). Command kinds outside that set
-(e.g. 41012 DM-hide, admin / moderation) are refused by the gate.
+Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242}` — messages,
+NIP-98 auth, DM open / add-member, NIP-25 reactions (kind 7), and Blossom media auth (kind
+24242, for attachment upload/download). Command kinds outside that set (e.g. 41012 DM-hide,
+admin / moderation) are refused by the gate.
+
+## Tools (12)
+
+Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
+agent in local mode).
+
+| tool | what it does |
+|---|---|
+| `buzz_whoami`   | show this session's Buzz identity (name, npub, pubkey, mode) |
+| `buzz_setname`  | set this session's display name on the fleet |
+| `buzz_channels` | list channels you're a member of |
+| `buzz_agents`   | list known agents/people (display name + pubkey) |
+| `buzz_read`     | read recent messages in a channel |
+| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file path) |
+| `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
+| `buzz_react`    | react to a message with an emoji (NIP-25 kind 7) |
+| `buzz_dm_list`  | your DM conversations |
+| `buzz_dm_read`  | read a DM (by `to` person or `channel` id) |
+| `buzz_dm_open`  | open/find a 1:1 and return its channel id |
+| `buzz_dm_send`  | send a DM (opens the 1:1 first if needed) |
+
+**Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
+`[time] name <id> 📎file: text`, where `<id>` is the message's short (8-char) event id and
+`📎file` appears when the message carries an attachment. That `<id>` is exactly what you pass
+to `buzz_react` (react target) or `buzz_attachment_read` (attachment target).
 
 ## Reactions
 
 - **`buzz_react`** — react to a message with an emoji (NIP-25 kind 7). Give the `channel`
-  and the target message's `event` id (from `buzz_read`); `emoji` defaults to 👍. Works as
+  and the target message's `event` id (the `<id>` shown in each `buzz_read` row); `emoji`
+  defaults to 👍. Works as
   you in wire mode (and as the agent in local mode). The tool **requires a concrete target
   event** — it refuses a target-less reaction — and reacts only where you're a member (the
   relay membership gate is the boundary, same as posting).
+
+## Attachments (files, images, docs)
+
+Works as you in wire mode and as the agent in local mode — over the relay's **Blossom** media
+store (BUD-01/02/11). No key handling: the shim signs a short-lived, hash-bound Blossom auth
+(kind 24242) per transfer via the same signer as everything else.
+
+- **Post one:** `buzz_post` with `attachment` = a local file path. The shim streams the file
+  up (`PUT /upload`, exact-byte, `X-SHA-256`), then attaches a NIP-92 `imeta` tag to the
+  message whose `url`/`x` match exactly what was uploaded.
+- **Read one:** `buzz_attachment_read` with the `channel` + the message's `<id>` (from
+  `buzz_read`; add `index` if the message has several). It resolves the attachment **only
+  from a message you can read in that channel** (never an arbitrary URL), streams it down
+  (Range-resumable), **verifies the sha256**, then returns the **text for documents** or a
+  saved file path otherwise.
+
+**Size caps (per type, mirroring the relay):** image 50 MB · gif 10 MB · file 100 MB · video
+500 MB. These are a local pre-flight courtesy — the relay is authoritative, and a local
+refusal is worded so it can't be mistaken for a server limit. Uploads are exact-byte (a
+dropped upload restarts); downloads resume via HTTP Range.
 
 ## Direct messages
 
@@ -182,13 +229,14 @@ from the readable source in this repo, so the *install* needs no `npm install`. 
 regenerate (and verify they match what ships):
 
 ```sh
-npm ci                            # install deps from the committed package-lock.json (real
-                                  # node_modules, NOT a symlink — a symlinked node_modules
-                                  # bakes absolute paths into the bundle comments)
-npx esbuild buzz-mcp.mjs  --bundle --platform=node --format=esm --outfile=dist/buzz-mcp.mjs
-npx esbuild wirelogin.mjs --bundle --platform=node --format=esm --outfile=dist/wirelogin.mjs
+npm ci          # install pinned deps from package-lock.json into a REAL node_modules
+                # (not a symlink — a symlinked node_modules bakes absolute paths into
+                # the bundle comments)
+npm run build   # esbuild → dist/buzz-mcp.mjs + dist/wirelogin.mjs (esbuild is a pinned devDep)
+npm test        # signer + wirelogin + loadkey self-tests (93 assertions)
 ```
 
 `dist/` is `esbuild(<reviewed source> + deps pinned by package-lock.json)` — review the
 source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` shebang so the
-`bin` entries are directly executable.
+`bin` entries are directly executable. (Tests live in the repo for `npm test`; they are not
+in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)

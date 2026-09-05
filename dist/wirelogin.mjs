@@ -2390,6 +2390,8 @@ function wirePubkeySet(id, hex) {
     return false;
   }
 }
+var MEDIA_MB = 1024 * 1024;
+var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
 async function wireSign(base, token, template, fetchFn = fetch) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",

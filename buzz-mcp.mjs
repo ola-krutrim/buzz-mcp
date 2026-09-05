@@ -5,11 +5,12 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB } from "./signer.mjs";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { homedir, hostname } from "node:os";
-import { join, basename } from "node:path";
+import { readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream } from "node:fs";
+import { Readable } from "node:stream";
+import { homedir, hostname, tmpdir } from "node:os";
+import { join, basename, extname } from "node:path";
 import { execSync } from "node:child_process";
 
 const RELAY = process.env.BUZZ_RELAY_HTTP || "http://localhost:3000";
@@ -82,7 +83,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.3";
+const SHIM_VERSION = "0.2.5";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -143,6 +144,59 @@ async function bridge(path, bodyObj) {
 }
 
 const query = (filters) => bridge("/query", filters);
+
+// ── Attachments (Blossom BUD-01/02/11). The kind-24242 auth is built ONLY via
+// blossomAuthTemplate (fail-closed). Per-type size caps (mediaCapCheck, from signer.mjs) are a
+// PRE-FLIGHT COURTESY — the relay's 413 is authoritative; the local refusal is worded so it
+// can't be mistaken for a server verdict.
+const MB = MEDIA_MB;
+const TEXT_MIME = /^(text\/|application\/(json|xml|.*\+xml|x-yaml|yaml))/; // safe to return inline as text
+function sha256File(p) {
+  return new Promise((res, rej) => { const h = createHash("sha256"); const s = createReadStream(p); s.on("error", rej); s.on("data", (c) => h.update(c)); s.on("end", () => res(h.digest("hex"))); });
+}
+async function blossomAuthHeader(verb, sha) {
+  const ev = await signer.sign(blossomAuthTemplate({ verb, sha256: sha })); // fail-closed shape enforced here
+  return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
+}
+const DOWNLOAD_CHUNK = 16 * MB; // relay caps a single 206 range at 16 MiB → loop for larger
+
+// Upload a local file → NIP-92 descriptor {url, sha256, size, mime, filename}. Streamed hash + PUT body.
+async function blossomUpload(filePath) {
+  let st; try { st = statSync(filePath); } catch { throw new Error(`attachment not found: ${filePath}`); }
+  if (!st.isFile()) throw new Error(`attachment is not a file: ${filePath}`);
+  const { mime } = mediaCapCheck(basename(filePath), st.size); // per-type cap; throws a distinguishable local refusal if over
+  const sha = await sha256File(filePath);
+  const res = await fetch(`${RELAY}/upload`, {
+    method: "PUT",
+    headers: { Authorization: await blossomAuthHeader("upload", sha), "X-SHA-256": sha, "Content-Type": mime, "Content-Length": String(st.size), ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}) },
+    body: Readable.toWeb(createReadStream(filePath)),
+    duplex: "half",
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`upload ${basename(filePath)} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let d = {}; try { d = JSON.parse(text); } catch {}
+  return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename(filePath) };
+}
+
+// Download a media blob (sha[.ext]) → destPath, streamed to disk with Range-based resume.
+async function blossomDownload(shaExt, destPath) {
+  const sha = String(shaExt).split(".")[0].toLowerCase();
+  const part = destPath + ".part";
+  let start = 0; try { start = statSync(part).size; } catch {}
+  let total = Infinity;
+  while (start < total) {
+    const res = await fetch(`${RELAY}/media/${shaExt}`, { headers: { Authorization: await blossomAuthHeader("get", sha), Range: `bytes=${start}-${start + DOWNLOAD_CHUNK - 1}`, ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}) } });
+    if (res.status === 200) { const buf = Buffer.from(await res.arrayBuffer()); writeFileSync(part, buf); start = buf.length; total = buf.length; break; }
+    if (res.status !== 206) { const t = await res.text().catch(() => ""); throw new Error(`download <${sha.slice(0, 8)}> -> HTTP ${res.status}: ${t.slice(0, 160)}`); }
+    const cr = res.headers.get("content-range") || ""; const m = cr.match(/\/(\d+)\s*$/); if (m) total = Number(m[1]);
+    const buf = Buffer.from(await res.arrayBuffer());
+    start === 0 ? writeFileSync(part, buf) : appendFileSync(part, buf);
+    start += buf.length;
+    if (!buf.length) break;
+  }
+  renameSync(part, destPath);
+  return destPath;
+}
 
 // ---- self-reported agent runtime metadata (model / harness / interface) ----
 // Extends the Buzz agent-card schema. Overridable per-session via env so each
@@ -291,7 +345,8 @@ const TOOLS = [
   { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
-  { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered).", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" } }, required: ["channel", "text"] } },
+  { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
+  { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is 👍.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to 👍" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
@@ -366,8 +421,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
-        // include a short event id so buzz_react has a target to point at (react by this id).
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+        // include a short event id so buzz_react/buzz_attachment_read has a target, + 📎 for attachments.
+        const atts = messageAttachments(e);
+        const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
       });
       return ok(`#${ch.name} (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
     }
@@ -395,10 +452,60 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const pk = byName[m.slice(1).toLowerCase()];
         if (pk) tags.push(["p", pk]);
       }
-      const ev = await signer.sign({ kind: 9, tags, content: a.text });
+      // Optional attachment: upload the local file (Blossom) → attach a NIP-92 imeta tag
+      // whose url/x match exactly what was uploaded (hash-bound). Content echoes the url too,
+      // matching how Buzz clients render attachments.
+      let attached = null, content = a.text;
+      if (a.attachment) {
+        const up = await blossomUpload(String(a.attachment));
+        tags.push(buildImeta(up));
+        content = content ? `${content}\n${up.url}` : up.url;
+        attached = up;
+      }
+      const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}: ${a.text}`);
+      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${a.text}`);
+    }
+
+    if (name === "buzz_attachment_read") {
+      const ch = await resolveChannel(a.channel);
+      const targetId = String(a.event || "").trim();
+      if (!targetId) throw new Error("buzz_attachment_read needs the message <id> (from buzz_read)");
+      // Resolve the target IN this channel (target-bound; never an arbitrary URL) — same
+      // channel-scoped resolution as buzz_react, so we only fetch attachments off a message
+      // the caller can actually read here. [codex_kavach constraint #3]
+      const isFull = /^[0-9a-f]{64}$/i.test(targetId);
+      let hit = null;
+      if (isFull) hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
+      else {
+        const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
+        const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        hit = pref[0];
+      }
+      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}… in #${ch.name} — use the <id> from buzz_read`);
+      const atts = messageAttachments(hit);
+      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${ch.name} has no attachments.`);
+      const idx = Number.isInteger(a.index) ? a.index : 0;
+      const att = atts[idx];
+      if (!att) throw new Error(`attachment index ${idx} out of range — message has ${atts.length} (0..${atts.length - 1})`);
+      if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) — refusing to fetch an unverifiable blob`);
+      const shaExt = basename(new URL(att.url).pathname); // "<sha>.<ext>"
+      const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
+      const dest = join(tmpdir(), `buzz-att-${att.sha256.slice(0, 16)}${ext}`);
+      await blossomDownload(shaExt, dest);
+      const got = await sha256File(dest);
+      if (got !== att.sha256) throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}… ≠ imeta ${att.sha256.slice(0, 12)}… — discarded`);
+      const size = statSync(dest).size;
+      const isText = (att.mime && TEXT_MIME.test(att.mime)) || /\.(md|txt|csv|json|ya?ml|log|tsv)$/i.test(att.filename || shaExt);
+      if (isText) {
+        const full = readFileSync(dest, "utf8");
+        const CAP = 200 * 1024;
+        const body = full.length > CAP ? `${full.slice(0, CAP)}\n…[truncated ${full.length - CAP} chars — full file at ${dest}]` : full;
+        return ok(`📎 ${att.filename || shaExt} (${att.mime || "text"}, ${(size / 1024).toFixed(0)} KB) from #${ch.name}:\n\n${body}`);
+      }
+      return ok(`📎 saved ${att.filename || shaExt} → ${dest}\n   (${att.mime || "binary"}, ${(size / MB).toFixed(2)} MB, sha ${att.sha256.slice(0, 12)}…) — not text; open the file to view.`);
     }
 
     if (name === "buzz_react") {
@@ -471,7 +578,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+        const atts = messageAttachments(e);
+        const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
+        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
       });
       return ok(`DM [${chan}] (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
     }
