@@ -19140,6 +19140,20 @@ function makeWireTokenProvider(env, fetchFn) {
   let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
   let accessExp = access ? Infinity : 0;
   const SKEW_MS = 3e4;
+  let inflightMint = null, renewTimer = null;
+  function scheduleRenew() {
+    if (renewTimer) {
+      clearTimeout(renewTimer);
+      renewTimer = null;
+    }
+    if (!refresh || !isFinite(accessExp)) return;
+    const delay = Math.max(3e4, Math.floor((accessExp - Date.now()) * 0.75));
+    renewTimer = setTimeout(() => {
+      getToken(true).catch((e) => process.stderr.write(`[buzz-mcp] wire keep-alive renew failed (will retry on next call): ${e.message}
+`));
+    }, delay);
+    if (renewTimer.unref) renewTimer.unref();
+  }
   async function mint() {
     if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
     if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
@@ -19171,22 +19185,62 @@ function makeWireTokenProvider(env, fetchFn) {
       refresh = j.refresh_token;
       wireRefreshSet(persistId, j.refresh_token);
     }
+    scheduleRenew();
+  }
+  async function getToken(force) {
+    if (!force && access && Date.now() < accessExp) return access;
+    if (refresh) {
+      if (!inflightMint) inflightMint = mint().finally(() => {
+        inflightMint = null;
+      });
+      await inflightMint;
+      return access;
+    }
+    if (access) return access;
+    throw new Error("wire mode: no bearer available (set BUZZ_WIRE_REFRESH+BUZZ_EKAM_CLIENT_ID, or BUZZ_EKAM_HUMAN_TOKEN)");
   }
   return {
     hasRefresh: () => !!refresh,
     hasStatic: () => !!(env.BUZZ_EKAM_HUMAN_TOKEN || "").trim(),
-    async get(force) {
-      if (!force && access && Date.now() < accessExp) return access;
-      if (refresh) {
-        await mint();
-        return access;
+    get: getToken,
+    stopKeepAlive() {
+      if (renewTimer) {
+        clearTimeout(renewTimer);
+        renewTimer = null;
       }
-      if (access) return access;
-      throw new Error("wire mode: no bearer available (set BUZZ_WIRE_REFRESH+BUZZ_EKAM_CLIENT_ID, or BUZZ_EKAM_HUMAN_TOKEN)");
     }
+    // for clean shutdown/tests
   };
 }
-var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242]);
+var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005]);
+var HEX64 = /^[0-9a-f]{64}$/;
+function addMemberTemplate({ channelId, targetPubkey, role } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_add_member: a channel is required (h-tag) \u2014 refusing a channel-less add");
+  const pk = String(targetPubkey || "").trim().toLowerCase();
+  if (!HEX64.test(pk)) throw new Error("buzz_add_member: a concrete 64-hex target pubkey is required (p-tag) \u2014 refusing a name-only/ambiguous add");
+  const tags = [["h", chan], ["p", pk]];
+  const r = String(role || "").trim().toLowerCase();
+  if (r) {
+    if (!["member", "admin", "owner", "guest", "bot"].includes(r)) throw new Error(`buzz_add_member: invalid role ${JSON.stringify(r)}`);
+    tags.push(["role", r]);
+  }
+  return { kind: 9e3, tags, content: "" };
+}
+function removeMemberTemplate({ channelId, targetPubkey } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_remove_member: a channel is required (h-tag) \u2014 refusing a channel-less remove");
+  const pk = String(targetPubkey || "").trim().toLowerCase();
+  if (!HEX64.test(pk)) throw new Error("buzz_remove_member: a concrete 64-hex target pubkey is required (p-tag) \u2014 refusing a name-only/ambiguous remove");
+  return { kind: 9001, tags: [["h", chan], ["p", pk]], content: "" };
+}
+function deleteMessageTemplate({ channelId, targetId } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_delete: a channel is required (h-tag) \u2014 refusing a channel-less delete");
+  const id = String(targetId || "").trim().toLowerCase();
+  if (!HEX64.test(id)) throw new Error("buzz_delete: a concrete 64-hex target event id is required (e-tag) \u2014 refusing a target-less delete");
+  return { kind: 9005, tags: [["h", chan], ["e", id]], content: "" };
+}
 function reactionTemplate({ targetId, targetAuthor, targetKind, channelId, emoji: emoji2 } = {}) {
   const id = String(targetId || "").trim();
   if (!id) throw new Error("buzz_react: a concrete target event id is required \u2014 refusing a target-less reaction (kind 7 must carry an `e` tag)");
@@ -19370,6 +19424,8 @@ async function resolveSigner(opts = {}) {
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, appendFileSync, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync3, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
+import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
+import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir as homedir3, hostname, tmpdir } from "node:os";
 import { join as join4, basename, extname } from "node:path";
 import { execSync } from "node:child_process";
@@ -19439,45 +19495,70 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.6";
+var SHIM_VERSION = "0.2.8";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
   if (c.includes("timeout") || c.includes("etimedout") || c.includes("econnrefused") || c.includes("connect")) return "connect_timeout";
   return "unknown_transport";
 }
+var TRANSPORT_WEDGED = false;
+function rawPost(urlStr, headers, body) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch (e) {
+      return reject(e);
+    }
+    const isHttps = u.protocol === "https:";
+    const req = (isHttps ? httpsRequest : httpRequest)(u, {
+      method: "POST",
+      headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      agent: new (isHttps ? HttpsAgent : HttpAgent)({ keepAlive: false })
+      // one-off socket, bypasses the wedged undici pool
+    }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => data += c);
+      res.on("end", () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: async () => data }));
+    });
+    req.on("error", reject);
+    req.setTimeout(3e4, () => req.destroy(new Error("rawPost timeout")));
+    req.end(body);
+  });
+}
 async function bridge(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
-  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": authz,
-      // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag`
-      // header (bridge.rs). Without this, a ViaOwner agent 403s on reads/queries.
-      ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
-      // Platform attribution — telemetry only (relay stamps a bounded `client` label,
-      // never gates auth). Format is platform/version (agent/<ver>), resolved to the Agent label by the relay client_attr.rs (#330/#295).
-      "x-buzz-client": `agent/${SHIM_VERSION}`,
-      // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry
-      // only, never gates). Absent on first attempts → no cardinality on the normal request path.
-      ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
-    },
-    body
+  const headersFor = (authz, isRetry, rClass) => ({
+    "Content-Type": "application/json",
+    "Authorization": authz,
+    // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag` header (bridge.rs).
+    ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
+    // Platform attribution — telemetry only (relay stamps a bounded `client` label, never gates auth).
+    "x-buzz-client": `agent/${SHIM_VERSION}`,
+    // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
+    ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
   });
+  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
   let res;
   try {
-    res = await attempt(await nip98(signUrl, "POST", body), false);
+    if (TRANSPORT_WEDGED) {
+      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, "wedged_reroute"), body);
+    } else {
+      res = await attempt(await nip98(signUrl, "POST", body), false);
+    }
   } catch (e) {
     const rClass = retryClass(e);
-    process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying once
+    process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket
 `);
     try {
-      res = await attempt(await nip98(signUrl, "POST", body), true, rClass);
+      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, rClass), body);
+      TRANSPORT_WEDGED = true;
     } catch {
-      throw new Error(`${path} -> transient fetch failed [retried 1x fresh-conn, still failed; class=${rClass}]`);
+      throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client \u2014 reconnect and the shim's own retry do NOT clear a wedged connection pool.`);
     }
   }
   const text = await res.text();
@@ -19707,6 +19788,9 @@ var TOOLS = [
   { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
   { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is \u{1F44D}.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to \u{1F44D}" } }, required: ["channel", "event"] } },
+  { name: "buzz_add_member", description: "Add a person to a channel (NIP-29 kind 9000), as you. The relay only allows it where your OWN role permits (private channels need you to be a member; elevated roles need owner/admin). NOTE: the added person can then see the channel's prior history. `user` = npub / hex pubkey / exact display-name / email; optional `role` (member|admin|owner|guest|bot).", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" }, role: { type: "string", description: "member|admin|owner|guest|bot (default member; elevated needs your owner/admin)" } }, required: ["channel", "user"] } },
+  { name: "buzz_remove_member", description: "Remove a person from a channel (NIP-29 kind 9001), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). `user` = npub / hex pubkey / exact display-name / email.", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" } }, required: ["channel", "user"] } },
+  { name: "buzz_delete", description: "Delete a message in a channel (NIP-29 kind 9005), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). Identify the message by `channel` + `event` (the <id> from buzz_read).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
   { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
@@ -19758,6 +19842,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   relay (dial): ${RELAY}
   relay (self-report): ${relayLine}
   auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : "none"}
+  transport: ${TRANSPORT_WEDGED ? "\u26A0 undici pool wedged \u2014 self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}
   NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) \u2014 compare it before claiming "X is deployed". reachable \u2260 up-to-date.`);
     }
     if (name === "buzz_setname") {
@@ -19925,6 +20010,55 @@ ${body}`);
       await bridge("/events", ev);
       const who = author ? (await profiles())[author] || author.slice(0, 8) : "";
       return ok(`reacted ${emoji2} to ${who ? `${who}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
+    }
+    const modRefuse = (verb) => ({ content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not ${verb} as the wrong identity.` }], isError: true });
+    if (name === "buzz_add_member") {
+      if (!IDENTITY_OK) return modRefuse("adding members");
+      const ch = await resolveChannel(a.channel);
+      const pk = await resolveRecipient(a.user);
+      const tmpl = addMemberTemplate({ channelId: ch.id, targetPubkey: pk, role: a.role });
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      const who = (await profiles())[pk] || pk.slice(0, 12) + "\u2026";
+      return ok(`added ${who} to #${ch.name}${a.role ? ` as ${a.role}` : ""}. \u26A0\uFE0F they can now see this channel's prior history.`);
+    }
+    if (name === "buzz_remove_member") {
+      if (!IDENTITY_OK) return modRefuse("removing members");
+      const ch = await resolveChannel(a.channel);
+      const pk = await resolveRecipient(a.user);
+      const tmpl = removeMemberTemplate({ channelId: ch.id, targetPubkey: pk });
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      const who = (await profiles())[pk] || pk.slice(0, 12) + "\u2026";
+      return ok(`removed ${who} from #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+    }
+    if (name === "buzz_delete") {
+      if (!IDENTITY_OK) return modRefuse("deleting messages");
+      const ch = await resolveChannel(a.channel);
+      let targetId = String(a.event || "").trim();
+      if (!targetId) throw new Error("buzz_delete needs a target message <id> (from buzz_read) \u2014 refusing a target-less delete");
+      const isFullId = /^[0-9a-f]{64}$/i.test(targetId);
+      let hit = null;
+      if (isFullId) {
+        hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}\u2026 is not in #${ch.name} \u2014 delete must target a message in the channel you name`);
+      } else {
+        const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
+        const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) \u2014 use more characters`);
+        hit = pref[0];
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} \u2014 use the <id> shown by buzz_read`);
+      }
+      if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
+        throw new Error(`target message is not bound to #${ch.name} \u2014 refusing a cross-channel delete`);
+      targetId = hit.id;
+      const tmpl = deleteMessageTemplate({ channelId: ch.id, targetId });
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
     }
     const dmRefuse = () => ({ content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not acting as the wrong identity.` }], isError: true });
     if (name === "buzz_dm_list") {

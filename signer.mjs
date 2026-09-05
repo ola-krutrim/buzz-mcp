@@ -74,6 +74,21 @@ export function makeWireTokenProvider(env, fetchFn) {
   let accessExp = access ? Infinity : 0; // static token: valid until a 401 says otherwise
   const SKEW_MS = 30_000;
 
+  // Single-flight + proactive keep-alive (v0.2.8). Rotating refresh tokens make CONCURRENT
+  // refreshes dangerous: two parallel /query calls on an expired access token would each POST
+  // the same refresh; Ekam rotates on the first, so the second presents a spent token →
+  // reuse-detection revokes the whole family (the ":40 lockout" this file already warns about).
+  // `inflightMint` dedupes so only ONE refresh is ever in flight. `renewTimer` refreshes at ~75%
+  // of the access token's life so a long-lived process never reaches expiry mid-use (unref'd, so
+  // it never keeps the process alive on its own).
+  let inflightMint = null, renewTimer = null;
+  function scheduleRenew() {
+    if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    if (!refresh || !isFinite(accessExp)) return; // need a refresh + a real expires_in to time a renew
+    const delay = Math.max(30_000, Math.floor((accessExp - Date.now()) * 0.75)); // ~75% of remaining life
+    renewTimer = setTimeout(() => { getToken(true).catch((e) => process.stderr.write(`[buzz-mcp] wire keep-alive renew failed (will retry on next call): ${e.message}\n`)); }, delay);
+    if (renewTimer.unref) renewTimer.unref();
+  }
   async function mint() {
     if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
     if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
@@ -97,17 +112,27 @@ export function makeWireTokenProvider(env, fetchFn) {
     access = j.access_token;
     accessExp = j.expires_in ? Date.now() + j.expires_in * 1000 - SKEW_MS : Infinity;
     if (j.refresh_token) { refresh = j.refresh_token; wireRefreshSet(persistId, j.refresh_token); } // rotate iff rotated
+    scheduleRenew(); // keep-alive: line up the next refresh at ~75% of this token's life
+  }
+
+  async function getToken(force) {
+    if (!force && access && Date.now() < accessExp) return access;
+    if (refresh) {
+      // single-flight: concurrent callers (and the keep-alive timer) share ONE mint, so a rotating
+      // refresh is never sent twice in parallel (which would trip reuse-detection → family revoke).
+      if (!inflightMint) inflightMint = mint().finally(() => { inflightMint = null; });
+      await inflightMint;
+      return access;
+    }
+    if (access) return access; // static token, no refresh to rotate
+    throw new Error("wire mode: no bearer available (set BUZZ_WIRE_REFRESH+BUZZ_EKAM_CLIENT_ID, or BUZZ_EKAM_HUMAN_TOKEN)");
   }
 
   return {
     hasRefresh: () => !!refresh,
     hasStatic: () => !!(env.BUZZ_EKAM_HUMAN_TOKEN || "").trim(),
-    async get(force) {
-      if (!force && access && Date.now() < accessExp) return access;
-      if (refresh) { await mint(); return access; }
-      if (access) return access; // static token, no refresh to rotate
-      throw new Error("wire mode: no bearer available (set BUZZ_WIRE_REFRESH+BUZZ_EKAM_CLIENT_ID, or BUZZ_EKAM_HUMAN_TOKEN)");
-    },
+    get: getToken,
+    stopKeepAlive() { if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; } }, // for clean shutdown/tests
   };
 }
 
@@ -123,7 +148,43 @@ export function makeWireTokenProvider(env, fetchFn) {
 //   7     = NIP-25 reaction (ekam #325 / v203) — a low-sensitivity ack, not a command.
 //   24242 = Blossom media auth (ekam #326 / v204) — signs upload/get auth for attachments;
 //           the shim only ever builds these via blossomAuthTemplate() (fail-closed shape).
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242]);
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005]);
+
+// NIP-29 governed moderation (kinds 9000 add-member / 9001 remove-member / 9005 delete-message),
+// live server-side via Ekam v206 (allowlist {…,9000,9001,9005}). Ekam stays content-agnostic; the
+// relay's validate_admin_event role-gates each against the SIGNER's OWN role (a wire-signed 9001/9005
+// only works where the human is already owner/admin) — so the shim never widens authority, it only
+// refuses to sign a malformed/target-less op. Each builder FAILS CLOSED: a concrete channel h-tag AND
+// a concrete 64-hex target (p for add/remove, e for delete) are required before the signer is ever
+// called — no bare name, no ambiguity, no target-less destructive op reaches Ekam.
+const HEX64 = /^[0-9a-f]{64}$/;
+export function addMemberTemplate({ channelId, targetPubkey, role } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_add_member: a channel is required (h-tag) — refusing a channel-less add");
+  const pk = String(targetPubkey || "").trim().toLowerCase();
+  if (!HEX64.test(pk)) throw new Error("buzz_add_member: a concrete 64-hex target pubkey is required (p-tag) — refusing a name-only/ambiguous add");
+  const tags = [["h", chan], ["p", pk]];
+  const r = String(role || "").trim().toLowerCase();
+  if (r) {
+    if (!["member", "admin", "owner", "guest", "bot"].includes(r)) throw new Error(`buzz_add_member: invalid role ${JSON.stringify(r)}`);
+    tags.push(["role", r]);
+  }
+  return { kind: 9000, tags, content: "" };
+}
+export function removeMemberTemplate({ channelId, targetPubkey } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_remove_member: a channel is required (h-tag) — refusing a channel-less remove");
+  const pk = String(targetPubkey || "").trim().toLowerCase();
+  if (!HEX64.test(pk)) throw new Error("buzz_remove_member: a concrete 64-hex target pubkey is required (p-tag) — refusing a name-only/ambiguous remove");
+  return { kind: 9001, tags: [["h", chan], ["p", pk]], content: "" };
+}
+export function deleteMessageTemplate({ channelId, targetId } = {}) {
+  const chan = String(channelId || "").trim();
+  if (!chan) throw new Error("buzz_delete: a channel is required (h-tag) — refusing a channel-less delete");
+  const id = String(targetId || "").trim().toLowerCase();
+  if (!HEX64.test(id)) throw new Error("buzz_delete: a concrete 64-hex target event id is required (e-tag) — refusing a target-less delete");
+  return { kind: 9005, tags: [["h", chan], ["e", id]], content: "" };
+}
 
 // Build a NIP-25 reaction (kind 7) template, ENFORCING a concrete target event id — the
 // condition ekam + security set when Ekam stayed content-agnostic for kind 7 (#325): a

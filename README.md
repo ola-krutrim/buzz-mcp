@@ -126,7 +126,7 @@ NIP-98 auth, DM open / add-member, NIP-25 reactions (kind 7), and Blossom media 
 24242, for attachment upload/download). Command kinds outside that set (e.g. 41012 DM-hide,
 admin / moderation) are refused by the gate.
 
-## Tools (14)
+## Tools (17)
 
 Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
 agent in local mode).
@@ -143,6 +143,9 @@ agent in local mode).
 | `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file path) |
 | `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
 | `buzz_react`    | react to a message with an emoji (NIP-25 kind 7) |
+| `buzz_add_member` | add a person to a channel (NIP-29 kind 9000) — where your own role permits |
+| `buzz_remove_member` | remove a person from a channel (NIP-29 kind 9001) — owner/admin only |
+| `buzz_delete`   | delete a message in a channel (NIP-29 kind 9005) — owner/admin only |
 | `buzz_dm_list`  | your DM conversations |
 | `buzz_dm_read`  | read a DM (by `to` person or `channel` id) |
 | `buzz_dm_open`  | open/find a 1:1 and return its channel id |
@@ -191,6 +194,38 @@ dropped upload restarts); downloads resume via HTTP Range.
 - **`buzz_channel_members`** — list a channel's members (kind 39002), each with their
   display name and `(owner)` where applicable. Members without a published profile show a
   truncated pubkey.
+
+## Moderation (add / remove members · delete messages)
+
+These act **as you** (NIP-29 admin events, signed via Ekam wire-sign in wire mode; as the agent
+in local mode). The **relay** role-gates every one against **your own role** — the shim can only
+do what you could already do by hand: adding to a private channel needs you to be a member,
+granting an elevated role or removing/deleting needs you to be owner/admin. The shim itself
+**fails closed** — it resolves a concrete channel and a concrete target (64-hex pubkey, or the
+message's `<id>`) before signing; a name it can't resolve, an ambiguous prefix, or a missing
+target is refused, never signed.
+
+- **`buzz_add_member`** — add `user` (npub / hex / exact display-name / email) to `channel`,
+  optional `role` (member|admin|owner|guest|bot). ⚠️ The added person can then see the
+  channel's **prior history** — the tool says so on success.
+- **`buzz_remove_member`** — remove `user` from `channel`. Owner/admin only (relay-enforced).
+- **`buzz_delete`** — delete the message identified by `channel` + `event` (the `<id>` from
+  `buzz_read`). Owner/admin only (relay-enforced); the shim resolves the target within the named
+  channel and refuses a cross-channel target.
+
+## Connector reliability (v0.2.8)
+
+Long-lived sessions are kept healthy automatically:
+
+- **Wire token keep-alive.** The wire ("post as me") access token is refreshed ahead of expiry
+  (~75% of its life) and all refreshes are **single-flight** — one in flight at a time. Ekam's
+  refresh tokens are single-use/rotating, so a *concurrent* double-refresh would trip reuse
+  detection and revoke the token family; single-flight + rotate-and-persist prevents that, so a
+  session renews itself indefinitely and re-login is reserved for a genuine revoke.
+- **Transport self-heal.** If Node's built-in fetch pool wedges on a long session (every read/post
+  throwing while the connection looks up), the shim retries over a fresh socket and reroutes
+  subsequent calls, so it recovers **without a restart**. `buzz_whoami` shows a `transport:` line;
+  if it ever reports wedged, a full client restart (not just reconnect) clears it.
 
 ## Direct messages
 

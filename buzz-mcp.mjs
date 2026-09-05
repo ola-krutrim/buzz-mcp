@@ -5,10 +5,12 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB } from "./signer.mjs";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
+import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
+import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir, hostname, tmpdir } from "node:os";
 import { join, basename, extname } from "node:path";
 import { execSync } from "node:child_process";
@@ -86,7 +88,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.6";
+const SHIM_VERSION = "0.2.8";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -94,6 +96,33 @@ function retryClass(e) {
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
   if (c.includes("timeout") || c.includes("etimedout") || c.includes("econnrefused") || c.includes("connect")) return "connect_timeout";
   return "unknown_transport";
+}
+
+// v0.2.8 transport self-heal. A long-lived MCP process can wedge Node's built-in undici fetch
+// pool (releng: every /query throws unknown_transport while whoami — local, no fetch — still
+// works; only a full process restart clears it). We can't recreate undici's dispatcher (undici
+// isn't importable — ERR_MODULE_NOT_FOUND), so on a transport throw we retry over a FRESH
+// node:https socket (keepAlive:false = a brand-new connection, never the wedged pool). Once a
+// wedge is seen we stick to the raw path for the rest of the process so every later call keeps
+// working without a restart; a clean undici attempt clears the flag. `whoami` surfaces it.
+let TRANSPORT_WEDGED = false;
+function rawPost(urlStr, headers, body) {
+  return new Promise((resolve, reject) => {
+    let u; try { u = new URL(urlStr); } catch (e) { return reject(e); }
+    const isHttps = u.protocol === "https:";
+    const req = (isHttps ? httpsRequest : httpRequest)(u, {
+      method: "POST",
+      headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      agent: new (isHttps ? HttpsAgent : HttpAgent)({ keepAlive: false }), // one-off socket, bypasses the wedged undici pool
+    }, (res) => {
+      let data = ""; res.setEncoding("utf8");
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: async () => data }));
+    });
+    req.on("error", reject);
+    req.setTimeout(30_000, () => req.destroy(new Error("rawPost timeout")));
+    req.end(body);
+  });
 }
 
 async function bridge(path, bodyObj) {
@@ -106,39 +135,43 @@ async function bridge(path, bodyObj) {
   // The auth header is SIGNED before the fetch and passed in — so a wire-mode sign
   // failure (revoked/scope-denied Ekam token) surfaces as its own auth error and is
   // NOT swallowed by the transient transport-retry below (kill-switch stays legible).
-  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": authz,
-      // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag`
-      // header (bridge.rs). Without this, a ViaOwner agent 403s on reads/queries.
-      ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}),
-      // Platform attribution — telemetry only (relay stamps a bounded `client` label,
-      // never gates auth). Format is platform/version (agent/<ver>), resolved to the Agent label by the relay client_attr.rs (#330/#295).
-      "x-buzz-client": `agent/${SHIM_VERSION}`,
-      // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry
-      // only, never gates). Absent on first attempts → no cardinality on the normal request path.
-      ...(isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}),
-    },
-    body,
+  // Header set is shared by the undici (fetch) path and the node:https self-heal path so the
+  // request the relay sees is identical either way. The auth header is SIGNED before the call —
+  // a wire-mode sign failure (revoked/scope-denied Ekam token) surfaces as its own auth error
+  // and is NOT swallowed by the transient transport-retry below (kill-switch stays legible).
+  const headersFor = (authz, isRetry, rClass) => ({
+    "Content-Type": "application/json",
+    "Authorization": authz,
+    // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag` header (bridge.rs).
+    ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}),
+    // Platform attribution — telemetry only (relay stamps a bounded `client` label, never gates auth).
+    "x-buzz-client": `agent/${SHIM_VERSION}`,
+    // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
+    ...(isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}),
   });
+  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
   let res;
   try {
-    res = await attempt(await nip98(signUrl, "POST", body), false);
+    // If we've already seen a wedge this process, skip the doomed undici attempt and go straight
+    // to the fresh-socket path — so a wedged process keeps working without a restart.
+    if (TRANSPORT_WEDGED) {
+      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, "wedged_reroute"), body);
+    } else {
+      res = await attempt(await nip98(signUrl, "POST", body), false);
+    }
   } catch (e) {
     // NETWORK-level throw only (dead pooled socket / reset / connect timeout). HTTP errors return a
-    // response (handled below) and are NEVER retried — a 401/403/4xx is not a throw. One retry on a
-    // fresh attempt (undici evicts the errored socket, so the retry does not reuse it). Counted, not silent.
-    // A wire-sign auth failure is NOT a transport throw — the nip98() above is outside this catch, so a
-    // revoked token surfaces directly (as `wire-sign … HTTP 403`), never masked as "transient".
+    // response (handled below) and are NEVER retried — a 401/403/4xx is not a throw. The retry goes
+    // over a FRESH node:https socket (not the wedged undici pool), and we mark the pool wedged so
+    // every later call reroutes too. A wire-sign auth failure is NOT a transport throw (nip98() is
+    // outside this catch), so a revoked token surfaces directly, never masked as "transient".
     const rClass = retryClass(e);
-    process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying once\n`);
+    process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket\n`);
     try {
-      res = await attempt(await nip98(signUrl, "POST", body), true, rClass); // fresh sign for the retry
+      res = await rawPost(dialUrl, headersFor(await nip98(signUrl, "POST", body), true, rClass), body);
+      TRANSPORT_WEDGED = true; // the raw retry worked where undici didn't → the pool is wedged; reroute from here on
     } catch {
-      // A failed retry never reaches the relay → the tool result is its only home (visible to the agent).
-      throw new Error(`${path} -> transient fetch failed [retried 1x fresh-conn, still failed; class=${rClass}]`);
+      throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client — reconnect and the shim's own retry do NOT clear a wedged connection pool.`);
     }
   }
   const text = await res.text();
@@ -353,6 +386,9 @@ const TOOLS = [
   { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
   { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is 👍.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to 👍" } }, required: ["channel", "event"] } },
+  { name: "buzz_add_member", description: "Add a person to a channel (NIP-29 kind 9000), as you. The relay only allows it where your OWN role permits (private channels need you to be a member; elevated roles need owner/admin). NOTE: the added person can then see the channel's prior history. `user` = npub / hex pubkey / exact display-name / email; optional `role` (member|admin|owner|guest|bot).", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" }, role: { type: "string", description: "member|admin|owner|guest|bot (default member; elevated needs your owner/admin)" } }, required: ["channel", "user"] } },
+  { name: "buzz_remove_member", description: "Remove a person from a channel (NIP-29 kind 9001), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). `user` = npub / hex pubkey / exact display-name / email.", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" } }, required: ["channel", "user"] } },
+  { name: "buzz_delete", description: "Delete a message in a channel (NIP-29 kind 9005), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). Identify the message by `channel` + `event` (the <id> from buzz_read).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
   { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
@@ -399,7 +435,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const info = await relayInfo();
       const relayLine = info.error ? `⚠ UNREACHABLE: ${info.error}` : `${info.name} · v${info.version}${info.sha ? ` · deploy ${info.sha.slice(0, 12)}` : " · (no software_sha — stale build?)"}`;
       const configLine = IS_ISOLATED ? "isolated ✅ (own CLAUDE_CONFIG_DIR)" : `⚠ SHARED ~/.claude.json — clobberable/flip-prone. Relaunch via 'buzz-claude ${MY_NAME}' to isolate. Guide: ${GUIDE_PATH}`;
-      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : "none"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
+      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : "none"}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
     }
 
     if (name === "buzz_setname") {
@@ -585,6 +621,67 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       await bridge("/events", ev);
       const who = author ? ((await profiles())[author] || author.slice(0, 8)) : "";
       return ok(`reacted ${emoji} to ${who ? `${who}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
+    }
+
+    // ---- Moderation tools (v0.2.7): add / remove members + delete messages, as you.
+    // Ekam v206 signs kinds 9000/9001/9005 content-agnostically; the RELAY role-gates each
+    // against your OWN role (validate_admin_event), so these can only do what you already can.
+    // The shim's job is to fail closed on a malformed/target-less op: every handler resolves a
+    // CONCRETE channel + CONCRETE 64-hex target before the template (which re-asserts it) signs. ----
+    const modRefuse = (verb) => ({ content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not ${verb} as the wrong identity.` }], isError: true });
+
+    if (name === "buzz_add_member") {
+      if (!IDENTITY_OK) return modRefuse("adding members");
+      const ch = await resolveChannel(a.channel);
+      const pk = await resolveRecipient(a.user);            // 64-hex or throws (no bare name reaches the signer)
+      const tmpl = addMemberTemplate({ channelId: ch.id, targetPubkey: pk, role: a.role });  // re-asserts concrete h + p
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      const who = (await profiles())[pk] || pk.slice(0, 12) + "…";
+      return ok(`added ${who} to #${ch.name}${a.role ? ` as ${a.role}` : ""}. ⚠️ they can now see this channel's prior history.`);
+    }
+
+    if (name === "buzz_remove_member") {
+      if (!IDENTITY_OK) return modRefuse("removing members");
+      const ch = await resolveChannel(a.channel);
+      const pk = await resolveRecipient(a.user);
+      const tmpl = removeMemberTemplate({ channelId: ch.id, targetPubkey: pk });
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      const who = (await profiles())[pk] || pk.slice(0, 12) + "…";
+      return ok(`removed ${who} from #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+    }
+
+    if (name === "buzz_delete") {
+      if (!IDENTITY_OK) return modRefuse("deleting messages");
+      const ch = await resolveChannel(a.channel);
+      // Resolve the target message IN the named channel and FAIL CLOSED if it isn't there —
+      // same channel-scoped resolution as buzz_react: full id (ids+#h) or short <id> prefix scan,
+      // ambiguity refused, h-tag asserted. Never signs a delete against an unproven/cross-channel target.
+      let targetId = String(a.event || "").trim();
+      if (!targetId) throw new Error("buzz_delete needs a target message <id> (from buzz_read) — refusing a target-less delete");
+      const isFullId = /^[0-9a-f]{64}$/i.test(targetId);
+      let hit = null;
+      if (isFullId) {
+        hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — delete must target a message in the channel you name`);
+      } else {
+        const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
+        const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        hit = pref[0];
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+      }
+      if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
+        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel delete`);
+      targetId = hit.id;
+      const tmpl = deleteMessageTemplate({ channelId: ch.id, targetId });  // re-asserts concrete h + e
+      if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
+      const ev = await signer.sign(tmpl);
+      await bridge("/events", ev);
+      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
     }
 
     // ---- DM tools (v0.2.1) ----

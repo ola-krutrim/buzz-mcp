@@ -3,7 +3,7 @@
 // dependency). Integration against the LIVE endpoint is deferred until ekam ships
 // 27235 (requirement C) and confirms the contract (requirement D).
 
-import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB } from "./signer.mjs";
+import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider } from "./signer.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 let pass = 0, fail = 0;
@@ -191,6 +191,34 @@ catch (e) { ok(/target-less|`e` tag|concrete target/i.test(e.message), "REFUSES 
 try { reactionTemplate({ targetId: "evt", channelId: "" }); ok(false, "missing channel should throw"); }
 catch (e) { ok(/channel/i.test(e.message), "refuses a reaction with no channel to route to (h-tag)"); }
 
+console.log("moderation (v0.2.7) — kinds 9000/9001/9005 in allowlist + fail-closed templates (concrete h + concrete 64-hex target):");
+ok([9000, 9001, 9005].every((k) => WIRE_ALLOWLIST.has(k)), "kinds 9000/9001/9005 are in the wire-sign allowlist");
+ok([9000, 9001, 9005].every((k) => wsigner.canSign(k)), "wire signer canSign(9000/9001/9005) → moderation signable as the user");
+{
+  const PK = "c".repeat(64), EV = "d".repeat(64);
+  const add = addMemberTemplate({ channelId: "chan-1", targetPubkey: PK });
+  const am = Object.fromEntries(add.tags.map((x) => [x[0], x[1]]));
+  ok(add.kind === 9000 && am.h === "chan-1" && am.p === PK && add.content === "", "addMemberTemplate → kind 9000, h+p tags, empty content");
+  ok(addMemberTemplate({ channelId: "c", targetPubkey: PK, role: "admin" }).tags.some((x) => x[0] === "role" && x[1] === "admin"), "add: role tag carried when requested");
+  const rm = removeMemberTemplate({ channelId: "chan-1", targetPubkey: PK });
+  ok(rm.kind === 9001 && rm.tags.some((x) => x[0] === "p" && x[1] === PK), "removeMemberTemplate → kind 9001 + p-tag(target)");
+  const del = deleteMessageTemplate({ channelId: "chan-1", targetId: EV });
+  const dm = Object.fromEntries(del.tags.map((x) => [x[0], x[1]]));
+  ok(del.kind === 9005 && dm.h === "chan-1" && dm.e === EV, "deleteMessageTemplate → kind 9005, h + e(target) tags");
+}
+try { addMemberTemplate({ channelId: "c", targetPubkey: "alice" }); ok(false, "add name-only should throw"); }
+catch (e) { ok(/64-hex|concrete/i.test(e.message), "add REFUSES a name-only/non-hex target (no bare-name signing)"); }
+try { addMemberTemplate({ channelId: "", targetPubkey: "c".repeat(64) }); ok(false, "add no-channel should throw"); }
+catch (e) { ok(/channel/i.test(e.message), "add REFUSES a channel-less op (h-tag)"); }
+try { addMemberTemplate({ channelId: "c", targetPubkey: "c".repeat(64), role: "superuser" }); ok(false, "bad role should throw"); }
+catch (e) { ok(/invalid role/i.test(e.message), "add REFUSES an invalid role"); }
+try { removeMemberTemplate({ channelId: "c", targetPubkey: "" }); ok(false, "remove no-target should throw"); }
+catch (e) { ok(/64-hex|concrete/i.test(e.message), "remove REFUSES a target-less op"); }
+try { deleteMessageTemplate({ channelId: "c", targetId: "abc" }); ok(false, "delete short-id should throw"); }
+catch (e) { ok(/64-hex|concrete/i.test(e.message), "delete REFUSES a non-64-hex target event id"); }
+try { deleteMessageTemplate({ channelId: "", targetId: "d".repeat(64) }); ok(false, "delete no-channel should throw"); }
+catch (e) { ok(/channel/i.test(e.message), "delete REFUSES a channel-less op (h-tag)"); }
+
 console.log("blossom media auth (kind 24242) — fail-closed shim constraints (codex_kavach gate):");
 {
   const SHA = "a".repeat(64);
@@ -252,6 +280,36 @@ try { mediaCapCheck("a.gif", 11 * MEDIA_MB); ok(false, "11MB gif should throw");
 catch (e) { ok(/gif cap/.test(e.message), "gif >10 MB → refused (tightest per-type cap)"); }
 try { mediaCapCheck("big.bin", 101 * MEDIA_MB); ok(false, "101MB file should throw"); }
 catch (e) { ok(/file cap/.test(e.message), "generic file >100 MB → refused"); }
+
+console.log("wire token provider (v0.2.8) — single-flight mint + rotate-persist (no concurrent refresh reuse):");
+{
+  const nfs = await import("node:fs"), npath = await import("node:path"), nos = await import("node:os");
+  const TEST_ID = "__test_singleflight__";
+  const tokFile = npath.join(nos.homedir(), ".config", "buzz-cli", "wire-refresh", `${TEST_ID}.tok`);
+  let mints = 0; const sentRefresh = [];
+  const fetchFn = async (url, opts) => {
+    if (String(url).endsWith("/oauth/token")) {
+      mints++;
+      const body = JSON.parse(opts.body);
+      sentRefresh.push(body.refresh_token);
+      await new Promise((r) => setTimeout(r, 15)); // latency so concurrent calls overlap
+      return { ok: true, status: 200, async text() { return JSON.stringify({ access_token: `acc-${mints}`, expires_in: 3600, refresh_token: `rot-${mints}` }); } };
+    }
+    throw new Error("unexpected url " + url);
+  };
+  const env = { BUZZ_EKAM_BASE: "https://ekam.test", BUZZ_EKAM_CLIENT_ID: "cid", BUZZ_WIRE_REFRESH: "orig-refresh", BUZZ_WIRE_ID: TEST_ID };
+  const p = makeWireTokenProvider(env, fetchFn);
+  const results = await Promise.all([p.get(), p.get(), p.get(), p.get(), p.get()]);
+  ok(mints === 1, `5 concurrent get() → exactly ONE mint (got ${mints}) — single-flight holds`);
+  ok(results.every((a) => a === "acc-1"), "all concurrent callers receive the same fresh access token");
+  ok(sentRefresh.length === 1 && sentRefresh[0] === "orig-refresh", "the rotating refresh was sent exactly once (no parallel reuse → no family-revoke)");
+  const again = await p.get();
+  ok(mints === 1 && again === "acc-1", "cached access reused within its life → no extra mint");
+  const forced = await p.get(true);
+  ok(mints === 2 && sentRefresh[1] === "rot-1", "force renew mints once more, sending the ROTATED (persisted) refresh, not the spent original");
+  p.stopKeepAlive();
+  try { nfs.rmSync(tokFile, { force: true }); } catch { /* throwaway */ }
+}
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
