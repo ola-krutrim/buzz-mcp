@@ -55,6 +55,31 @@ function contextName() {
   const animal = ANIMALS[parseInt(PK.slice(0, 8), 16) % ANIMALS.length];
   return `${ctx}·${animal}`;
 }
+
+// ---- timestamp formatting (pilot #3: buzz_read times were raw UTC, unlabelled) ----
+// Honor BUZZ_TZ (IANA name, e.g. Asia/Kolkata); default UTC. Always append a zone
+// label so a time is never ambiguous. Ola config sets BUZZ_TZ=Asia/Kolkata → IST.
+const DISPLAY_TZ = (process.env.BUZZ_TZ || "UTC").trim() || "UTC";
+function tzLabel(d) {
+  if (DISPLAY_TZ === "UTC") return "UTC";
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: DISPLAY_TZ, timeZoneName: "short" })
+      .formatToParts(d).find((x) => x.type === "timeZoneName");
+    return p ? p.value : DISPLAY_TZ;
+  } catch { return DISPLAY_TZ; }
+}
+function fmtTime(created_at, withDate = false) {
+  const d = new Date(created_at * 1000);
+  try {
+    const opts = { timeZone: DISPLAY_TZ, hour12: false, hour: "2-digit", minute: "2-digit" };
+    if (withDate) { opts.year = "numeric"; opts.month = "2-digit"; opts.day = "2-digit"; }
+    const p = Object.fromEntries(
+      new Intl.DateTimeFormat("en-GB", opts).formatToParts(d).map((x) => [x.type, x.value]));
+    const hm = `${p.hour}:${p.minute}`;
+    const stamp = withDate ? `${p.year}-${p.month}-${p.day} ${hm}` : hm;
+    return `${stamp} ${tzLabel(d)}`;
+  } catch { return `${d.toISOString().slice(11, 16)} UTC`; }
+}
 let MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || contextName();
 // NIP-OA owner attestation: if BUZZ_AUTH_TAG is set (a signed ["auth",owner,conditions,sig] JSON),
 // attach it to signed events so the desktop shows "Agent managed by <owner>" instead of "owner unavailable".
@@ -88,7 +113,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.9";
+const SHIM_VERSION = "0.2.10";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -467,7 +492,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const evs = await query([{ kinds: [9], "#h": [ch.id], limit: a.limit || 30 }]);
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
+        const t = fmtTime(e.created_at);
         // include a short event id so buzz_react/buzz_attachment_read has a target, + 📎 for attachments.
         const atts = messageAttachments(e);
         const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
@@ -490,7 +515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const hTag = (e.tags || []).find((t) => t[0] === "h");
         const chan = hTag ? (chById[hTag[1]] || hTag[1].slice(0, 8)) : "?";
-        const t = new Date(e.created_at * 1000).toISOString().slice(0, 16).replace("T", " ");
+        const t = fmtTime(e.created_at, true);
         return `#${chan} [${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
       });
       return ok(`search "${q}"${scope} → ${rows.length} result(s):\n` + (rows.join("\n") || "(none)"));
@@ -509,6 +534,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "buzz_post") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${EXPECTED_PK.slice(0, 16)}…. Not posting as the wrong agent. Fix your pin, or launch with your own CLAUDE_CONFIG_DIR.` }], isError: true };
+      // guard: a missing/mis-named text arg would otherwise throw a cryptic "reading 'match'"
+      // on the @-mention scan below. The parameter is `text` (not `message`). (pilot #1 fallout)
+      if (typeof a.text !== "string" || a.text.trim() === "")
+        return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` string. (The parameter is `text` — not `message`.)" }], isError: true };
       const ch = await resolveChannel(a.channel);
       const names = await profiles();
       // Index each identity under several keys so @Pulse resolves even when the
@@ -716,7 +745,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const evs = await query([{ kinds: [9], "#h": [chan], limit: a.limit || 30 }]);
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = new Date(e.created_at * 1000).toISOString().slice(11, 16);
+        const t = fmtTime(e.created_at);
         const atts = messageAttachments(e);
         const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
         return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
@@ -745,6 +774,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
   }
 });
+
+// pilot #4: in wire mode the shim posts AS the human — default the display name to the
+// user's OWN kind:0 profile name (not the auto <ctx>·<animal>), unless one was set explicitly.
+if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME)) {
+  try {
+    const pm = await profiles();
+    const human = pm[PK];
+    if (human && human.trim() && human !== PK.slice(0, 8)) MY_NAME = human.trim();
+  } catch {}
+}
 
 // auto-register this session's context-derived friendly name (best-effort).
 // Skipped on impersonation-guard trip: never publish a profile AS the wrong agent.

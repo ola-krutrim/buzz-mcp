@@ -12,6 +12,7 @@
 // runtime reads (wirePersistId), so the shim finds it with no further config.
 
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireBleedVars, wireSign } from "./signer.mjs";
 
@@ -87,6 +88,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   const url = authorizeUrl(base, { clientId, redirectUri, challenge, state, resource: base });
   console.error(`\n[wire-login] open this URL in your browser to grant "post as me":\n\n${url}\n\n[wire-login] waiting for the redirect on ${redirectUri} …`);
+  // pilot #2: best-effort auto-open the browser (fall back to the printed URL if it fails).
+  try {
+    const [cmd, ...pre] = process.platform === "darwin" ? ["open"]
+      : process.platform === "win32" ? ["cmd", "/c", "start", ""]
+      : ["xdg-open"];
+    spawn(cmd, [...pre, url], { stdio: "ignore", detached: true }).unref();
+    console.error("[wire-login] (tried to open your browser — if nothing opened, paste the URL above)");
+  } catch { /* printing the URL above is the fallback */ }
   srv.on("request", async (req, res) => {
     try {
       const u = new URL(req.url, redirectUri);

@@ -2,6 +2,7 @@
 
 // wirelogin.mjs
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
 
 // node_modules/@noble/hashes/utils.js
@@ -2506,6 +2507,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 ${url}
 
 [wire-login] waiting for the redirect on ${redirectUri} \u2026`);
+  try {
+    const [cmd, ...pre] = process.platform === "darwin" ? ["open"] : process.platform === "win32" ? ["cmd", "/c", "start", ""] : ["xdg-open"];
+    spawn(cmd, [...pre, url], { stdio: "ignore", detached: true }).unref();
+    console.error("[wire-login] (tried to open your browser \u2014 if nothing opened, paste the URL above)");
+  } catch {
+  }
   srv.on("request", async (req, res) => {
     try {
       const u = new URL(req.url, redirectUri);

@@ -19472,6 +19472,35 @@ function contextName() {
   const animal = ANIMALS[parseInt(PK.slice(0, 8), 16) % ANIMALS.length];
   return `${ctx}\xB7${animal}`;
 }
+var DISPLAY_TZ = (process.env.BUZZ_TZ || "UTC").trim() || "UTC";
+function tzLabel(d) {
+  if (DISPLAY_TZ === "UTC") return "UTC";
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: DISPLAY_TZ, timeZoneName: "short" }).formatToParts(d).find((x) => x.type === "timeZoneName");
+    return p ? p.value : DISPLAY_TZ;
+  } catch {
+    return DISPLAY_TZ;
+  }
+}
+function fmtTime(created_at, withDate = false) {
+  const d = new Date(created_at * 1e3);
+  try {
+    const opts = { timeZone: DISPLAY_TZ, hour12: false, hour: "2-digit", minute: "2-digit" };
+    if (withDate) {
+      opts.year = "numeric";
+      opts.month = "2-digit";
+      opts.day = "2-digit";
+    }
+    const p = Object.fromEntries(
+      new Intl.DateTimeFormat("en-GB", opts).formatToParts(d).map((x) => [x.type, x.value])
+    );
+    const hm = `${p.hour}:${p.minute}`;
+    const stamp = withDate ? `${p.year}-${p.month}-${p.day} ${hm}` : hm;
+    return `${stamp} ${tzLabel(d)}`;
+  } catch {
+    return `${d.toISOString().slice(11, 16)} UTC`;
+  }
+}
 var MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || contextName();
 var AUTH_TAG = (() => {
   try {
@@ -19495,7 +19524,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.9";
+var SHIM_VERSION = "0.2.10";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19863,7 +19892,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const evs = await query([{ kinds: [9], "#h": [ch.id], limit: a.limit || 30 }]);
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = new Date(e.created_at * 1e3).toISOString().slice(11, 16);
+        const t = fmtTime(e.created_at);
         const atts = messageAttachments(e);
         const att = atts.length ? " " + atts.map((x) => `\u{1F4CE}${x.filename || x.mime || "file"}`).join("") : "";
         return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
@@ -19889,7 +19918,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
         const hTag = (e.tags || []).find((t2) => t2[0] === "h");
         const chan = hTag ? chById[hTag[1]] || hTag[1].slice(0, 8) : "?";
-        const t = new Date(e.created_at * 1e3).toISOString().slice(0, 16).replace("T", " ");
+        const t = fmtTime(e.created_at, true);
         return `#${chan} [${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
       });
       return ok(`search "${q}"${scope} \u2192 ${rows.length} result(s):
@@ -19907,6 +19936,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (name === "buzz_post") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${EXPECTED_PK.slice(0, 16)}\u2026. Not posting as the wrong agent. Fix your pin, or launch with your own CLAUDE_CONFIG_DIR.` }], isError: true };
+      if (typeof a.text !== "string" || a.text.trim() === "")
+        return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` string. (The parameter is `text` \u2014 not `message`.)" }], isError: true };
       const ch = await resolveChannel(a.channel);
       const names = await profiles();
       const byName = {};
@@ -20081,7 +20112,7 @@ ${body}`);
       const evs = await query([{ kinds: [9], "#h": [chan], limit: a.limit || 30 }]);
       const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
         const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = new Date(e.created_at * 1e3).toISOString().slice(11, 16);
+        const t = fmtTime(e.created_at);
         const atts = messageAttachments(e);
         const att = atts.length ? " " + atts.map((x) => `\u{1F4CE}${x.filename || x.mime || "file"}`).join("") : "";
         return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
@@ -20108,6 +20139,14 @@ ${body}`);
     return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
   }
 });
+if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME)) {
+  try {
+    const pm = await profiles();
+    const human = pm[PK];
+    if (human && human.trim() && human !== PK.slice(0, 8)) MY_NAME = human.trim();
+  } catch {
+  }
+}
 if (IDENTITY_OK && signer.canSign(0)) publishProfile(MY_NAME).catch(() => {
 });
 else if (IDENTITY_OK && signer.mode === "wire") process.stderr.write(`[buzz-mcp] profile publish skipped (wire mode: posts as the user; kind:0/10100 not in the wire-sign allowlist).
