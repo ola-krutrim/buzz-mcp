@@ -2391,6 +2391,20 @@ function wirePubkeySet(id, hex) {
     return false;
   }
 }
+var wireNameFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
+function wireNameSet(id, name) {
+  try {
+    const v = String(name || "").trim();
+    if (!v) return false;
+    mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+    const f = wireNameFile(id);
+    writeFileSync2(f, v, { mode: 384 });
+    chmodSync2(f, 384);
+    return true;
+  } catch {
+    return false;
+  }
+}
 var MEDIA_MB = 1024 * 1024;
 var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
 async function wireSign(base, token, template, fetchFn = fetch) {
@@ -2533,6 +2547,14 @@ ${url}
         if (probe?.pubkey) wirePubkeySet(wirePersistId(env), probe.pubkey);
       } catch (e) {
         console.error(`[wire-login] (pubkey auto-capture skipped: ${e.message} \u2014 set BUZZ_USER_PUBKEY if needed)`);
+      }
+      try {
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        if (wk.ok) {
+          const kj = await wk.json().catch(() => null);
+          if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name));
+        }
+      } catch {
       }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(`<!doctype html><meta charset="utf-8"><body style="font:15px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a">

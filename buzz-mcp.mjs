@@ -5,7 +5,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId } from "./signer.mjs";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
@@ -80,7 +80,9 @@ function fmtTime(created_at, withDate = false) {
     return `${stamp} ${tzLabel(d)}`;
   } catch { return `${d.toISOString().slice(11, 16)} UTC`; }
 }
-let MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || contextName();
+let MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME
+  || (signer.mode === "wire" ? wireNameGet(wirePersistId(process.env)) : null)   // ekam #335 name captured at login
+  || contextName();
 // NIP-OA owner attestation: if BUZZ_AUTH_TAG is set (a signed ["auth",owner,conditions,sig] JSON),
 // attach it to signed events so the desktop shows "Agent managed by <owner>" instead of "owner unavailable".
 const AUTH_TAG = (() => { try { const t = JSON.parse(process.env.BUZZ_AUTH_TAG || ""); return (Array.isArray(t) && t[0] === "auth" && t.length === 4) ? t : null; } catch { return null; } })();
@@ -113,7 +115,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.10";
+const SHIM_VERSION = "0.2.11";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -775,9 +777,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// pilot #4: in wire mode the shim posts AS the human — default the display name to the
-// user's OWN kind:0 profile name (not the auto <ctx>·<animal>), unless one was set explicitly.
-if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME)) {
+// pilot #4: in wire mode the shim posts AS the human — default the display name to the human.
+// Preferred source is ekam's login-captured `name` (#335, handled at MY_NAME init above); this
+// is the FALLBACK for sessions with no captured name — read the user's OWN kind:0 profile name
+// (not the auto <ctx>·<animal>), unless one was set explicitly.
+if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME)
+    && !wireNameGet(wirePersistId(process.env))) {
   try {
     const pm = await profiles();
     const human = pm[PK];

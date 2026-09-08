@@ -3,7 +3,7 @@
 // dependency). Integration against the LIVE endpoint is deferred until ekam ships
 // 27235 (requirement C) and confirms the contract (requirement D).
 
-import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider } from "./signer.mjs";
+import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet } from "./signer.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 let pass = 0, fail = 0;
@@ -309,6 +309,17 @@ console.log("wire token provider (v0.2.8) — single-flight mint + rotate-persis
   ok(mints === 2 && sentRefresh[1] === "rot-1", "force renew mints once more, sending the ROTATED (persisted) refresh, not the spent original");
   p.stopKeepAlive();
   try { nfs.rmSync(tokFile, { force: true }); } catch { /* throwaway */ }
+}
+
+// wire display-name capture (ekam #335: /v1/me/wire-key `name`) — round-trip, trim, fallbacks.
+console.log("wire display name (ekam #335 name capture):");
+{
+  const id = "test-wirename-" + Date.now();
+  ok(wireNameSet(id, "  Anirban Das  ") === true, "wireNameSet persists a name");
+  ok(wireNameGet(id) === "Anirban Das", "wireNameGet reads it back trimmed");
+  ok(wireNameSet(id + "-empty", "   ") === false, "wireNameSet refuses an empty/whitespace name");
+  ok(wireNameGet("absent-" + Date.now()) === null, "wireNameGet returns null when absent");
+  try { const nfs = await import("node:fs"); const { join } = await import("node:path"); const { homedir } = await import("node:os"); nfs.rmSync(join(homedir(), ".config", "buzz-cli", "wire-refresh", id + ".name"), { force: true }); } catch { /* throwaway */ }
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);

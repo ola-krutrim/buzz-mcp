@@ -19132,6 +19132,16 @@ function wirePubkeyGet(id) {
     return null;
   }
 }
+var wireNameFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
+function wireNameGet(id) {
+  try {
+    const f = wireNameFile(id);
+    const v = existsSync2(f) ? readFileSync2(f, "utf8").trim() : "";
+    return v || null;
+  } catch {
+    return null;
+  }
+}
 function makeWireTokenProvider(env, fetchFn) {
   const base = ekamBase2(env);
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
@@ -19501,7 +19511,7 @@ function fmtTime(created_at, withDate = false) {
     return `${d.toISOString().slice(11, 16)} UTC`;
   }
 }
-var MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || contextName();
+var MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || (signer.mode === "wire" ? wireNameGet(wirePersistId(process.env)) : null) || contextName();
 var AUTH_TAG = (() => {
   try {
     const t = JSON.parse(process.env.BUZZ_AUTH_TAG || "");
@@ -19524,7 +19534,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.10";
+var SHIM_VERSION = "0.2.11";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20139,7 +20149,7 @@ ${body}`);
     return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
   }
 });
-if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME)) {
+if (signer.mode === "wire" && !(process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME) && !wireNameGet(wirePersistId(process.env))) {
   try {
     const pm = await profiles();
     const human = pm[PK];

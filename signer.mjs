@@ -57,6 +57,18 @@ export function wirePubkeySet(id, hex) {
   try { mkdirSync(WIRE_REFRESH_DIR, { recursive: true, mode: 0o700 }); const f = wirePubkeyFile(id); writeFileSync(f, hex, { mode: 0o600 }); chmodSync(f, 0o600); return true; } catch { return false; }
 }
 
+// The user's display name captured at login (ekam #335: /v1/me/wire-key returns `name` =
+// the Ekam profile displayName → email local-part). Persisted next to the refresh so wire
+// mode shows the PERSON's name (not an auto <ctx>·<animal>). Preferred over a kind:0 read
+// because it's the identity system's authoritative name.
+const wireNameFile = (id) => join(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
+export function wireNameGet(id) {
+  try { const f = wireNameFile(id); const v = existsSync(f) ? readFileSync(f, "utf8").trim() : ""; return v || null; } catch { return null; }
+}
+export function wireNameSet(id, name) {
+  try { const v = String(name || "").trim(); if (!v) return false; mkdirSync(WIRE_REFRESH_DIR, { recursive: true, mode: 0o700 }); const f = wireNameFile(id); writeFileSync(f, v, { mode: 0o600 }); chmodSync(f, 0o600); return true; } catch { return false; }
+}
+
 // Wire-mode bearer provider (the loadkey_v2 Phase-2 seam for "post as me"). Sources:
 //   • BUZZ_WIRE_REFRESH (+ BUZZ_EKAM_CLIENT_ID): the offline_access refresh from the
 //     one-time wire:sign login. Shim self-re-mints a short-TTL wire:sign access token

@@ -14,7 +14,7 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireBleedVars, wireSign } from "./signer.mjs";
+import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
@@ -113,6 +113,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         const probe = await wireSign(base, tok.access_token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" });
         if (probe?.pubkey) wirePubkeySet(wirePersistId(env), probe.pubkey);
       } catch (e) { console.error(`[wire-login] (pubkey auto-capture skipped: ${e.message} — set BUZZ_USER_PUBKEY if needed)`); }
+      // Capture the person's display name (ekam #335: /v1/me/wire-key returns `name`), so the
+      // shim shows the human's name instead of an auto-handle. Best-effort; login still succeeds.
+      try {
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        if (wk.ok) { const kj = await wk.json().catch(() => null); if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name)); }
+      } catch { /* name is a nicety; the auto-handle remains the fallback */ }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(`<!doctype html><meta charset="utf-8"><body style="font:15px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a">
 <h2 style="margin:0 0 .5rem">✅ Buzz is now connected as you</h2>

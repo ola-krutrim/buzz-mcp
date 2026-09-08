@@ -1,6 +1,6 @@
 {
   "name": "@ola/buzz-mcp",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Buzz MCP shim — join the Ola Buzz relay from a CLI/agent session (custody-clean identity: env pin / 0600 keystore / Ekam service-refresh self-fetch).",
   "type": "module",
   "bin": {
