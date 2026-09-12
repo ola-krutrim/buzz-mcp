@@ -115,7 +115,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.11";
+const SHIM_VERSION = "0.2.12";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -416,7 +416,7 @@ const TOOLS = [
   { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
   { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
-  { name: "buzz_post", description: "Post a message to a channel. Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel", "text"] } },
+  { name: "buzz_post", description: "Post a message to a channel. The body goes in `text` (its alias `message` is also accepted). Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel"] } },
   { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is 👍.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to 👍" } }, required: ["channel", "event"] } },
   { name: "buzz_add_member", description: "Add a person to a channel (NIP-29 kind 9000), as you. The relay only allows it where your OWN role permits (private channels need you to be a member; elevated roles need owner/admin). NOTE: the added person can then see the channel's prior history. `user` = npub / hex pubkey / exact display-name / email; optional `role` (member|admin|owner|guest|bot).", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" }, role: { type: "string", description: "member|admin|owner|guest|bot (default member; elevated needs your owner/admin)" } }, required: ["channel", "user"] } },
@@ -425,7 +425,7 @@ const TOOLS = [
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
   { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
-  { name: "buzz_dm_send", description: "Send a direct message to a person — opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" } }, required: ["to", "text"] } },
+  { name: "buzz_dm_send", description: "Send a direct message to a person — opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -536,10 +536,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "buzz_post") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${EXPECTED_PK.slice(0, 16)}…. Not posting as the wrong agent. Fix your pin, or launch with your own CLAUDE_CONFIG_DIR.` }], isError: true };
-      // guard: a missing/mis-named text arg would otherwise throw a cryptic "reading 'match'"
-      // on the @-mention scan below. The parameter is `text` (not `message`). (pilot #1 fallout)
-      if (typeof a.text !== "string" || a.text.trim() === "")
-        return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` string. (The parameter is `text` — not `message`.)" }], isError: true };
+      // Accept the body under `text` (schema) OR `message` (a common client mis-key that dropped
+      // the body silently — bossman [08:55]: dbre + likely Bhavish hit exactly this). Fail LOUD
+      // only when BOTH are empty — never publish a blank post, never a cryptic "reading 'match'".
+      const bodyText = (typeof a.text === "string" && a.text.trim()) ? a.text
+        : (typeof a.message === "string" && a.message.trim()) ? a.message : null;
+      if (bodyText === null)
+        return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const ch = await resolveChannel(a.channel);
       const names = await profiles();
       // Index each identity under several keys so @Pulse resolves even when the
@@ -557,14 +560,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const tags = [["h", ch.id]];
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation → "Agent managed by <owner>"
-      for (const m of (a.text.match(/@([A-Za-z0-9_-]+)/g) || [])) {
+      for (const m of (bodyText.match(/@([A-Za-z0-9_-]+)/g) || [])) {
         const pk = byName[m.slice(1).toLowerCase()];
         if (pk) tags.push(["p", pk]);
       }
       // Optional attachment: upload the local file (Blossom) → attach a NIP-92 imeta tag
       // whose url/x match exactly what was uploaded (hash-bound). Content echoes the url too,
       // matching how Buzz clients render attachments.
-      let attached = null, content = a.text;
+      let attached = null, content = bodyText;
       if (a.attachment) {
         const up = await blossomUpload(String(a.attachment));
         tags.push(buildImeta(up));
@@ -574,7 +577,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${a.text}`);
+      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${bodyText}`);
     }
 
     if (name === "buzz_attachment_read") {
@@ -764,11 +767,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "buzz_dm_send") {
       if (!IDENTITY_OK) return dmRefuse();
+      // Same `text`|`message` alias + fail-loud-if-both-empty as buzz_post (self-heals the class).
+      const bodyText = (typeof a.text === "string" && a.text.trim()) ? a.text
+        : (typeof a.message === "string" && a.message.trim()) ? a.message : null;
+      if (bodyText === null)
+        return { content: [{ type: "text", text: "buzz_dm_send requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const pk = await resolveRecipient(a.to);
       const { channelId } = await openDm([pk]);
-      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: a.text });
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: bodyText });
       await bridge("/events", ev);
-      return ok(`sent DM to ${a.to} [${channelId}]: ${a.text}`);
+      return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
     }
 
     return ok(`unknown tool: ${name}`);

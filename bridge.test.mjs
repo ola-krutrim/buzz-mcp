@@ -118,10 +118,12 @@ console.log("\ncase 2: agent-mode relay-fetch failure (unroutable relay)");
   }
 }
 
-// ---- Case 3: buzz_post with the wrong param name → clear error, not a cryptic throw ----
-// Origin: Anirban's pilot — a post call missing `text` (e.g. passing `message`) threw
-// "reading 'match'" from the @-mention scan. The guard must return an actionable message.
-console.log("\ncase 3: buzz_post missing `text` (passed `message`)");
+// ---- Case 3: buzz_post with NO body at all → fail LOUD, not a cryptic throw / not a blank post ----
+// Origin: Anirban's pilot — a post call with the body under the wrong key threw "reading 'match'".
+// As of v0.2.12 `message` is accepted as an alias for `text` (bossman [08:55]), so the guard only
+// fires when BOTH are absent. It must then return an actionable error naming `text` — never the
+// cryptic TypeError, never a blank post. (We assert the empty path, which needs no live post.)
+console.log("\ncase 3: buzz_post with neither `text` nor `message` → fail loud");
 {
   const text = await new Promise((resolve) => {
     const p = spawn("node", [SHIM], {
@@ -133,13 +135,13 @@ console.log("\ncase 3: buzz_post missing `text` (passed `message`)");
     let out = ""; p.stdout.on("data", (d) => (out += d));
     const send = (o) => { try { p.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
     send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bridge-test", version: "1" } } });
-    setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "buzz_post", arguments: { channel: "buzz-main", message: "oops, wrong param" } } }), 1000);
+    setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "buzz_post", arguments: { channel: "buzz-main" } } }), 1000);
     setTimeout(() => { p.kill(); const r = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.id === 2); resolve(r ? JSON.stringify(r.result ?? r.error) : null); }, 6000);
   });
   if (text == null) skipped("no reply for post-guard case");
   else {
     console.log("  client sees: " + text.slice(0, 160));
-    ok(/requires a non-empty `?text`? string/i.test(text), "missing text → clear, actionable error naming `text`");
+    ok(/requires a non-empty `?text`?/i.test(text), "empty body → clear, actionable error naming `text`");
     ok(!/reading 'match'/i.test(text), "does NOT throw the cryptic reading-'match' TypeError");
   }
 }
