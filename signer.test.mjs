@@ -219,6 +219,11 @@ catch (e) { ok(/64-hex|concrete/i.test(e.message), "delete REFUSES a non-64-hex 
 try { deleteMessageTemplate({ channelId: "", targetId: "d".repeat(64) }); ok(false, "delete no-channel should throw"); }
 catch (e) { ok(/channel/i.test(e.message), "delete REFUSES a channel-less op (h-tag)"); }
 
+console.log("user status (NIP-38 kind 30315) — v0.2.13: agent-mode only, NOT in the wire allowlist:");
+ok(!WIRE_ALLOWLIST.has(30315), "kind 30315 is NOT in the wire-sign allowlist (Ekam doesn't sign it for post-as-me yet)");
+ok(wsigner.canSign(30315) === false, "wire signer canSign(30315) === false → buzz_status_set/clear must refuse in wire mode");
+ok(lsigner.canSign(30315) === true, "local signer canSign(30315) === true → status works in agent mode");
+
 console.log("blossom media auth (kind 24242) — fail-closed shim constraints (codex_kavach gate):");
 {
   const SHA = "a".repeat(64);

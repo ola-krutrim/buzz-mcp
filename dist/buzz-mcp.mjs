@@ -19534,7 +19534,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.12";
+var SHIM_VERSION = "0.2.13";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19813,6 +19813,39 @@ async function openDm(others) {
   if (!channelId) throw new Error("open_dm: relay did not return a channel id");
   return { channelId, created };
 }
+async function resolveEventInChannel(chId, chName, rawEvent) {
+  const targetId = String(rawEvent || "").trim();
+  if (!targetId) throw new Error("a target event <id> is required (from buzz_read)");
+  const isFullId = /^[0-9a-f]{64}$/i.test(targetId);
+  let hit = null;
+  if (isFullId) {
+    hit = (await query([{ ids: [targetId], "#h": [chId] }]) || [])[0];
+    if (!hit) throw new Error(`message ${targetId.slice(0, 8)}\u2026 is not in #${chName} \u2014 the target must be a message in the channel you name`);
+  } else {
+    const recent = await query([{ kinds: [9], "#h": [chId], limit: 200 }]) || [];
+    const pref = recent.filter((e) => String(e.id).startsWith(targetId));
+    if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${chName} (${pref.length} matches) \u2014 use more characters`);
+    hit = pref[0];
+    if (!hit) throw new Error(`no message with id "${targetId}" found in #${chName} \u2014 use the <id> shown by buzz_read`);
+  }
+  if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === chId))
+    throw new Error(`target message is not bound to #${chName} \u2014 refusing a cross-channel operation`);
+  return hit;
+}
+function mentionPtags(text, names) {
+  const byName = {};
+  for (const [pk, n] of Object.entries(names)) {
+    const low = String(n).toLowerCase();
+    const keys = /* @__PURE__ */ new Set([low, low.replace(/[^a-z0-9]+/g, ""), (low.match(/[a-z0-9]+/) || [""])[0]]);
+    for (const k of keys) if (k && !(k in byName)) byName[k] = pk;
+  }
+  const out = [];
+  for (const m of String(text).match(/@([A-Za-z0-9_-]+)/g) || []) {
+    const pk = byName[m.slice(1).toLowerCase()];
+    if (pk && !out.includes(pk)) out.push(pk);
+  }
+  return out;
+}
 var server = new Server({ name: "buzz", version: "0.1.0" }, { capabilities: { tools: {} } });
 var TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
@@ -19825,13 +19858,18 @@ var TOOLS = [
   { name: "buzz_post", description: "Post a message to a channel. The body goes in `text` (its alias `message` is also accepted). Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel"] } },
   { name: "buzz_attachment_read", description: "Download an attachment from a message you can read and return it (text extracted for docs; a saved file path otherwise). Identify the message by `channel` + `event` (the <id> from buzz_read); if the message has multiple attachments, pass `index` (default 0).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" }, index: { type: "number", description: "which attachment on the message (default 0)" } }, required: ["channel", "event"] } },
   { name: "buzz_react", description: "React to a message with an emoji (NIP-25). Needs the channel and the target message's event id; reacts as this identity. Default emoji is \u{1F44D}.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's event id (from buzz_read)" }, emoji: { type: "string", description: "the reaction emoji; defaults to \u{1F44D}" } }, required: ["channel", "event"] } },
+  { name: "buzz_reply", description: "Reply to a message in a channel, threaded per NIP-10 (kind 9). Needs `channel` + `event` (the <id> from buzz_read); the reply body goes in `text` (its alias `message` is also accepted). Threads under the original via marked e-tags (root/reply). Use @Name to mention agents; optional `attachment` = a local file path to upload + attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the message being replied to (<id> from buzz_read)" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" }, attachment: { type: "string", description: "local file path to upload + attach" } }, required: ["channel", "event"] } },
+  { name: "buzz_forward", description: "Forward (quote) a message to another channel or person as a link-back pill (kind 9) \u2014 it REFERENCES the source event, it does not copy the original text. `source_channel` + `event` identify the message; `to` = a channel (name/id) OR a person (npub / hex / email / exact display-name, DM'd). Optional `comment` becomes your note (empty allowed).", inputSchema: { type: "object", properties: { source_channel: { type: "string" }, event: { type: "string", description: "the message to forward (<id> from buzz_read)" }, to: { type: "string", description: "target channel (name/id) or person (npub / hex / email / display-name)" }, comment: { type: "string", description: "optional note posted with the pill (empty allowed)" } }, required: ["source_channel", "event", "to"] } },
   { name: "buzz_add_member", description: "Add a person to a channel (NIP-29 kind 9000), as you. The relay only allows it where your OWN role permits (private channels need you to be a member; elevated roles need owner/admin). NOTE: the added person can then see the channel's prior history. `user` = npub / hex pubkey / exact display-name / email; optional `role` (member|admin|owner|guest|bot).", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" }, role: { type: "string", description: "member|admin|owner|guest|bot (default member; elevated needs your owner/admin)" } }, required: ["channel", "user"] } },
   { name: "buzz_remove_member", description: "Remove a person from a channel (NIP-29 kind 9001), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). `user` = npub / hex pubkey / exact display-name / email.", inputSchema: { type: "object", properties: { channel: { type: "string" }, user: { type: "string", description: "npub / hex pubkey / exact display name / email" } }, required: ["channel", "user"] } },
   { name: "buzz_delete", description: "Delete a message in a channel (NIP-29 kind 9005), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). Identify the message by `channel` + `event` (the <id> from buzz_read).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
   { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
-  { name: "buzz_dm_send", description: "Send a direct message to a person \u2014 opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } }
+  { name: "buzz_dm_send", description: "Send a direct message to a person \u2014 opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } },
+  { name: "buzz_status_set", description: "Set your live user status (NIP-38 kind 30315, d=general). `text` = the status message (empty allowed), optional `emoji`. AGENT MODE ONLY \u2014 wire mode (post-as-the-user) can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: { text: { type: "string", description: "the status text (empty allowed)" }, emoji: { type: "string", description: "optional status emoji" } } } },
+  { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general \u2014 a replaceable-event clear). AGENT MODE ONLY \u2014 wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
+  { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) \u2014 it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } }
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 var RELAY_INFO = null;
@@ -20051,6 +20089,68 @@ ${body}`);
       const who = author ? (await profiles())[author] || author.slice(0, 8) : "";
       return ok(`reacted ${emoji2} to ${who ? `${who}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
     }
+    if (name === "buzz_reply") {
+      if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not replying as the wrong identity.` }], isError: true };
+      const bodyText = typeof a.text === "string" && a.text.trim() ? a.text : typeof a.message === "string" && a.message.trim() ? a.message : null;
+      if (bodyText === null)
+        return { content: [{ type: "text", text: "buzz_reply requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
+      if (!String(a.event || "").trim())
+        return { content: [{ type: "text", text: "buzz_reply needs the `event` <id> of the message you're replying to (from buzz_read)." }], isError: true };
+      const ch = await resolveChannel(a.channel);
+      const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+      const names = await profiles();
+      const tags = [["h", ch.id]];
+      if (AUTH_TAG) tags.push(AUTH_TAG);
+      const rootTag = (target.tags || []).filter((t) => t[0] === "e").find((t) => t[3] === "root");
+      const rootId = rootTag && rootTag[1] && rootTag[1] !== target.id ? rootTag[1] : null;
+      if (rootId) {
+        tags.push(["e", rootId, "", "root"]);
+        tags.push(["e", target.id, "", "reply"]);
+      } else tags.push(["e", target.id, "", "root"]);
+      const ptags = /* @__PURE__ */ new Set();
+      if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());
+      for (const pk of mentionPtags(bodyText, names)) ptags.add(pk);
+      for (const pk of ptags) tags.push(["p", pk]);
+      let attached = null, content = bodyText;
+      if (a.attachment) {
+        const up = await blossomUpload(String(a.attachment));
+        tags.push(buildImeta(up));
+        content = content ? `${content}
+${up.url}` : up.url;
+        attached = up;
+      }
+      const ev = await signer.sign({ kind: 9, tags, content });
+      await bridge("/events", ev);
+      const who = names[target.pubkey] || (target.pubkey || "").slice(0, 8);
+      const mentioned = tags.filter((t) => t[0] === "p").length;
+      return ok(`replied in #${ch.name} to ${who}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${bodyText}`);
+    }
+    if (name === "buzz_forward") {
+      if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not forwarding as the wrong identity.` }], isError: true };
+      if (!String(a.event || "").trim())
+        return { content: [{ type: "text", text: "buzz_forward needs the `event` <id> of the message to forward (from buzz_read)." }], isError: true };
+      if (!String(a.to || "").trim())
+        return { content: [{ type: "text", text: "buzz_forward needs a `to` target \u2014 a channel (name/id) or a person (npub / hex / email / display-name)." }], isError: true };
+      const src = await resolveChannel(a.source_channel);
+      const source = await resolveEventInChannel(src.id, src.name, a.event);
+      let destId, destLabel;
+      try {
+        const dch = await resolveChannel(a.to);
+        destId = dch.id;
+        destLabel = `#${dch.name}`;
+      } catch {
+        const pk = await resolveRecipient(a.to);
+        const { channelId } = await openDm([pk]);
+        destId = channelId;
+        destLabel = `DM ${(await profiles())[pk] || pk.slice(0, 8)}`;
+      }
+      const tags = [["h", destId], ["e", source.id], ["k", String(source.kind || 9)]];
+      if (AUTH_TAG) tags.push(AUTH_TAG);
+      const content = typeof a.comment === "string" ? a.comment : "";
+      const ev = await signer.sign({ kind: 9, tags, content });
+      await bridge("/events", ev);
+      return ok(`forwarded <${String(source.id).slice(0, 8)}> from #${src.name} \u2192 ${destLabel}${content ? ` with comment: ${content}` : " (link-back pill, no comment)"}`);
+    }
     const modRefuse = (verb) => ({ content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not ${verb} as the wrong identity.` }], isError: true });
     if (name === "buzz_add_member") {
       if (!IDENTITY_OK) return modRefuse("adding members");
@@ -20147,6 +20247,61 @@ ${body}`);
       const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: bodyText });
       await bridge("/events", ev);
       return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
+    }
+    const STATUS_KIND = 30315;
+    if (name === "buzz_status_set") {
+      if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not setting a status as the wrong identity.` }], isError: true };
+      if (!signer.canSign(STATUS_KIND))
+        return { content: [{ type: "text", text: "buzz_status_set: status (kind 30315) isn't in the wire-sign allowlist \u2014 agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+      const text = typeof a.text === "string" ? a.text : "";
+      const tags = [["d", "general"]];
+      const emoji2 = a.emoji && String(a.emoji).trim();
+      if (emoji2) tags.push(["emoji", emoji2]);
+      if (AUTH_TAG) tags.push(AUTH_TAG);
+      const ev = await signer.sign({ kind: STATUS_KIND, tags, content: text });
+      await bridge("/events", ev);
+      return ok(`status set${emoji2 ? ` ${emoji2}` : ""}: ${text || "(empty)"}`);
+    }
+    if (name === "buzz_status_clear") {
+      if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not clearing a status as the wrong identity.` }], isError: true };
+      if (!signer.canSign(STATUS_KIND))
+        return { content: [{ type: "text", text: "buzz_status_clear: status (kind 30315) isn't in the wire-sign allowlist \u2014 agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+      const tags = [["d", "general"]];
+      if (AUTH_TAG) tags.push(AUTH_TAG);
+      const ev = await signer.sign({ kind: STATUS_KIND, tags, content: "" });
+      await bridge("/events", ev);
+      return ok("status cleared.");
+    }
+    if (name === "buzz_unread") {
+      const hours = Number.isFinite(a.hours) && a.hours > 0 ? a.hours : 24;
+      const since = Math.floor(Date.now() / 1e3) - Math.floor(hours * 3600);
+      const cs = await channels();
+      const dms = await dmChannels();
+      const names = await profiles();
+      const meta2 = /* @__PURE__ */ new Map();
+      for (const c of cs) meta2.set(c.id, `#${c.name}`);
+      for (const d of dms) meta2.set(d.id, `DM ${d.others.map((p) => names[p] || p.slice(0, 8)).join(", ") || "(self)"}`);
+      const ids = [...meta2.keys()];
+      if (!ids.length) return ok("no channels or DMs to scan.");
+      const evs = await query([{ kinds: [9], "#h": ids, since, limit: 2e3 }]) || [];
+      const stat = /* @__PURE__ */ new Map();
+      for (const e of evs) {
+        const id = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+        if (!id || !meta2.has(id)) continue;
+        if (e.pubkey === PK) continue;
+        const s = stat.get(id) || { msgs: 0, mentions: 0 };
+        s.msgs++;
+        if ((e.tags || []).some((t) => t[0] === "p" && t[1] === PK)) s.mentions++;
+        stat.set(id, s);
+      }
+      const active = [...stat.entries()].sort((x, y) => y[1].msgs - x[1].msgs);
+      if (!active.length) return ok(`Unread digest (last ${hours}h): no new messages across ${ids.length} channel(s)/DM(s).`);
+      const totMsgs = active.reduce((n, [, s]) => n + s.msgs, 0);
+      const totMentions = active.reduce((n, [, s]) => n + s.mentions, 0);
+      const lines = active.map(([id, s]) => `  ${meta2.get(id)}  \u2014  ${s.msgs} new${s.mentions ? `  (${s.mentions} @you)` : ""}`);
+      return ok(`Unread digest (last ${hours}h) \u2014 ${active.length} active of ${ids.length}:
+${lines.join("\n")}
+Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
     }
     return ok(`unknown tool: ${name}`);
   } catch (e) {
