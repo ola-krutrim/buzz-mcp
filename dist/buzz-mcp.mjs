@@ -3732,7 +3732,7 @@ var require_schemes = __commonJS({
       urnComponent.nss = (uuidComponent.uuid || "").toLowerCase();
       return urnComponent;
     }
-    var http = (
+    var http2 = (
       /** @type {SchemeHandler} */
       {
         scheme: "http",
@@ -3745,7 +3745,7 @@ var require_schemes = __commonJS({
       /** @type {SchemeHandler} */
       {
         scheme: "https",
-        domainHost: http.domainHost,
+        domainHost: http2.domainHost,
         parse: httpParse,
         serialize: httpSerialize
       }
@@ -3789,7 +3789,7 @@ var require_schemes = __commonJS({
     var SCHEMES = (
       /** @type {Record<SchemeName, SchemeHandler>} */
       {
-        http,
+        http: http2,
         https,
         ws,
         wss,
@@ -19101,6 +19101,7 @@ import { join as join3 } from "node:path";
 var now = () => Math.floor(Date.now() / 1e3);
 var ekamBase2 = (env) => (env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
 var wirePersistId = (env) => (env.BUZZ_WIRE_ID || "wire").trim() || "wire";
+var wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter((k) => (env[k] || "").trim());
 var WIRE_REFRESH_DIR = join3(homedir2(), ".config", "buzz-cli", "wire-refresh");
 var wireRefreshFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
 function wireRefreshGet(id) {
@@ -19132,6 +19133,17 @@ function wirePubkeyGet(id) {
     return null;
   }
 }
+function wirePubkeySet(id, hex) {
+  try {
+    mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+    const f = wirePubkeyFile(id);
+    writeFileSync2(f, hex, { mode: 384 });
+    chmodSync2(f, 384);
+    return true;
+  } catch {
+    return false;
+  }
+}
 var wireNameFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
 function wireNameGet(id) {
   try {
@@ -19140,6 +19152,19 @@ function wireNameGet(id) {
     return v || null;
   } catch {
     return null;
+  }
+}
+function wireNameSet(id, name) {
+  try {
+    const v = String(name || "").trim();
+    if (!v) return false;
+    mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+    const f = wireNameFile(id);
+    writeFileSync2(f, v, { mode: 384 });
+    chmodSync2(f, 384);
+    return true;
+  } catch {
+    return false;
   }
 }
 function makeWireTokenProvider(env, fetchFn) {
@@ -19430,15 +19455,166 @@ async function resolveSigner(opts = {}) {
   };
 }
 
-// buzz-mcp.mjs
+// wirelogin.mjs
+import http from "node:http";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+var b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+function pkce() {
+  const verifier = b64url(randomBytes2(32));
+  const challenge2 = b64url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge: challenge2 };
+}
+function authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource }) {
+  const p = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: "openid wire:sign offline_access",
+    resource,
+    code_challenge: challenge2,
+    code_challenge_method: "S256",
+    state
+  });
+  return `${base}/authorize?${p.toString()}`;
+}
+async function exchangeAuthCode(base, { code, verifier, clientId, redirectUri }, fetchFn = fetch) {
+  const res = await fetchFn(`${base}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri })
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    let d = text.slice(0, 200);
+    try {
+      const j2 = JSON.parse(text);
+      d = j2.error_description || j2.error || d;
+    } catch {
+    }
+    throw new Error(`authcode exchange -> HTTP ${res.status}: ${d}`);
+  }
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    throw new Error(`authcode exchange returned non-JSON: ${text.slice(0, 120)}`);
+  }
+  if (!j.refresh_token)
+    throw new Error("authcode exchange returned no refresh_token \u2014 did step \u2461 grant offline_access + refresh_token to this client?");
+  return j;
+}
+async function bindLoopback(ports) {
+  for (const port of ports) {
+    const srv = http.createServer();
+    const bound = await new Promise((resolve) => {
+      srv.once("error", () => resolve(false));
+      srv.listen(port, "127.0.0.1", () => resolve(true));
+    });
+    if (bound) return { srv, port };
+    try {
+      srv.close();
+    } catch {
+    }
+  }
+  throw new Error(`no free loopback port among ${ports.join(", ")} \u2014 free one or set BUZZ_WIRE_LOGIN_PORTS`);
+}
+if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
+  const env = process.env;
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
+  if (!clientId) {
+    console.error("[wire-login] set BUZZ_EKAM_CLIENT_ID (from the DCR registration)");
+    process.exit(1);
+  }
+  const base = ekamBase2(env);
+  const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+  const { verifier, challenge: challenge2 } = pkce();
+  const state = b64url(randomBytes2(16));
+  const { srv, port } = await bindLoopback(ports);
+  const redirectUri = `http://127.0.0.1:${port}/callback`;
+  const url = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
+  console.error(`
+[wire-login] open this URL in your browser to grant "post as me":
+
+${url}
+
+[wire-login] waiting for the redirect on ${redirectUri} \u2026`);
+  try {
+    const [cmd, ...pre] = process.platform === "darwin" ? ["open"] : process.platform === "win32" ? ["cmd", "/c", "start", ""] : ["xdg-open"];
+    spawn(cmd, [...pre, url], { stdio: "ignore", detached: true }).unref();
+    console.error("[wire-login] (tried to open your browser \u2014 if nothing opened, paste the URL above)");
+  } catch {
+  }
+  srv.on("request", async (req, res) => {
+    try {
+      const u = new URL(req.url, redirectUri);
+      if (u.pathname !== "/callback") {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      const err = u.searchParams.get("error");
+      if (err) throw new Error(`authorize error: ${err} ${u.searchParams.get("error_description") || ""}`);
+      if (u.searchParams.get("state") !== state) throw new Error("state mismatch (possible CSRF) \u2014 aborting");
+      const code = u.searchParams.get("code");
+      if (!code) throw new Error("no authorization code in callback");
+      const tok = await exchangeAuthCode(base, { code, verifier, clientId, redirectUri });
+      wireRefreshSet(wirePersistId(env), tok.refresh_token);
+      try {
+        const probe = await wireSign(base, tok.access_token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" });
+        if (probe?.pubkey) wirePubkeySet(wirePersistId(env), probe.pubkey);
+      } catch (e) {
+        console.error(`[wire-login] (pubkey auto-capture skipped: ${e.message} \u2014 set BUZZ_USER_PUBKEY if needed)`);
+      }
+      try {
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        if (wk.ok) {
+          const kj = await wk.json().catch(() => null);
+          if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name));
+        }
+      } catch {
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><meta charset="utf-8"><body style="font:15px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a">
+<h2 style="margin:0 0 .5rem">\u2705 Buzz is now connected as you</h2>
+<p>Sign-in complete. The Buzz tool can now post and DM under your identity through Ekam's revocable signer \u2014 your key was never shared with it.</p>
+<p style="color:#666">You can safely close this tab.</p></body>`);
+      const pid = wirePersistId(env);
+      console.error(`[wire-login] success \u2014 wire:sign refresh persisted 0600 (id=${pid}). The shim is now autonomous. access expires_in=${tok.expires_in || "?"}s`);
+      const bleed = wireBleedVars(env);
+      if (bleed.length)
+        console.error(`[wire-login] note: ${bleed.join(", ")} is set but IGNORED for wire mode (it keys off BUZZ_WIRE_ID, default "wire"). Do NOT set BUZZ_IDENTITY_NAME=<agent> for the human "post as me" shim \u2014 that was the old footgun.`);
+      setTimeout(() => {
+        try {
+          srv.close();
+        } catch {
+        }
+        process.exit(0);
+      }, 200);
+    } catch (e) {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("login failed: " + e.message);
+      console.error(`[wire-login] FAILED: ${e.message}`);
+      setTimeout(() => {
+        try {
+          srv.close();
+        } catch {
+        }
+        process.exit(1);
+      }, 200);
+    }
+  });
+}
+
+// buzz-mcp.mjs
+import { createHash as createHash2, randomBytes as randomBytes3 } from "node:crypto";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, appendFileSync, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync3, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir as homedir3, hostname, tmpdir } from "node:os";
 import { join as join4, basename, extname } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawn as spawn2 } from "node:child_process";
 var RELAY = process.env.BUZZ_RELAY_HTTP || "http://localhost:3000";
 var SIGN_BASE = process.env.BUZZ_SIGN_BASE || RELAY;
 var CFG_DIR2 = join4(homedir3(), ".config", "buzz-cli");
@@ -19528,13 +19704,13 @@ if (!IDENTITY_OK)
   process.stderr.write(`[buzz-mcp] \u26A0 IMPERSONATION GUARD: config expects ${EXPECTED_PK.slice(0, 16)} but running key is ${PK.slice(0, 16)} (${MY_NAME}). WRITES DISABLED. Fix: pin the correct key, or launch with your own CLAUDE_CONFIG_DIR.
 `);
 async function nip98(url, method, body) {
-  const payload = createHash("sha256").update(body ?? "").digest("hex");
+  const payload = createHash2("sha256").update(body ?? "").digest("hex");
   const ev = await signer.sign(
-    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes2(12).toString("hex")]], content: "" }
+    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes3(12).toString("hex")]], content: "" }
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.14";
+var SHIM_VERSION = "0.2.15";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19611,7 +19787,7 @@ var MB = MEDIA_MB;
 var TEXT_MIME = /^(text\/|application\/(json|xml|.*\+xml|x-yaml|yaml))/;
 function sha256File(p) {
   return new Promise((res, rej) => {
-    const h = createHash("sha256");
+    const h = createHash2("sha256");
     const s = createReadStream(p);
     s.on("error", rej);
     s.on("data", (c) => h.update(c));
@@ -19869,7 +20045,8 @@ var TOOLS = [
   { name: "buzz_dm_send", description: "Send a direct message to a person \u2014 opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } },
   { name: "buzz_status_set", description: "Set your live user status (NIP-38 kind 30315, d=general). `text` = the status message (empty allowed), optional `emoji`. AGENT MODE ONLY \u2014 wire mode (post-as-the-user) can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: { text: { type: "string", description: "the status text (empty allowed)" }, emoji: { type: "string", description: "optional status emoji" } } } },
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general \u2014 a replaceable-event clear). AGENT MODE ONLY \u2014 wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) \u2014 it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } }
+  { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) \u2014 it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
+  { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal \u2014 for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again \u2014 or buzz_whoami \u2014 to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } }
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 var RELAY_INFO = null;
@@ -19897,6 +20074,7 @@ var keyProvenance = () => {
   if (EXPECTED_PK) return IDENTITY_OK ? `${base}; pin VERIFIED \u2705 (matches BUZZ_EXPECTED_PUBKEY)` : `\u26A0 IMPERSONATION GUARD TRIPPED: key ${PK.slice(0, 16)}\u2026 \u2260 expected ${EXPECTED_PK.slice(0, 16)}\u2026 \u2014 WRITES DISABLED`;
   return `${base} (no BUZZ_EXPECTED_PUBKEY \u2014 set it to fail-closed on mis-pin)`;
 };
+var pendingLogin = null;
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: a = {} } = req.params;
   const ok = (s) => ({ content: [{ type: "text", text: s }] });
@@ -20302,6 +20480,123 @@ ${up.url}` : up.url;
       return ok(`Unread digest (last ${hours}h) \u2014 ${active.length} active of ${ids.length}:
 ${lines.join("\n")}
 Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
+    }
+    if (name === "buzz_login") {
+      const env = process.env;
+      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || "").trim();
+      const base = ekamBase2(env);
+      const persistId = wirePersistId(env);
+      const whoLabel = () => wireNameGet(persistId) || wirePubkeyGet(persistId) || "your account";
+      if (pendingLogin && pendingLogin.status === "done")
+        return ok(`\u2705 connected as ${whoLabel()}. Run buzz_whoami to verify.`);
+      if (pendingLogin && pendingLogin.status === "error") {
+        const msg = pendingLogin.error || "unknown error";
+        pendingLogin = null;
+        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${msg}
+Run buzz_login again to retry.` }], isError: true };
+      }
+      if (pendingLogin && (pendingLogin.status === "expired" || pendingLogin.status === "pending" && Date.now() >= pendingLogin.expires)) {
+        try {
+          pendingLogin.srv.close();
+        } catch {
+        }
+        pendingLogin = null;
+        return { content: [{ type: "text", text: "buzz_login: that sign-in link expired before it was approved. Starting a fresh one \u2014 run buzz_login once more to get the new URL." }], isError: true };
+      }
+      if (pendingLogin && pendingLogin.status === "pending") {
+        const mins = Math.max(1, Math.ceil((pendingLogin.expires - Date.now()) / 6e4));
+        return ok(`still waiting on your browser sign-in \u2014 finish at this URL (~${mins} min left):
+${pendingLogin.authUrl}
+After you approve, run buzz_login again \u2014 or buzz_whoami \u2014 to confirm.`);
+      }
+      if (wireRefreshGet(persistId))
+        return ok(`already connected as ${whoLabel()}; run buzz_whoami to verify. (To re-consent, remove the persisted wire refresh, then call buzz_login again.)`);
+      if (!clientId)
+        return { content: [{ type: "text", text: "buzz_login: no OAuth client id \u2014 pass `client_id` or set the BUZZ_EKAM_CLIENT_ID env var (from the Ekam DCR registration). Without it the wire-sign login can't start." }], isError: true };
+      const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+      const { verifier, challenge: challenge2 } = pkce();
+      const state = randomBytes3(16).toString("base64url");
+      const { srv, port } = await bindLoopback(ports);
+      const redirectUri = `http://127.0.0.1:${port}/callback`;
+      const authUrl = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
+      const ttlMs = (parseInt(env.BUZZ_WIRE_LOGIN_TTL_S || "", 10) || 300) * 1e3;
+      pendingLogin = { srv, verifier, state, redirectUri, clientId, status: "pending", authUrl, expires: Date.now() + ttlMs };
+      srv.on("request", async (req2, res) => {
+        try {
+          const u = new URL(req2.url, redirectUri);
+          if (u.pathname !== "/callback") {
+            res.writeHead(404);
+            res.end("not found");
+            return;
+          }
+          const oerr = u.searchParams.get("error");
+          if (oerr) throw new Error(`authorize error: ${oerr} ${u.searchParams.get("error_description") || ""}`);
+          if (u.searchParams.get("state") !== state) throw new Error("state mismatch (possible CSRF) \u2014 aborting");
+          const code = u.searchParams.get("code");
+          if (!code) throw new Error("no authorization code in callback");
+          const tok = await exchangeAuthCode(base, { code, verifier, clientId, redirectUri });
+          wireRefreshSet(persistId, tok.refresh_token);
+          try {
+            const probe = await wireSign(base, tok.access_token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" });
+            if (probe?.pubkey) wirePubkeySet(persistId, probe.pubkey);
+          } catch {
+          }
+          try {
+            const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+            if (wk.ok) {
+              const kj = await wk.json().catch(() => null);
+              if (kj && kj.name) wireNameSet(persistId, String(kj.name));
+            }
+          } catch {
+          }
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!doctype html><meta charset="utf-8"><body style="font:15px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a"><h2 style="margin:0 0 .5rem">\u2705 Buzz is now connected as you</h2><p>Sign-in complete. Return to your client and run buzz_whoami to confirm \u2014 your key was never shared with the tool.</p><p style="color:#666">You can safely close this tab.</p></body>`);
+          if (pendingLogin) pendingLogin.status = "done";
+        } catch (e) {
+          try {
+            res.writeHead(400, { "Content-Type": "text/plain" });
+            res.end("login failed: " + e.message);
+          } catch {
+          }
+          if (pendingLogin) {
+            pendingLogin.status = "error";
+            pendingLogin.error = e.message;
+          }
+        } finally {
+          try {
+            srv.close();
+          } catch {
+          }
+        }
+      });
+      srv.on("error", (e) => {
+        if (pendingLogin) {
+          pendingLogin.status = "error";
+          pendingLogin.error = e.message;
+        }
+        try {
+          srv.close();
+        } catch {
+        }
+      });
+      const expiryTimer = setTimeout(() => {
+        if (pendingLogin && pendingLogin.status === "pending") {
+          pendingLogin.status = "expired";
+          try {
+            pendingLogin.srv.close();
+          } catch {
+          }
+        }
+      }, ttlMs);
+      if (typeof expiryTimer.unref === "function") expiryTimer.unref();
+      try {
+        const [cmd, ...pre] = process.platform === "darwin" ? ["open"] : process.platform === "win32" ? ["cmd", "/c", "start", ""] : ["xdg-open"];
+        spawn2(cmd, [...pre, authUrl], { stdio: "ignore", detached: true }).unref();
+      } catch {
+      }
+      return ok(`Opening your browser to sign in as yourself. If it didn't open, use this URL:
+${authUrl}
+The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you approve, run buzz_login again (or buzz_whoami) to confirm. If it expires, just run buzz_login again for a fresh link.`);
     }
     return ok(`unknown tool: ${name}`);
   } catch (e) {

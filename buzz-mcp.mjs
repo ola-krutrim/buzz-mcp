@@ -5,7 +5,11 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign } from "./signer.mjs";
+// buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
+// import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
+// (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
+import { pkce, authorizeUrl, exchangeAuthCode, bindLoopback } from "./wirelogin.mjs";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
@@ -13,7 +17,7 @@ import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir, hostname, tmpdir } from "node:os";
 import { join, basename, extname } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 
 const RELAY = process.env.BUZZ_RELAY_HTTP || "http://localhost:3000";
 // URL base the relay validates NIP-98 against (its canonical community host).
@@ -115,7 +119,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.14";
+const SHIM_VERSION = "0.2.15";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -474,6 +478,7 @@ const TOOLS = [
   { name: "buzz_status_set", description: "Set your live user status (NIP-38 kind 30315, d=general). `text` = the status message (empty allowed), optional `emoji`. AGENT MODE ONLY — wire mode (post-as-the-user) can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: { text: { type: "string", description: "the status text (empty allowed)" }, emoji: { type: "string", description: "optional status emoji" } } } },
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general — a replaceable-event clear). AGENT MODE ONLY — wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) — it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
+  { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal — for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again — or buzz_whoami — to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -507,6 +512,12 @@ const keyProvenance = () => {
     : `⚠ IMPERSONATION GUARD TRIPPED: key ${PK.slice(0, 16)}… ≠ expected ${EXPECTED_PK.slice(0, 16)}… — WRITES DISABLED`;
   return `${base} (no BUZZ_EXPECTED_PUBKEY — set it to fail-closed on mis-pin)`;
 };
+
+// buzz_login (v0.2.15) flow state. Module-level so a later buzz_login/buzz_whoami call can
+// observe a flow started by an earlier call (the callback completes out-of-band, in the
+// loopback server's request handler). null = no flow; else { srv, verifier, state, redirectUri,
+// clientId, status: "pending"|"done"|"error"|"expired", authUrl, expires (epoch ms), error? }.
+let pendingLogin = null;
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: a = {} } = req.params;
@@ -959,6 +970,116 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const totMentions = active.reduce((n, [, s]) => n + s.mentions, 0);
       const lines = active.map(([id, s]) => `  ${meta.get(id)}  —  ${s.msgs} new${s.mentions ? `  (${s.mentions} @you)` : ""}`);
       return ok(`Unread digest (last ${hours}h) — ${active.length} active of ${ids.length}:\n${lines.join("\n")}\nTotals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
+    }
+
+    // ---- buzz_login (v0.2.15): terminal-free "post as me" wire-sign OAuth, in-process. -----
+    // Non-blocking + idempotent: never blocks the tool call waiting for the browser (that would
+    // hit client tool-timeouts). The loopback callback completes out-of-band and flips
+    // pendingLogin.status; a later buzz_login / buzz_whoami observes the result. Reuses the
+    // wirelogin.mjs + signer.mjs primitives — no OAuth logic re-implemented here.
+    if (name === "buzz_login") {
+      const env = process.env;
+      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || "").trim();
+      const base = ekamBase(env);
+      const persistId = wirePersistId(env);
+      const whoLabel = () => wireNameGet(persistId) || wirePubkeyGet(persistId) || "your account";
+
+      // Observe an existing flow / already-connected state FIRST — none of these need a client id,
+      // and an already-connected user should hear "already connected", not a client-id error.
+      // (a) a flow that already finished / failed / expired / is still mid-air.
+      if (pendingLogin && pendingLogin.status === "done")
+        return ok(`✅ connected as ${whoLabel()}. Run buzz_whoami to verify.`);
+      if (pendingLogin && pendingLogin.status === "error") {
+        const msg = pendingLogin.error || "unknown error";
+        pendingLogin = null;   // clear so the next call can retry cleanly
+        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${msg}\nRun buzz_login again to retry.` }], isError: true };
+      }
+      // auto-abandon: a pending flow that ran past its TTL (the timer below should have flipped it,
+      // but observe it here too in case the timer never ran). Clear so this call's fall-through can
+      // mint a FRESH link — retry is implicit in re-invoking buzz_login.
+      if (pendingLogin && (pendingLogin.status === "expired" || (pendingLogin.status === "pending" && Date.now() >= pendingLogin.expires))) {
+        try { pendingLogin.srv.close(); } catch { /* already closing */ }
+        pendingLogin = null;
+        return { content: [{ type: "text", text: "buzz_login: that sign-in link expired before it was approved. Starting a fresh one — run buzz_login once more to get the new URL." }], isError: true };
+      }
+      if (pendingLogin && pendingLogin.status === "pending") {
+        const mins = Math.max(1, Math.ceil((pendingLogin.expires - Date.now()) / 60000));
+        return ok(`still waiting on your browser sign-in — finish at this URL (~${mins} min left):\n${pendingLogin.authUrl}\nAfter you approve, run buzz_login again — or buzz_whoami — to confirm.`);
+      }
+
+      // (b) idempotent: already connected (a valid persisted refresh) and no flow in flight.
+      if (wireRefreshGet(persistId))
+        return ok(`already connected as ${whoLabel()}; run buzz_whoami to verify. (To re-consent, remove the persisted wire refresh, then call buzz_login again.)`);
+
+      // (c) only NOW do we need a client id — it gates starting a new flow, not the states above.
+      //     fail LOUD, naming the missing input — no crash.
+      if (!clientId)
+        return { content: [{ type: "text", text: "buzz_login: no OAuth client id — pass `client_id` or set the BUZZ_EKAM_CLIENT_ID env var (from the Ekam DCR registration). Without it the wire-sign login can't start." }], isError: true };
+
+      // (d) start a NEW flow. Bind a loopback port, build the authorize URL, return immediately.
+      const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+      const { verifier, challenge } = pkce();
+      const state = randomBytes(16).toString("base64url");
+      const { srv, port } = await bindLoopback(ports);
+      const redirectUri = `http://127.0.0.1:${port}/callback`;
+      const authUrl = authorizeUrl(base, { clientId, redirectUri, challenge, state, resource: base });
+      // TTL: how long the loopback listener waits for the browser callback before auto-abandoning.
+      // Generous on purpose — a too-tight window (the classic 15s bug) expires mid-login while the
+      // person is still approving SSO / verifying email. 5 min, overridable.
+      const ttlMs = (parseInt(env.BUZZ_WIRE_LOGIN_TTL_S || "", 10) || 300) * 1000;
+      pendingLogin = { srv, verifier, state, redirectUri, clientId, status: "pending", authUrl, expires: Date.now() + ttlMs };
+
+      // The callback runs out-of-band. Wrapped so a failed exchange sets status="error" with the
+      // message (never an unhandled throw). Mirrors wirelogin's persist steps at v0.2.13.
+      srv.on("request", async (req2, res) => {
+        try {
+          const u = new URL(req2.url, redirectUri);
+          if (u.pathname !== "/callback") { res.writeHead(404); res.end("not found"); return; }
+          const oerr = u.searchParams.get("error");
+          if (oerr) throw new Error(`authorize error: ${oerr} ${u.searchParams.get("error_description") || ""}`);
+          if (u.searchParams.get("state") !== state) throw new Error("state mismatch (possible CSRF) — aborting");
+          const code = u.searchParams.get("code");
+          if (!code) throw new Error("no authorization code in callback");
+          const tok = await exchangeAuthCode(base, { code, verifier, clientId, redirectUri });
+          wireRefreshSet(persistId, tok.refresh_token);
+          // capture the user's pubkey via one wire-sign probe (so wire mode needs no hand-set key)
+          try {
+            const probe = await wireSign(base, tok.access_token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" });
+            if (probe?.pubkey) wirePubkeySet(persistId, probe.pubkey);
+          } catch { /* pubkey auto-capture best-effort — BUZZ_USER_PUBKEY remains the fallback */ }
+          // capture the person's display name (ekam #335: GET /v1/me/wire-key → name) best-effort
+          try {
+            const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+            if (wk.ok) { const kj = await wk.json().catch(() => null); if (kj && kj.name) wireNameSet(persistId, String(kj.name)); }
+          } catch { /* name is a nicety; the auto-handle remains the fallback */ }
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!doctype html><meta charset="utf-8"><body style="font:15px/1.5 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a"><h2 style="margin:0 0 .5rem">✅ Buzz is now connected as you</h2><p>Sign-in complete. Return to your client and run buzz_whoami to confirm — your key was never shared with the tool.</p><p style="color:#666">You can safely close this tab.</p></body>`);
+          if (pendingLogin) pendingLogin.status = "done";
+        } catch (e) {
+          try { res.writeHead(400, { "Content-Type": "text/plain" }); res.end("login failed: " + e.message); } catch { /* response may be gone */ }
+          if (pendingLogin) { pendingLogin.status = "error"; pendingLogin.error = e.message; }
+        } finally {
+          try { srv.close(); } catch { /* already closing */ }
+        }
+      });
+      srv.on("error", (e) => { if (pendingLogin) { pendingLogin.status = "error"; pendingLogin.error = e.message; } try { srv.close(); } catch {} });
+      // auto-abandon after the TTL: close the loopback port and mark expired so it isn't left
+      // listening forever if the person never finishes. .unref() so this timer never, on its own,
+      // keeps the MCP process alive (stdio already does).
+      const expiryTimer = setTimeout(() => {
+        if (pendingLogin && pendingLogin.status === "pending") { pendingLogin.status = "expired"; try { pendingLogin.srv.close(); } catch { /* already closing */ } }
+      }, ttlMs);
+      if (typeof expiryTimer.unref === "function") expiryTimer.unref();
+
+      // best-effort auto-open the browser (same pattern as wirelogin; the printed URL is the fallback)
+      try {
+        const [cmd, ...pre] = process.platform === "darwin" ? ["open"]
+          : process.platform === "win32" ? ["cmd", "/c", "start", ""]
+          : ["xdg-open"];
+        spawn(cmd, [...pre, authUrl], { stdio: "ignore", detached: true }).unref();
+      } catch { /* printing the URL is the fallback */ }
+
+      return ok(`Opening your browser to sign in as yourself. If it didn't open, use this URL:\n${authUrl}\nThe link is valid for about ${Math.round(ttlMs / 60000)} min — after you approve, run buzz_login again (or buzz_whoami) to confirm. If it expires, just run buzz_login again for a fresh link.`);
     }
 
     return ok(`unknown tool: ${name}`);

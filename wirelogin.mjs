@@ -75,8 +75,8 @@ export async function bindLoopback(ports) {
   throw new Error(`no free loopback port among ${ports.join(", ")} — free one or set BUZZ_WIRE_LOGIN_PORTS`);
 }
 
-// CLI entry (skipped when imported by tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+// CLI entry — skipped when imported by tests AND when esbuild inlines this into dist/buzz-mcp.mjs (the basename guard stops CLI-main firing at shim boot).
+if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
   const env = process.env;
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
   if (!clientId) { console.error("[wire-login] set BUZZ_EKAM_CLIENT_ID (from the DCR registration)"); process.exit(1); }

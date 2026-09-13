@@ -2501,7 +2501,7 @@ async function bindLoopback(ports) {
   }
   throw new Error(`no free loopback port among ${ports.join(", ")} \u2014 free one or set BUZZ_WIRE_LOGIN_PORTS`);
 }
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
   const env = process.env;
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
   if (!clientId) {

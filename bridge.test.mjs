@@ -82,6 +82,23 @@ function probeTool(env, toolName, args, { waitMs = 6000, callDelay = 1000 } = {}
   });
 }
 
+// Generic: drive the shim over stdio, call tools/list, capture the registered tool list.
+function probeList(env, { waitMs = 6000, callDelay = 1000 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn("node", [SHIM], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    const send = (o) => { try { p.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bridge-test", version: "1" } } });
+    setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }), callDelay);
+    setTimeout(() => {
+      p.kill();
+      const reply = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.id === 2);
+      resolve(reply ? (reply.result ?? null) : null);
+    }, waitMs);
+  });
+}
+
 const LOGIN_REMEDY = /buzz-mcp-login|re-run the one-time login|sign-?in expired|refresh (token )?(is )?(invalid|revoked|expired)/i;
 const UNKNOWN_TRANSPORT = /unknown_transport/;
 const RESTART = /restart|transport|terminated|fetch failed/i;
@@ -261,6 +278,44 @@ console.log("\ncase 6: buzz_unread returns a digest shape (mock relay)");
     ok(/Unread digest \(last 24h\)/.test(text), "buzz_unread → returns a labelled digest shape");
     ok(/#testchan/.test(text) && /2 new/.test(text), "digest counts messages from others (own post excluded → 2 new)");
     ok(/1 @you/.test(text), "digest counts @mentions of self");
+  }
+}
+
+// ---- Case 7 (v0.2.15): buzz_login is registered and the tool count is now 23 ----------------
+// Static: tools/list is answered from the in-process TOOLS array — no network, no OAuth. Agent
+// mode boots cleanly offline; the black-hole relay is never dialed for tools/list.
+console.log("\ncase 7: buzz_login registered + tool count is 23 (static, no OAuth)");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
+    BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const res = await probeList(AGENT);
+  if (res == null) skipped("no tools/list reply — shim did not start");
+  else {
+    const names = (res.tools || []).map((t) => t.name);
+    console.log("  tools: " + names.length + " → " + names.join(", "));
+    ok(names.includes("buzz_login"), "buzz_login is registered in tools/list");
+    ok(names.length === 23, `total tool count is 23 (got ${names.length})`);
+  }
+}
+
+// ---- Case 8 (v0.2.15): buzz_login with NO client_id and no env → fail LOUD, no crash ---------
+// Since v0.2.15 the "already connected" check runs BEFORE the client-id guard (friendlier UX),
+// so this test pins BUZZ_WIRE_ID to an id nobody uses → wireRefreshGet misses deterministically
+// (never touches a real persisted wire.tok on the dev box), so we always reach the client-id
+// guard regardless of ambient login state. That guard short-circuits before any port bind or
+// network — fully offline + static, and deterministic (bossman's env-control ask).
+console.log("\ncase 8: buzz_login with no client_id/env → clear BUZZ_EKAM_CLIENT_ID error");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "", BUZZ_WIRE_ID: "loginprobe-noclient",
+    BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const text = await probeTool(AGENT, "buzz_login", {});
+  if (text == null) skipped("no reply for buzz_login no-client case");
+  else {
+    console.log("  client sees: " + text.slice(0, 180));
+    ok(/BUZZ_EKAM_CLIENT_ID/.test(text), "names BUZZ_EKAM_CLIENT_ID as the missing input");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "fails loud — no crash / cryptic throw");
   }
 }
 
