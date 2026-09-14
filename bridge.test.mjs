@@ -28,6 +28,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createServer } from "node:http";
+import { statSync } from "node:fs";
 import { getPublicKey } from "nostr-tools/pure";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -281,10 +282,10 @@ console.log("\ncase 6: buzz_unread returns a digest shape (mock relay)");
   }
 }
 
-// ---- Case 7 (v0.2.15): buzz_login is registered and the tool count is now 23 ----------------
+// ---- Case 7 (v0.2.16): buzz_login + buzz_doctor registered and the tool count is now 24 -------
 // Static: tools/list is answered from the in-process TOOLS array — no network, no OAuth. Agent
 // mode boots cleanly offline; the black-hole relay is never dialed for tools/list.
-console.log("\ncase 7: buzz_login registered + tool count is 23 (static, no OAuth)");
+console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 24 (static, no OAuth)");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -295,7 +296,8 @@ console.log("\ncase 7: buzz_login registered + tool count is 23 (static, no OAut
     const names = (res.tools || []).map((t) => t.name);
     console.log("  tools: " + names.length + " → " + names.join(", "));
     ok(names.includes("buzz_login"), "buzz_login is registered in tools/list");
-    ok(names.length === 23, `total tool count is 23 (got ${names.length})`);
+    ok(names.includes("buzz_doctor"), "buzz_doctor is registered in tools/list");
+    ok(names.length === 24, `total tool count is 24 (got ${names.length})`);
   }
 }
 
@@ -316,6 +318,95 @@ console.log("\ncase 8: buzz_login with no client_id/env → clear BUZZ_EKAM_CLIE
     console.log("  client sees: " + text.slice(0, 180));
     ok(/BUZZ_EKAM_CLIENT_ID/.test(text), "names BUZZ_EKAM_CLIENT_ID as the missing input");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "fails loud — no crash / cryptic throw");
+  }
+}
+
+// ---- Case 9 (v0.2.16): buzz_doctor works when the relay is unreachable → no crash -------------
+// Point the dial host at a black-hole port. buzz_doctor probes over a FRESH node:https socket, so
+// the connect error must surface as the "relay unreachable" 3-way classification (verbatim string
+// docs track), NOT an unhandled throw. Fully offline + static.
+console.log("\ncase 9: buzz_doctor against a dead relay → 'relay unreachable', structured, no crash");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "66".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const text = await probeTool(AGENT, "buzz_doctor", { timeout_s: 2 }, { waitMs: 9000, callDelay: 1200 });
+  if (text == null) skipped("no reply for buzz_doctor unreachable case");
+  else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 220));
+    ok(/relay unreachable/i.test(text), "buzz_doctor → classifies a dead relay as 'relay unreachable'");
+    ok(/nothing local fixes this/i.test(text), "buzz_doctor → gives the unreachable recovery text");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ---- Case 10 (v0.2.16): NIP-98 is RE-SIGNED per attempt (fresh, never reused across a retry) ---
+// A mock relay resets the socket on the FIRST membership (kind 39002) /query, forcing the shim's
+// fresh-transport retry, then serves the retry. We capture the Authorization (base64 NIP-98 event)
+// on BOTH the reset request and its retry and prove they are DISTINCT signed events (different
+// event id + nonce) — i.e. the auth event was rebuilt for the retry, not the stale one reused
+// (which would 401 on ±60s during a delay). STATIC/offline — no live relay.
+console.log("\ncase 10: NIP-98 auth event is re-signed per attempt (retry carries a fresh event)");
+{
+  const SK = "77".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const OTHER = "88".repeat(32);
+  const now = Math.floor(Date.now() / 1000);
+  const captured = [];
+  let resetOnce = false;
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      captured.push({ url: rq.url, body, auth: rq.headers["authorization"] || "" });
+      const reply = (obj) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "deadbeef" });
+      if (rq.url === "/events") return reply({ message: "response:{}" });
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        // Reset the socket on the FIRST 39002 query → a genuine transport throw → shim re-signs +
+        // retries over a fresh node:https socket. The retry (same body) is served normally.
+        if (kinds.has(39002) && !resetOnce) { resetOnce = true; try { rq.socket.destroy(); } catch {} return; }
+        if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+        if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+        if (kinds.has(0)) return reply([{ id: "p1", pubkey: PK, kind: 0, created_at: now, tags: [], content: JSON.stringify({ name: "me" }) }]);
+        if (kinds.has(9)) return reply([{ id: "e1", pubkey: OTHER, kind: 9, created_at: now, tags: [["h", "chanA"]], content: "hi" }]);
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const text = await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_read", { channel: "testchan", limit: 5 }, { waitMs: 10000, callDelay: 1500 });
+  relay.close();
+
+  const decode = (a) => { try { return JSON.parse(Buffer.from(String(a).replace(/^Nostr /, ""), "base64").toString("utf8")); } catch { return null; } };
+  const nonceOf = (ev) => ((ev.tags || []).find((t) => t[0] === "nonce") || [])[1];
+  // The two requests whose body carries a 39002 filter are the reset attempt + its retry.
+  const memberReqs = captured.filter((c) => c.url === "/query" && /39002/.test(c.body) && c.auth);
+  if (memberReqs.length < 2) {
+    skipped(`did not observe both the reset attempt and its retry (saw ${memberReqs.length} membership queries; reply=${(text || "").slice(0, 80)})`);
+  } else {
+    const [a1, a2] = [decode(memberReqs[0].auth), decode(memberReqs[1].auth)];
+    ok(!!a1 && !!a2 && a1.kind === 27235 && a2.kind === 27235, "both attempts carry a NIP-98 (kind 27235) auth event");
+    ok(!!a1 && !!a2 && a1.id && a2.id && a1.id !== a2.id, "retry auth event has a DIFFERENT id → re-signed, not reused");
+    ok(!!a1 && !!a2 && nonceOf(a1) && nonceOf(a2) && nonceOf(a1) !== nonceOf(a2), "retry auth event has a fresh nonce (distinct per attempt)");
+    ok(!!a1 && !!a2 && Number.isFinite(a1.created_at) && Number.isFinite(a2.created_at) && a2.created_at >= a1.created_at, "retry auth event created_at is freshly (re-)stamped, not older");
+  }
+}
+
+// ---- Case 11 (v0.2.16): both dist bins ship EXECUTABLE (git mode 100755) --------------------
+// dist/wirelogin.mjs shipped 100644 which stalls `npx -p …buzz-mcp-login`. esbuild can reset the
+// mode on rebuild, so this guards that BOTH shipped bins keep an exec bit. (releng must chmod 755
+// after the canonical dist rebuild — the source patch cannot carry a dist file-mode change.)
+console.log("\ncase 11: dist/buzz-mcp.mjs and dist/wirelogin.mjs are executable");
+{
+  for (const f of ["buzz-mcp.mjs", "wirelogin.mjs"]) {
+    let mode = 0; try { mode = statSync(join(HERE, "dist", f)).mode; } catch {}
+    ok((mode & 0o111) !== 0, `dist/${f} has an exec bit (mode ${(mode & 0o777).toString(8)})`);
   }
 }
 

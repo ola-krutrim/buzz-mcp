@@ -119,7 +119,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.15";
+const SHIM_VERSION = "0.2.16";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -156,6 +156,28 @@ function rawPost(urlStr, headers, body) {
   });
 }
 
+// buzz_doctor (v0.2.16) — a one-off node:https/node:http GET over a BRAND-NEW socket
+// (keepAlive:false), deliberately NOT the shim's normal undici client so it still answers
+// when that client's pool is wedged. Diagnostic-only; short, caller-set timeout.
+function rawGet(urlStr, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u; try { u = new URL(urlStr); } catch (e) { return reject(e); }
+    const isHttps = u.protocol === "https:";
+    const req = (isHttps ? httpsRequest : httpRequest)(u, {
+      method: "GET",
+      headers: { ...(headers || {}) },
+      agent: new (isHttps ? HttpsAgent : HttpAgent)({ keepAlive: false }), // one-off socket, bypasses the wedged undici pool
+    }, (res) => {
+      let data = ""; res.setEncoding("utf8");
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: data }));
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs || 5000, () => req.destroy(new Error("doctor probe timeout")));
+    req.end();
+  });
+}
+
 async function bridge(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
@@ -181,13 +203,23 @@ async function bridge(path, bodyObj) {
     ...(isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}),
   });
   const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
+  // v0.2.16 — NIP-98 FRESHNESS INVARIANT. `freshAuthz()` builds a brand-new NIP-98 auth event
+  // (kind 27235) at the moment it is called. It is invoked ONCE PER ACTUAL SEND — once for the
+  // first attempt (just below) and AGAIN for the fresh-transport retry — so a previously-signed
+  // auth event is NEVER reused across a retry or a queue delay. This is what keeps `created_at`
+  // inside the relay's ±60s NIP-98 window: a delayed/retried request always carries a freshly
+  // stamped timestamp, instead of a stale one the relay 401s ("event timestamp outside ±60s
+  // window") — the failure mode that wedged writes during a relay cutover. The event body (and
+  // the deterministic Nostr event id it may carry) is unchanged, so a retried /events dedups
+  // server-side (ON CONFLICT DO NOTHING before side effects); reads are idempotent regardless.
+  const freshAuthz = () => nip98(signUrl, "POST", body);
   let res;
   // Sign OUTSIDE the transport try/catch. A wire-mode mint/auth failure (revoked token, rotating-
   // refresh family-revoke, scope-denied) throws HERE and propagates VERBATIM with its own legible
   // message ("… re-run the one-time login") — it must never be mislabeled unknown_transport, and
   // never retried, since a mint retry re-presents a spent single-use refresh and compounds the
   // revoke. ONLY the relay fetch/rawPost throw below is transport-retryable. [releng 05:48 BUG 1]
-  const authz = await nip98(signUrl, "POST", body);
+  const authz = await freshAuthz();
   try {
     // If we've already seen a wedge this process, skip the doomed undici attempt and go straight
     // to the fresh-socket path — so a wedged process keeps working without a restart.
@@ -201,9 +233,10 @@ async function bridge(path, bodyObj) {
     // later call reroutes too.
     const rClass = retryClass(e);
     process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket\n`);
-    // Fresh sign for the retry — hoisted out of the inner try so an auth failure here ALSO
-    // propagates verbatim rather than being swallowed as transport. (Cached access → no re-mint.)
-    const authz2 = await nip98(signUrl, "POST", body);
+    // RE-SIGN a fresh NIP-98 for the retry (per the freshness invariant above) — hoisted out of the
+    // inner try so an auth failure here ALSO propagates verbatim rather than being swallowed as
+    // transport. (Cached access token → no re-mint; only a new, freshly-timestamped auth event.)
+    const authz2 = await freshAuthz();
     try {
       res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true; // the raw retry worked where undici didn't → the pool is wedged; reroute from here on
@@ -479,6 +512,7 @@ const TOOLS = [
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general — a replaceable-event clear). AGENT MODE ONLY — wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) — it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
   { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal — for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again — or buzz_whoami — to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
+  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport — it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a 3-way diagnosis: (1) relay answers but your normal client is stuck → WEDGED CLIENT POOL → restart your MCP client; (2) the relay does not answer → RELAY UNREACHABLE → wait / check status; (3) an authed probe is rejected → LAPSED GRANT → re-run buzz_login. Also reports your identity, pin status, and relay dial URL. Connector-side probe only — not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -1080,6 +1114,80 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       } catch { /* printing the URL is the fallback */ }
 
       return ok(`Opening your browser to sign in as yourself. If it didn't open, use this URL:\n${authUrl}\nThe link is valid for about ${Math.round(ttlMs / 60000)} min — after you approve, run buzz_login again (or buzz_whoami) to confirm. If it expires, just run buzz_login again for a fresh link.`);
+    }
+
+    if (name === "buzz_doctor") {
+      const timeoutMs = Math.min(30, Math.max(1, Number(a.timeout_s) || 5)) * 1000;
+      // Probe over a FRESH socket (rawGet/rawPost, keepAlive:false) — deliberately NOT the shim's
+      // normal undici client, which is exactly what may be wedged. Every step below is best-effort
+      // and wrapped so buzz_doctor ALWAYS returns a structured diagnosis rather than throwing.
+      let classification, recovery, healthLine, authLine;
+
+      // (1) unauthenticated /health — does the relay answer AT ALL over a brand-new socket?
+      let health = null, healthErr = null;
+      try { health = await rawGet(`${RELAY}/health`, {}, timeoutMs); }
+      catch (e) { healthErr = e; }
+
+      if (!health) {
+        // No HTTP response at all (connect refused / timeout / DNS) → nothing local can fix this.
+        classification = "relay unreachable";
+        recovery = "the relay is unreachable — wait / check status; nothing local fixes this";
+        healthLine = `unreachable (${(healthErr && (healthErr.code || healthErr.message)) || "no response"})`;
+        authLine = "not probed (relay did not answer)";
+      } else {
+        healthLine = `HTTP ${health.status} over a fresh node:https socket → relay reachable`;
+        // Relay answers on a fresh socket. Best-effort AUTHED probe (fresh NIP-98, fresh socket) to
+        // tell a lapsed sign-in (401 / auth) apart from a merely-wedged local connection pool.
+        let lapsed = false;
+        try {
+          const authz = await nip98(`${SIGN_BASE}/query`, "POST", "[]");
+          const probe = await rawPost(`${RELAY}/query`, {
+            "Content-Type": "application/json",
+            "Authorization": authz,
+            ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}),
+            "x-buzz-client": `agent/${SHIM_VERSION}`,
+          }, "[]");
+          const ptext = await probe.text();
+          if (probe.status === 401 || probe.status === 403 || /nip-?98|unauthor|sign-?in|invalid.?token|revoked|expired/i.test(ptext)) {
+            lapsed = true; authLine = `authed probe HTTP ${probe.status} → auth rejected`;
+          } else {
+            authLine = `authed probe HTTP ${probe.status} → grant OK`;
+          }
+        } catch (e) {
+          // A wire-mode sign failure (revoked/expired grant) throws here, naming 401 / sign-in.
+          const m = (e && e.message) || "";
+          if (/401|403|unauthor|sign-?in|revoked|expired|re-run the one-time login|wire-sign/i.test(m)) {
+            lapsed = true; authLine = `sign/auth failed → ${m.slice(0, 140)}`;
+          } else {
+            authLine = `authed probe inconclusive → ${m.slice(0, 140)}`;
+          }
+        }
+        if (lapsed) {
+          classification = "lapsed grant";
+          recovery = "re-run buzz_login (your sign-in lapsed)";
+        } else {
+          classification = "wedged client pool";
+          recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        }
+      }
+
+      const transportLine = TRANSPORT_WEDGED
+        ? "⚠ undici pool already flagged wedged this process — self-healing via fresh node:https sockets"
+        : "ok (no wedge flagged this process)";
+      const pinLine = EXPECTED_PK
+        ? (IDENTITY_OK ? "pin VERIFIED ✅" : "⚠ IMPERSONATION GUARD TRIPPED — WRITES DISABLED")
+        : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
+
+      return ok([
+        "buzz_doctor — connector-side diagnosis (NOT the authoritative relay health signal)",
+        `  diagnosis: ${classification}`,
+        `  recovery: ${recovery}`,
+        `  identity: ${MY_NAME} (${pinLine})`,
+        `  relay (dial): ${RELAY}`,
+        `  health probe: ${healthLine}`,
+        `  auth probe: ${authLine}`,
+        `  transport: ${transportLine}`,
+      ].join("\n"));
     }
 
     return ok(`unknown tool: ${name}`);

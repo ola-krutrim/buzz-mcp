@@ -19710,7 +19710,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.15";
+var SHIM_VERSION = "0.2.16";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19743,6 +19743,31 @@ function rawPost(urlStr, headers, body) {
     req.end(body);
   });
 }
+function rawGet(urlStr, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch (e) {
+      return reject(e);
+    }
+    const isHttps = u.protocol === "https:";
+    const req = (isHttps ? httpsRequest : httpRequest)(u, {
+      method: "GET",
+      headers: { ...headers || {} },
+      agent: new (isHttps ? HttpsAgent : HttpAgent)({ keepAlive: false })
+      // one-off socket, bypasses the wedged undici pool
+    }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => data += c);
+      res.on("end", () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: data }));
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs || 5e3, () => req.destroy(new Error("doctor probe timeout")));
+    req.end();
+  });
+}
 async function bridge(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
@@ -19758,15 +19783,16 @@ async function bridge(path, bodyObj) {
     ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
   });
   const attempt = (authz2, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz2, isRetry, rClass), body });
+  const freshAuthz = () => nip98(signUrl, "POST", body);
   let res;
-  const authz = await nip98(signUrl, "POST", body);
+  const authz = await freshAuthz();
   try {
     res = TRANSPORT_WEDGED ? await rawPost(dialUrl, headersFor(authz, true, "wedged_reroute"), body) : await attempt(authz, false);
   } catch (e) {
     const rClass = retryClass(e);
     process.stderr.write(`[buzz-mcp] transient ${path} fetch failed (${rClass}); retrying on a fresh node:https socket
 `);
-    const authz2 = await nip98(signUrl, "POST", body);
+    const authz2 = await freshAuthz();
     try {
       res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true;
@@ -20046,7 +20072,8 @@ var TOOLS = [
   { name: "buzz_status_set", description: "Set your live user status (NIP-38 kind 30315, d=general). `text` = the status message (empty allowed), optional `emoji`. AGENT MODE ONLY \u2014 wire mode (post-as-the-user) can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: { text: { type: "string", description: "the status text (empty allowed)" }, emoji: { type: "string", description: "optional status emoji" } } } },
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general \u2014 a replaceable-event clear). AGENT MODE ONLY \u2014 wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) \u2014 it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
-  { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal \u2014 for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again \u2014 or buzz_whoami \u2014 to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } }
+  { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal \u2014 for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again \u2014 or buzz_whoami \u2014 to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
+  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport \u2014 it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a 3-way diagnosis: (1) relay answers but your normal client is stuck \u2192 WEDGED CLIENT POOL \u2192 restart your MCP client; (2) the relay does not answer \u2192 RELAY UNREACHABLE \u2192 wait / check status; (3) an authed probe is rejected \u2192 LAPSED GRANT \u2192 re-run buzz_login. Also reports your identity, pin status, and relay dial URL. Connector-side probe only \u2014 not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } }
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 var RELAY_INFO = null;
@@ -20597,6 +20624,68 @@ After you approve, run buzz_login again \u2014 or buzz_whoami \u2014 to confirm.
       return ok(`Opening your browser to sign in as yourself. If it didn't open, use this URL:
 ${authUrl}
 The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you approve, run buzz_login again (or buzz_whoami) to confirm. If it expires, just run buzz_login again for a fresh link.`);
+    }
+    if (name === "buzz_doctor") {
+      const timeoutMs = Math.min(30, Math.max(1, Number(a.timeout_s) || 5)) * 1e3;
+      let classification, recovery, healthLine, authLine;
+      let health = null, healthErr = null;
+      try {
+        health = await rawGet(`${RELAY}/health`, {}, timeoutMs);
+      } catch (e) {
+        healthErr = e;
+      }
+      if (!health) {
+        classification = "relay unreachable";
+        recovery = "the relay is unreachable \u2014 wait / check status; nothing local fixes this";
+        healthLine = `unreachable (${healthErr && (healthErr.code || healthErr.message) || "no response"})`;
+        authLine = "not probed (relay did not answer)";
+      } else {
+        healthLine = `HTTP ${health.status} over a fresh node:https socket \u2192 relay reachable`;
+        let lapsed = false;
+        try {
+          const authz = await nip98(`${SIGN_BASE}/query`, "POST", "[]");
+          const probe = await rawPost(`${RELAY}/query`, {
+            "Content-Type": "application/json",
+            "Authorization": authz,
+            ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
+            "x-buzz-client": `agent/${SHIM_VERSION}`
+          }, "[]");
+          const ptext = await probe.text();
+          if (probe.status === 401 || probe.status === 403 || /nip-?98|unauthor|sign-?in|invalid.?token|revoked|expired/i.test(ptext)) {
+            lapsed = true;
+            authLine = `authed probe HTTP ${probe.status} \u2192 auth rejected`;
+          } else {
+            authLine = `authed probe HTTP ${probe.status} \u2192 grant OK`;
+          }
+        } catch (e) {
+          const m = e && e.message || "";
+          if (/401|403|unauthor|sign-?in|revoked|expired|re-run the one-time login|wire-sign/i.test(m)) {
+            lapsed = true;
+            authLine = `sign/auth failed \u2192 ${m.slice(0, 140)}`;
+          } else {
+            authLine = `authed probe inconclusive \u2192 ${m.slice(0, 140)}`;
+          }
+        }
+        if (lapsed) {
+          classification = "lapsed grant";
+          recovery = "re-run buzz_login (your sign-in lapsed)";
+        } else {
+          classification = "wedged client pool";
+          recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        }
+      }
+      const transportLine = TRANSPORT_WEDGED ? "\u26A0 undici pool already flagged wedged this process \u2014 self-healing via fresh node:https sockets" : "ok (no wedge flagged this process)";
+      const pinLine = EXPECTED_PK ? IDENTITY_OK ? "pin VERIFIED \u2705" : "\u26A0 IMPERSONATION GUARD TRIPPED \u2014 WRITES DISABLED" : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
+      return ok([
+        "buzz_doctor \u2014 connector-side diagnosis (NOT the authoritative relay health signal)",
+        `  diagnosis: ${classification}`,
+        `  recovery: ${recovery}`,
+        `  identity: ${MY_NAME} (${pinLine})`,
+        `  relay (dial): ${RELAY}`,
+        `  health probe: ${healthLine}`,
+        `  auth probe: ${authLine}`,
+        `  transport: ${transportLine}`
+      ].join("\n"));
     }
     return ok(`unknown tool: ${name}`);
   } catch (e) {
