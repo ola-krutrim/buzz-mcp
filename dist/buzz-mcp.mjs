@@ -19459,6 +19459,8 @@ async function resolveSigner(opts = {}) {
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 var b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 function pkce() {
   const verifier = b64url(randomBytes2(32));
@@ -19519,7 +19521,14 @@ async function bindLoopback(ports) {
   }
   throw new Error(`no free loopback port among ${ports.join(", ")} \u2014 free one or set BUZZ_WIRE_LOGIN_PORTS`);
 }
-if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
+var __entry = (() => {
+  try {
+    return realpathSync(process.argv[1] || "");
+  } catch {
+    return process.argv[1] || "";
+  }
+})();
+if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
   if (!clientId) {
@@ -19710,12 +19719,28 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.16";
+var SHIM_VERSION = "0.2.17";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
   if (c.includes("timeout") || c.includes("etimedout") || c.includes("econnrefused") || c.includes("connect")) return "connect_timeout";
   return "unknown_transport";
+}
+var HTTP_TIMEOUT_S = (() => {
+  const n = parseInt(process.env.BUZZ_HTTP_TIMEOUT_S || "", 10);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.min(n, 300)) : 25;
+})();
+var STALE_401_RETRIES = 0;
+var STALE_TS_CODES = /* @__PURE__ */ new Set(["nip98_timestamp_out_of_window", "stale_timestamp", "timestamp_out_of_window", "nip98_stale_timestamp", "nip98_timestamp_stale"]);
+function isStaleTimestamp401(bodyText) {
+  const s = String(bodyText || "");
+  try {
+    const j = JSON.parse(s);
+    const code = String(j.code || j.error || j.reason || "").toLowerCase();
+    if (STALE_TS_CODES.has(code)) return true;
+  } catch {
+  }
+  return s.includes("outside \xB160s window");
 }
 var TRANSPORT_WEDGED = false;
 function rawPost(urlStr, headers, body) {
@@ -19782,9 +19807,15 @@ async function bridge(path, bodyObj) {
     // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
     ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
   });
-  const attempt = (authz2, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz2, isRetry, rClass), body });
+  const attempt = (authz2, isRetry, rClass) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error(`undici attempt exceeded BUZZ_HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S}s`)), HTTP_TIMEOUT_S * 1e3);
+    timer.unref?.();
+    return fetch(dialUrl, { method: "POST", headers: headersFor(authz2, isRetry, rClass), body, signal: ac.signal }).finally(() => clearTimeout(timer));
+  };
   const freshAuthz = () => nip98(signUrl, "POST", body);
   let res;
+  let remediated = false;
   const authz = await freshAuthz();
   try {
     res = TRANSPORT_WEDGED ? await rawPost(dialUrl, headersFor(authz, true, "wedged_reroute"), body) : await attempt(authz, false);
@@ -19796,11 +19827,21 @@ async function bridge(path, bodyObj) {
     try {
       res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true;
+      remediated = true;
     } catch {
       throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client \u2014 reconnect and the shim's own retry do NOT clear a wedged connection pool.`);
     }
   }
-  const text = await res.text();
+  let text = await res.text();
+  if (!remediated && res.status === 401 && isStaleTimestamp401(text)) {
+    remediated = true;
+    STALE_401_RETRIES += 1;
+    process.stderr.write(`[buzz-mcp] stale-timestamp 401 on ${path}; re-signing a fresh NIP-98 and retrying once on a fresh node:https socket (stale_401_retry_count=${STALE_401_RETRIES})
+`);
+    const authzA = await freshAuthz();
+    res = await rawPost(dialUrl, headersFor(authzA, true, "stale_timestamp_401"), body);
+    text = await res.text();
+  }
   if (!res.ok) throw new Error(`${path} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
   try {
     return JSON.parse(text);
@@ -20641,7 +20682,7 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         authLine = "not probed (relay did not answer)";
       } else {
         healthLine = `HTTP ${health.status} over a fresh node:https socket \u2192 relay reachable`;
-        let lapsed = false;
+        let authState = "ok";
         try {
           const authz = await nip98(`${SIGN_BASE}/query`, "POST", "[]");
           const probe = await rawPost(`${RELAY}/query`, {
@@ -20652,26 +20693,34 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
           }, "[]");
           const ptext = await probe.text();
           if (probe.status === 401 || probe.status === 403 || /nip-?98|unauthor|sign-?in|invalid.?token|revoked|expired/i.test(ptext)) {
-            lapsed = true;
+            authState = "rejected";
             authLine = `authed probe HTTP ${probe.status} \u2192 auth rejected`;
           } else {
+            authState = "ok";
             authLine = `authed probe HTTP ${probe.status} \u2192 grant OK`;
           }
         } catch (e) {
           const m = e && e.message || "";
           if (/401|403|unauthor|sign-?in|revoked|expired|re-run the one-time login|wire-sign/i.test(m)) {
-            lapsed = true;
+            authState = "rejected";
             authLine = `sign/auth failed \u2192 ${m.slice(0, 140)}`;
           } else {
+            authState = "inconclusive";
             authLine = `authed probe inconclusive \u2192 ${m.slice(0, 140)}`;
           }
         }
-        if (lapsed) {
+        if (authState === "rejected") {
           classification = "lapsed grant";
           recovery = "re-run buzz_login (your sign-in lapsed)";
-        } else {
+        } else if (authState === "inconclusive") {
+          classification = "couldn't tell";
+          recovery = "couldn't tell \u2014 retry buzz_doctor (the authed probe errored without a clear verdict)";
+        } else if (TRANSPORT_WEDGED) {
           classification = "wedged client pool";
           recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        } else {
+          classification = "healthy";
+          recovery = "healthy \u2014 reads/posts should work; no action";
         }
       }
       const transportLine = TRANSPORT_WEDGED ? "\u26A0 undici pool already flagged wedged this process \u2014 self-healing via fresh node:https sockets" : "ok (no wedge flagged this process)";

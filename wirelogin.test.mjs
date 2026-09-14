@@ -1,6 +1,11 @@
 // wirelogin.test.mjs — `node wirelogin.test.mjs`
 import { pkce, authorizeUrl, exchangeAuthCode, bindLoopback } from "./wirelogin.mjs";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => (c ? (pass++, console.log("  ✅ " + m)) : (fail++, console.log("  ❌ " + m)));
@@ -43,6 +48,32 @@ ok([8765, 8766, 8770].includes(port), `bound a candidate loopback port (${port})
 try { const two = await bindLoopback([port]); try { two.srv.close(); } catch {} ok(false, "second bind on the held port should fail"); }
 catch (e) { ok(/no free loopback port/.test(e.message), "no free port → throws"); }
 try { srv.close(); } catch {}
+
+// FIX 1 (v0.2.17) — symlink-robust CLI-entry detection. npm's .bin/buzz-mcp-login is a SYMLINK to
+// wirelogin.mjs (how npx and installed bins invoke it): process.argv[1] is the symlink path (does
+// NOT end in wirelogin.mjs) while import.meta.url is the RESOLVED real path — so the old
+// `import.meta.url === file://argv[1]` guard was false and CLI main never fired (zero output). The
+// fix resolves argv[1] through realpathSync and compares real paths, keeping the basename guard.
+console.log("CLI entry — symlink invocation (npx/.bin) runs main; module import does NOT:");
+const realWirelogin = fileURLToPath(new URL("./wirelogin.mjs", import.meta.url));
+const cleanEnv = { ...process.env }; delete cleanEnv.BUZZ_EKAM_CLIENT_ID;
+{
+  const tmpd = mkdtempSync(join(tmpdir(), "wirelogin-symlink-"));
+  const link = join(tmpd, "buzz-mcp-login"); // mimic npm's .bin symlink → dist/wirelogin.mjs
+  symlinkSync(realWirelogin, link);
+  // BUZZ_EKAM_CLIENT_ID unset → CLI main hits the client-id guard, prints usage, exits 1. No network.
+  const r = spawnSync(process.execPath, [link], { encoding: "utf8", env: cleanEnv, timeout: 15000 });
+  const out = (r.stdout || "") + (r.stderr || "");
+  ok(/set BUZZ_EKAM_CLIENT_ID/.test(out), "node <symlink→wirelogin.mjs> runs CLI main → prints usage (THE FIX; was zero output)");
+  ok(r.status === 1, `symlink CLI exits 1 when BUZZ_EKAM_CLIENT_ID unset (got ${r.status})`);
+}
+{
+  // Importing wirelogin.mjs as a module must NOT run CLI main (no argv[1] script → guard false).
+  const imp = spawnSync(process.execPath, ["-e", `import(${JSON.stringify(realWirelogin)}).then(()=>{console.log("IMPORTED_OK");process.exit(0)}).catch(e=>{console.error(e);process.exit(2)})`], { encoding: "utf8", env: cleanEnv, timeout: 15000 });
+  const impOut = (imp.stdout || "") + (imp.stderr || "");
+  ok(/IMPORTED_OK/.test(impOut) && imp.status === 0, "importing wirelogin.mjs completes without running main (no hang/exit)");
+  ok(!/\[wire-login\]/.test(impOut), "importing wirelogin.mjs emits NO '[wire-login]' output → main did not fire");
+}
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

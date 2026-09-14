@@ -4,6 +4,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // node_modules/@noble/hashes/utils.js
 function isBytes(a) {
@@ -2501,7 +2503,14 @@ async function bindLoopback(ports) {
   }
   throw new Error(`no free loopback port among ${ports.join(", ")} \u2014 free one or set BUZZ_WIRE_LOGIN_PORTS`);
 }
-if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
+var __entry = (() => {
+  try {
+    return realpathSync(process.argv[1] || "");
+  } catch {
+    return process.argv[1] || "";
+  }
+})();
+if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
   if (!clientId) {

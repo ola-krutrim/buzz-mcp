@@ -119,7 +119,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.16";
+const SHIM_VERSION = "0.2.17";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -127,6 +127,36 @@ function retryClass(e) {
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
   if (c.includes("timeout") || c.includes("etimedout") || c.includes("econnrefused") || c.includes("connect")) return "connect_timeout";
   return "unknown_transport";
+}
+
+// B (v0.2.17 item 3) — hard per-attempt timeout for the undici fetch. A slow-but-not-dead attempt
+// would otherwise deliver LATE carrying an aged NIP-98 created_at that the relay 401s on ±60s; abort
+// it so it THROWS instead → the existing fresh-socket catch in bridge() re-signs a fresh NIP-98
+// (fresh created_at → the wedge can't recur). Env-tunable BUZZ_HTTP_TIMEOUT_S (seconds), default 25,
+// clamped 1..300, parsed like the other env ints (wire-login TTL/ports).
+const HTTP_TIMEOUT_S = (() => {
+  const n = parseInt(process.env.BUZZ_HTTP_TIMEOUT_S || "", 10);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.min(n, 300)) : 25;
+})();
+
+// A (v0.2.17 item 3) — DISTINCT process-level counter for stale-timestamp-401 remediations, so a
+// clock-skewed / relay-queue-delayed fleet is visible as its OWN signal (separate from the
+// transport-retry marker). Surfaced in a stderr telemetry line each time an A-retry fires.
+let STALE_401_RETRIES = 0;
+// Typed stale-timestamp codes a relay MAY return in a structured JSON body (preferred over string).
+const STALE_TS_CODES = new Set(["nip98_timestamp_out_of_window", "stale_timestamp", "timestamp_out_of_window", "nip98_stale_timestamp", "nip98_timestamp_stale"]);
+// A — is this 401 body the NIP-98 timestamp-staleness error (and ONLY that)? PREFER a typed code in
+// a JSON body; FALL BACK to an EXACT substring on the ±60s window message the relay returns today
+// ("event timestamp outside ±60s window"). Every OTHER 401/403/4xx (revoked, scope-denied,
+// forbidden, …) → false → NOT retried, stays legible. Strictly gated to this one case.
+function isStaleTimestamp401(bodyText) {
+  const s = String(bodyText || "");
+  try {
+    const j = JSON.parse(s);
+    const code = String(j.code || j.error || j.reason || "").toLowerCase();
+    if (STALE_TS_CODES.has(code)) return true;
+  } catch { /* body isn't JSON → fall through to the exact string match */ }
+  return s.includes("outside ±60s window"); // exact window-message substring (relay's current wording)
 }
 
 // v0.2.8 transport self-heal. A long-lived MCP process can wedge Node's built-in undici fetch
@@ -202,7 +232,16 @@ async function bridge(path, bodyObj) {
     // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
     ...(isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}),
   });
-  const attempt = (authz, isRetry, rClass) => fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body });
+  const attempt = (authz, isRetry, rClass) => {
+    // B: hard timeout so a slow undici attempt THROWS (→ the fresh-socket catch below re-signs)
+    // instead of arriving late with an aged created_at. The timer is .unref()'d (never keeps the
+    // process alive) and cleared on settle (success OR failure).
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error(`undici attempt exceeded BUZZ_HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S}s`)), HTTP_TIMEOUT_S * 1000);
+    timer.unref?.();
+    return fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body, signal: ac.signal })
+      .finally(() => clearTimeout(timer));
+  };
   // v0.2.16 — NIP-98 FRESHNESS INVARIANT. `freshAuthz()` builds a brand-new NIP-98 auth event
   // (kind 27235) at the moment it is called. It is invoked ONCE PER ACTUAL SEND — once for the
   // first attempt (just below) and AGAIN for the fresh-transport retry — so a previously-signed
@@ -214,6 +253,10 @@ async function bridge(path, bodyObj) {
   // server-side (ON CONFLICT DO NOTHING before side effects); reads are idempotent regardless.
   const freshAuthz = () => nip98(signUrl, "POST", body);
   let res;
+  // SINGLE-FLIGHT guard shared by B (transport-throw retry) and A (stale-timestamp-401 retry): one
+  // logical bridge() call makes AT MOST TWO physical attempts (original + one remediation). Once
+  // either B or A has remediated, the other MUST NOT add a third attempt — no cascade.
+  let remediated = false;
   // Sign OUTSIDE the transport try/catch. A wire-mode mint/auth failure (revoked token, rotating-
   // refresh family-revoke, scope-denied) throws HERE and propagates VERBATIM with its own legible
   // message ("… re-run the one-time login") — it must never be mislabeled unknown_transport, and
@@ -240,11 +283,28 @@ async function bridge(path, bodyObj) {
     try {
       res = await rawPost(dialUrl, headersFor(authz2, true, rClass), body);
       TRANSPORT_WEDGED = true; // the raw retry worked where undici didn't → the pool is wedged; reroute from here on
+      remediated = true;        // B used this call's one remediation → A must NOT add a third attempt
     } catch {
       throw new Error(`${path} -> transient fetch failed [retried 1x on a fresh transport, still failed; class=${rClass}]. If reads/posts keep failing, FULLY RESTART your MCP client — reconnect and the shim's own retry do NOT clear a wedged connection pool.`);
     }
   }
-  const text = await res.text();
+  let text = await res.text();
+  // A (v0.2.17 item 3) — narrow retry on a stale-timestamp NIP-98 401 (clock-skew / relay-queue
+  // delay that B's timeout can't catch — a fast 401 whose created_at aged before the relay checked
+  // it). Fires AT MOST ONCE, only when B hasn't already remediated (single-flight above), and ONLY
+  // for the stale-timestamp case — every OTHER 401/403/4xx stays legible (falls through to the
+  // res.ok throw below, returned exactly as today). The retry re-signs a FRESH NIP-98 via
+  // freshAuthz() (signer's non-forced tokens.get(false) path — NEVER a forced mint) and goes over a
+  // fresh node:https socket, consistent with the transport-retry path. A DISTINCT counter +
+  // stderr marker (retry_class=stale_timestamp_401) make a clock-skewed fleet visible.
+  if (!remediated && res.status === 401 && isStaleTimestamp401(text)) {
+    remediated = true;
+    STALE_401_RETRIES += 1;
+    process.stderr.write(`[buzz-mcp] stale-timestamp 401 on ${path}; re-signing a fresh NIP-98 and retrying once on a fresh node:https socket (stale_401_retry_count=${STALE_401_RETRIES})\n`);
+    const authzA = await freshAuthz(); // fresh created_at; non-forced token path (no re-mint)
+    res = await rawPost(dialUrl, headersFor(authzA, true, "stale_timestamp_401"), body);
+    text = await res.text();
+  }
   if (!res.ok) throw new Error(`${path} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
   try { return JSON.parse(text); } catch { return text; }
 }
@@ -1137,8 +1197,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       } else {
         healthLine = `HTTP ${health.status} over a fresh node:https socket → relay reachable`;
         // Relay answers on a fresh socket. Best-effort AUTHED probe (fresh NIP-98, fresh socket) to
-        // tell a lapsed sign-in (401 / auth) apart from a merely-wedged local connection pool.
-        let lapsed = false;
+        // tell a lapsed sign-in (401 / auth) apart from a merely-wedged local connection pool. The
+        // authed probe has THREE outcomes: "rejected" (a clear 401/auth verdict), "ok" (200/grant
+        // OK), or "inconclusive" (the probe ERRORED without a clear verdict — timeout/DNS/TLS/other);
+        // an inconclusive probe must NOT be mislabeled as a confident "wedged" diagnosis.
+        let authState = "ok";
         try {
           const authz = await nip98(`${SIGN_BASE}/query`, "POST", "[]");
           const probe = await rawPost(`${RELAY}/query`, {
@@ -1149,25 +1212,38 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           }, "[]");
           const ptext = await probe.text();
           if (probe.status === 401 || probe.status === 403 || /nip-?98|unauthor|sign-?in|invalid.?token|revoked|expired/i.test(ptext)) {
-            lapsed = true; authLine = `authed probe HTTP ${probe.status} → auth rejected`;
+            authState = "rejected"; authLine = `authed probe HTTP ${probe.status} → auth rejected`;
           } else {
-            authLine = `authed probe HTTP ${probe.status} → grant OK`;
+            authState = "ok"; authLine = `authed probe HTTP ${probe.status} → grant OK`;
           }
         } catch (e) {
           // A wire-mode sign failure (revoked/expired grant) throws here, naming 401 / sign-in.
           const m = (e && e.message) || "";
           if (/401|403|unauthor|sign-?in|revoked|expired|re-run the one-time login|wire-sign/i.test(m)) {
-            lapsed = true; authLine = `sign/auth failed → ${m.slice(0, 140)}`;
+            authState = "rejected"; authLine = `sign/auth failed → ${m.slice(0, 140)}`;
           } else {
-            authLine = `authed probe inconclusive → ${m.slice(0, 140)}`;
+            // Any OTHER error (authed-POST timeout / DNS blip / TLS error) → NO verdict reached.
+            // This is inconclusive, NOT a wedged pool — never emit a confident restart diagnosis here.
+            authState = "inconclusive"; authLine = `authed probe inconclusive → ${m.slice(0, 140)}`;
           }
         }
-        if (lapsed) {
+        if (authState === "rejected") {
           classification = "lapsed grant";
           recovery = "re-run buzz_login (your sign-in lapsed)";
-        } else {
+        } else if (authState === "inconclusive") {
+          // health 200 but the authed probe errored without a clear verdict → we genuinely can't
+          // tell; do NOT claim "wedged". Ask for a retry rather than a restart.
+          classification = "couldn't tell";
+          recovery = "couldn't tell — retry buzz_doctor (the authed probe errored without a clear verdict)";
+        } else if (TRANSPORT_WEDGED) {
+          // health 200 + auth 200 but this process already flagged its undici pool wedged →
+          // the local client pool is stuck; only a full client restart clears it.
           classification = "wedged client pool";
           recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        } else {
+          // health 200 + auth 200 + transport OK (no wedge flagged) → nothing is actually broken.
+          classification = "healthy";
+          recovery = "healthy — reads/posts should work; no action";
         }
       }
 

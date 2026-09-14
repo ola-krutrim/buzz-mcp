@@ -14,6 +14,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -76,7 +78,12 @@ export async function bindLoopback(ports) {
 }
 
 // CLI entry — skipped when imported by tests AND when esbuild inlines this into dist/buzz-mcp.mjs (the basename guard stops CLI-main firing at shim boot).
-if (import.meta.url === `file://${process.argv[1]}` && /wirelogin\.mjs$/.test(process.argv[1] || "")) {
+// Symlink-robust: npm's .bin/buzz-mcp-login is a SYMLINK to this file, so process.argv[1] is the
+// symlink path (not ending in wirelogin.mjs) while import.meta.url is the RESOLVED real path.
+// Resolve argv[1] through realpathSync and compare real paths; keep the basename guard so the
+// esbuild-bundled-in-buzz-mcp case (import.meta.url → buzz-mcp.mjs) still stays OFF at shim boot.
+const __entry = (() => { try { return realpathSync(process.argv[1] || ""); } catch { return process.argv[1] || ""; } })();
+if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
   if (!clientId) { console.error("[wire-login] set BUZZ_EKAM_CLIENT_ID (from the DCR registration)"); process.exit(1); }

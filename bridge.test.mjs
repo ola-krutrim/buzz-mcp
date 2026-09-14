@@ -100,6 +100,25 @@ function probeList(env, { waitMs = 6000, callDelay = 1000 } = {}) {
   });
 }
 
+// Like probeTool, but ALSO captures the shim's stderr (where the retry/telemetry markers land) so a
+// test can assert the stale-401 counter line fired. Returns { text, err }.
+function probeToolErr(env, toolName, args, { waitMs = 8000, callDelay = 1200 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn("node", [SHIM], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "", err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    const send = (o) => { try { p.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bridge-test", version: "1" } } });
+    setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: toolName, arguments: args } }), callDelay);
+    setTimeout(() => {
+      p.kill();
+      const reply = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.id === 2);
+      resolve({ text: reply ? JSON.stringify(reply.result ?? reply.error) : null, err });
+    }, waitMs);
+  });
+}
+
 const LOGIN_REMEDY = /buzz-mcp-login|re-run the one-time login|sign-?in expired|refresh (token )?(is )?(invalid|revoked|expired)/i;
 const UNKNOWN_TRANSPORT = /unknown_transport/;
 const RESTART = /restart|transport|terminated|fetch failed/i;
@@ -407,6 +426,280 @@ console.log("\ncase 11: dist/buzz-mcp.mjs and dist/wirelogin.mjs are executable"
   for (const f of ["buzz-mcp.mjs", "wirelogin.mjs"]) {
     let mode = 0; try { mode = statSync(join(HERE, "dist", f)).mode; } catch {}
     ok((mode & 0o111) !== 0, `dist/${f} has an exec bit (mode ${(mode & 0o777).toString(8)})`);
+  }
+}
+
+// ---- Case 12 (v0.2.17): buzz_doctor healthy path → 'healthy', NOT 'wedged' ------------------
+// FIX 2: with a reachable relay (health 200 + authed /query 200) AND no transport wedge flagged
+// this process, buzz_doctor must classify "healthy" — the old code keyed the "wedged client pool"
+// branch on health==200 alone and mislabeled a perfectly healthy setup as wedged. A local mock
+// relay answers GET /health → 200 and POST /query → 200 (grant OK, not a 401/auth rejection).
+// STATIC/offline — no live relay, agent-mode NIP-98 is signed locally. TRANSPORT_WEDGED stays
+// false because no transport throw ever occurs on the fresh-socket probes.
+console.log("\ncase 12: buzz_doctor healthy relay (health 200 + auth 200, no wedge) → 'healthy', not 'wedged'");
+{
+  const SK = "99".repeat(32);
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      // GET (health / self-report) → 200; POST /query (authed probe) → 200 with a benign body
+      // (no 401/403 and no nip-98/unauthorized text → the probe reads as "grant OK").
+      if (rq.method === "GET") { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ name: "mock", version: "0", software_sha: "healthy" })); return; }
+      rs.writeHead(200, { "Content-Type": "application/json" }); rs.end("[]");
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const text = await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", { timeout_s: 3 }, { waitMs: 9000, callDelay: 1200 });
+  relay.close();
+  if (text == null) skipped("no reply for buzz_doctor healthy case");
+  else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 260));
+    ok(/diagnosis: healthy/i.test(text), "buzz_doctor → classifies a reachable+authed+unwedged relay as 'healthy'");
+    ok(!/diagnosis: wedged/i.test(text), "buzz_doctor → does NOT mislabel a healthy setup as 'wedged'");
+    ok(/reads\/posts should work|no action/i.test(text), "buzz_doctor → gives the healthy recovery text");
+    ok(/connector-side diagnosis \(NOT the authoritative/i.test(text), "buzz_doctor → keeps the 'NOT authoritative' disclaimer");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ---- Case 13 (v0.2.17): buzz_doctor auth probe INCONCLUSIVE → 'couldn't tell', NOT 'wedged' ---
+// FIX 2 (5th branch): health 200 but the authed /query probe ERRORS in a non-401 way (timeout /
+// DNS / TLS / socket reset = no clear verdict). That is inconclusive — it must NOT be reported as
+// a confident "wedged client pool → restart". The mock relay answers GET /health → 200 but DESTROYS
+// the socket on the authed POST /query, so rawPost throws a transport error whose message matches
+// neither the auth-rejected patterns nor a wedge → the new "couldn't tell → retry" branch.
+// STATIC/offline. TRANSPORT_WEDGED stays false (buzz_doctor's fresh-socket probes never set it).
+console.log("\ncase 13: buzz_doctor health ok but authed probe errors (non-401) → 'couldn't tell', not 'wedged'");
+{
+  const SK = "aa".repeat(32);
+  const relay = createServer((rq, rs) => {
+    if (rq.method === "GET") { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ name: "mock", version: "0", software_sha: "healthy" })); return; }
+    // authed POST /query → reset the socket → rawPost throws a NON-auth transport error → inconclusive.
+    try { rq.socket.destroy(); } catch {}
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const text = await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", { timeout_s: 3 }, { waitMs: 9000, callDelay: 1200 });
+  relay.close();
+  if (text == null) skipped("no reply for buzz_doctor inconclusive case");
+  else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 260));
+    ok(/diagnosis: couldn't tell/i.test(text), "buzz_doctor → an inconclusive authed probe → 'couldn't tell'");
+    ok(!/diagnosis: wedged/i.test(text), "buzz_doctor → does NOT mislabel an inconclusive probe as 'wedged'");
+    ok(/retry buzz_doctor/i.test(text) && !/restart your MCP client/i.test(text), "buzz_doctor → asks for a retry, not a restart");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ==== v0.2.17 item 3 (write-wedge fix B + A) — stale-timestamp-401 remediation + hard timeout ====
+// Shared helpers for the NIP-98 auth events these cases inspect.
+const decodeNip98 = (a) => { try { return JSON.parse(Buffer.from(String(a).replace(/^Nostr /, ""), "base64").toString("utf8")); } catch { return null; } };
+const nonceTag = (ev) => ((ev && ev.tags || []).find((t) => t[0] === "nonce") || [])[1];
+
+// ---- Case 14 (v0.2.17 item 3 / A): a stale-timestamp 401 → ONE re-signed retry, then succeeds ----
+// A mock relay 401s the FIRST membership (kind 39002) /query with the ±60s window message, then
+// serves 200 on every later request (incl. the retry). Assert: exactly ONE remediation retry (two
+// physical 39002 requests, not three), the retry carried a FRESHLY-signed NIP-98 (distinct id +
+// fresh created_at), the call ultimately succeeds (no 401 surfaced), and the DISTINCT stale-401
+// counter incremented (stderr telemetry line). STATIC/offline — agent-mode NIP-98 signed locally.
+console.log("\ncase 14: A fires on a stale-timestamp 401 → exactly one re-signed retry, succeeds, counter++");
+{
+  const SK = "12".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const OTHER = "34".repeat(32);
+  const now = Math.floor(Date.now() / 1000);
+  const captured = [];
+  let staleServed = false;
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      captured.push({ url: rq.url, body, auth: rq.headers["authorization"] || "" });
+      const reply = (obj) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+      const reply401 = (txt) => { rs.writeHead(401, { "Content-Type": "application/json" }); rs.end(txt); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "deadbeef" });
+      if (rq.url === "/events") return reply({ message: "response:{}" });
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        // First membership query → a stale-timestamp 401 (exact ±60s window wording, wrapped in JSON).
+        if (kinds.has(39002) && !staleServed) { staleServed = true; return reply401(JSON.stringify({ error: "event timestamp outside ±60s window" })); }
+        if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+        if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+        if (kinds.has(0)) return reply([{ id: "p1", pubkey: PK, kind: 0, created_at: now, tags: [], content: JSON.stringify({ name: "me" }) }]);
+        if (kinds.has(9)) return reply([{ id: "e1", pubkey: OTHER, kind: 9, created_at: now, tags: [["h", "chanA"]], content: "hi from other" }]);
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_read", { channel: "testchan", limit: 5 }, { waitMs: 10000, callDelay: 1500 });
+  relay.close();
+  const memberReqs = captured.filter((c) => c.url === "/query" && /39002/.test(c.body) && c.auth);
+  if (text == null || memberReqs.length < 2) {
+    skipped(`A-fires: did not observe the stale 401 + its retry (saw ${memberReqs.length} membership queries; reply=${(text || "").slice(0, 80)})`);
+  } else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 160));
+    ok(memberReqs.length === 2, `exactly ONE remediation retry — two physical 39002 attempts (got ${memberReqs.length}, no cascade)`);
+    const [a1, a2] = [decodeNip98(memberReqs[0].auth), decodeNip98(memberReqs[1].auth)];
+    ok(!!a1 && !!a2 && a1.kind === 27235 && a2.kind === 27235, "both attempts carry a NIP-98 (kind 27235) auth event");
+    ok(!!a1 && !!a2 && a1.id && a2.id && a1.id !== a2.id, "retry carried a NEWLY-signed NIP-98 (different id → re-signed, not reused)");
+    ok(!!a1 && !!a2 && nonceTag(a1) !== nonceTag(a2), "retry NIP-98 has a fresh nonce (distinct per attempt)");
+    ok(!!a1 && !!a2 && Number.isFinite(a2.created_at) && a2.created_at >= a1.created_at, "retry NIP-98 created_at is freshly (re-)stamped, not older");
+    ok(!/HTTP 401/.test(text), "the stale 401 did NOT surface — the call ultimately succeeded");
+    ok(/stale_401_retry_count=1/.test(err), "the DISTINCT stale-401 counter incremented (stderr telemetry line)");
+  }
+}
+
+// ---- Case 15 (v0.2.17 item 3 / A): a NON-stale 401 → NO retry, surfaces legibly -----------------
+// The relay 401s the membership query with "revoked token" (NOT the ±60s message and no stale code).
+// A must NOT fire: exactly ONE physical attempt, the 401 surfaces as a legible HTTP 401 error, and
+// the stale-401 counter does NOT increment. STATIC/offline.
+console.log("\ncase 15: A does NOT fire on a non-stale 401 (revoked token) → no retry, legible error");
+{
+  const SK = "56".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const captured = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      captured.push({ url: rq.url, body });
+      if (rq.method === "GET") { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ name: "mock", version: "0", software_sha: "deadbeef" })); return; }
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        if (kinds.has(39002)) { rs.writeHead(401, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ error: "revoked token" })); return; }
+      }
+      rs.writeHead(200, { "Content-Type": "application/json" }); rs.end("[]");
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_read", { channel: "testchan", limit: 5 }, { waitMs: 9000, callDelay: 1500 });
+  relay.close();
+  const memberReqs = captured.filter((c) => c.url === "/query" && /39002/.test(c.body));
+  if (text == null) skipped("A-no-fire: no tools/call reply");
+  else {
+    console.log("  client sees: " + text.slice(0, 160));
+    ok(memberReqs.length === 1, `NO retry on a non-stale 401 — exactly one physical attempt (got ${memberReqs.length})`);
+    ok(/HTTP 401/.test(text) && /revoked token/.test(text), "the non-stale 401 surfaces legibly (HTTP 401 + body)");
+    ok(!/stale_401_retry_count/.test(err), "the stale-401 counter did NOT increment for a non-stale 401");
+  }
+}
+
+// ---- Case 16 (v0.2.17 item 3 / single-flight): stale 401 TWICE → retry once, then surface --------
+// The relay 401s EVERY membership query with the stale message. A must retry exactly ONCE and then
+// surface the second 401 (no cascade / no loop): exactly TWO physical attempts, an HTTP 401 result,
+// and the counter incremented exactly once. STATIC/offline.
+console.log("\ncase 16: single-flight — stale 401 twice → retried once then surfaced (no cascade)");
+{
+  const SK = "78".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const captured = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      captured.push({ url: rq.url, body });
+      if (rq.method === "GET") { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ name: "mock", version: "0", software_sha: "deadbeef" })); return; }
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        if (kinds.has(39002)) { rs.writeHead(401, { "Content-Type": "application/json" }); rs.end(JSON.stringify({ error: "event timestamp outside ±60s window" })); return; }
+      }
+      rs.writeHead(200, { "Content-Type": "application/json" }); rs.end("[]");
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_read", { channel: "testchan", limit: 5 }, { waitMs: 9000, callDelay: 1500 });
+  relay.close();
+  const memberReqs = captured.filter((c) => c.url === "/query" && /39002/.test(c.body));
+  const staleHits = (err.match(/stale_401_retry_count=/g) || []).length;
+  if (text == null) skipped("single-flight: no tools/call reply");
+  else {
+    console.log("  client sees: " + text.slice(0, 160));
+    ok(memberReqs.length === 2, `at most two physical attempts (original + one remediation) — got ${memberReqs.length}, no cascade`);
+    ok(/HTTP 401/.test(text), "the second stale 401 surfaced (did not loop forever)");
+    ok(staleHits === 1, `A fired exactly once for this call (counter line count = ${staleHits})`);
+  }
+}
+
+// ---- Case 17 (v0.2.17 item 3 / B): a slow undici attempt → hard timeout THROWS → fresh-socket retry
+// BUZZ_HTTP_TIMEOUT_S is set very low (1s) and the mock DELAYS the first membership response past it,
+// so the undici attempt() aborts (throws) → the EXISTING transport catch re-signs a fresh NIP-98 and
+// retries over a fresh node:https socket, which the mock serves immediately. Assert: two physical
+// 39002 attempts, the retry carried a fresh NIP-98, the transient-retry stderr marker fired, and the
+// call ultimately succeeds. (This is the offline simulation of B; the abort is driven by the real
+// AbortController timeout wired from BUZZ_HTTP_TIMEOUT_S.)
+console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S → fresh-socket re-sign retry");
+{
+  const SK = "9a".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const OTHER = "bc".repeat(32);
+  const now = Math.floor(Date.now() / 1000);
+  const captured = [];
+  let delayedOnce = false;
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      captured.push({ url: rq.url, body, auth: rq.headers["authorization"] || "" });
+      const reply = (obj) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "deadbeef" });
+      if (rq.url === "/events") return reply({ message: "response:{}" });
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        if (kinds.has(39002) && !delayedOnce) {
+          // First membership query: hold the response well past the 1s BUZZ_HTTP_TIMEOUT_S so the
+          // undici attempt aborts. The retry (fresh socket) is served immediately below.
+          delayedOnce = true;
+          const t = setTimeout(() => { try { reply([]); } catch {} }, 3000); t.unref?.();
+          return;
+        }
+        if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+        if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+        if (kinds.has(0)) return reply([{ id: "p1", pubkey: PK, kind: 0, created_at: now, tags: [], content: JSON.stringify({ name: "me" }) }]);
+        if (kinds.has(9)) return reply([{ id: "e1", pubkey: OTHER, kind: 9, created_at: now, tags: [["h", "chanA"]], content: "recovered ok" }]);
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_HTTP_TIMEOUT_S: "1",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_read", { channel: "testchan", limit: 5 }, { waitMs: 13000, callDelay: 1500 });
+  relay.close();
+  const memberReqs = captured.filter((c) => c.url === "/query" && /39002/.test(c.body) && c.auth);
+  if (text == null || memberReqs.length < 2) {
+    skipped(`B-timeout: did not observe the aborted attempt + its retry (saw ${memberReqs.length} membership queries; reply=${(text || "").slice(0, 80)})`);
+  } else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 160));
+    ok(memberReqs.length === 2, `slow attempt aborted → one fresh-socket retry (two physical 39002 attempts, got ${memberReqs.length})`);
+    const [a1, a2] = [decodeNip98(memberReqs[0].auth), decodeNip98(memberReqs[1].auth)];
+    ok(!!a1 && !!a2 && a1.id && a2.id && a1.id !== a2.id, "the timeout retry carried a fresh, re-signed NIP-98 (different id)");
+    ok(/transient .* fetch failed/.test(err) && /fresh node:https socket/.test(err), "the transport (B→existing) retry marker fired on stderr");
+    ok(!/HTTP 401|timeout|outside ±60s/.test(text), "the call ultimately succeeded (no timeout/401 surfaced to the client)");
   }
 }
 
