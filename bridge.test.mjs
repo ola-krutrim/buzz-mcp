@@ -100,6 +100,23 @@ function probeList(env, { waitMs = 6000, callDelay = 1000 } = {}) {
   });
 }
 
+// Generic: drive the shim over stdio and capture the MCP `initialize` handshake result (id 1) —
+// where serverInfo (name + version) is advertised. No tool call, fully static/offline.
+function probeInit(env, { waitMs = 4000 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn("node", [SHIM], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    const send = (o) => { try { p.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bridge-test", version: "1" } } });
+    setTimeout(() => {
+      p.kill();
+      const reply = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((j) => j && j.id === 1);
+      resolve(reply ? (reply.result ?? null) : null);
+    }, waitMs);
+  });
+}
+
 // Like probeTool, but ALSO captures the shim's stderr (where the retry/telemetry markers land) so a
 // test can assert the stale-401 counter line fired. Returns { text, err }.
 function probeToolErr(env, toolName, args, { waitMs = 8000, callDelay = 1200 } = {}) {
@@ -700,6 +717,61 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
     ok(!!a1 && !!a2 && a1.id && a2.id && a1.id !== a2.id, "the timeout retry carried a fresh, re-signed NIP-98 (different id)");
     ok(/transient .* fetch failed/.test(err) && /fresh node:https socket/.test(err), "the transport (B→existing) retry marker fired on stderr");
     ok(!/HTTP 401|timeout|outside ±60s/.test(text), "the call ultimately succeeded (no timeout/401 surfaced to the client)");
+  }
+}
+
+// ---- Case 18 (v0.2.18): MCP initialize serverInfo.version = the shim version, NOT "0.1.0" ------
+// The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
+// now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
+// (handshake is answered in-process; the black-hole relay is never dialed for initialize).
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.18), not 0.1.0");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
+    BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const res = await probeInit(AGENT);
+  if (res == null) skipped("no initialize reply — shim did not start");
+  else {
+    const si = res.serverInfo || {};
+    console.log("  serverInfo: " + JSON.stringify(si));
+    ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
+    ok(si.version === "0.2.18", `serverInfo.version === '0.2.18' (got '${si.version}')`);
+    ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
+    ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
+  }
+}
+
+// ---- Case 19 (v0.2.18): buzz_whoami surfaces the shim version -------------------------------
+// The identity block must carry a readable shim-version line. Offline: whoami builds its block
+// locally; relayInfo() against a black-hole host just renders an UNREACHABLE self-report line.
+console.log("\ncase 19: buzz_whoami output contains the shim version string");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
+    BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const text = await probeTool(AGENT, "buzz_whoami", {}, { waitMs: 6000, callDelay: 1000 });
+  if (text == null) skipped("no reply for buzz_whoami version case");
+  else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
+    ok(/@ola\/buzz-mcp v0\.2\.18/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.18'");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
+  }
+}
+
+// ---- Case 20 (v0.2.18): buzz_doctor surfaces the shim version -------------------------------
+// The connector-side diagnosis block must carry the same shim-version line. Offline: doctor probes a
+// dead relay over a fresh socket and STILL returns its structured diagnosis (incl. the shim line).
+console.log("\ncase 20: buzz_doctor output contains the shim version string");
+{
+  const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
+    BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
+    BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
+  const text = await probeTool(AGENT, "buzz_doctor", { timeout_s: 2 }, { waitMs: 9000, callDelay: 1200 });
+  if (text == null) skipped("no reply for buzz_doctor version case");
+  else {
+    console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
+    ok(/@ola\/buzz-mcp v0\.2\.18/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.18'");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
 

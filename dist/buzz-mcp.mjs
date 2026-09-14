@@ -19719,7 +19719,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.17";
+var SHIM_VERSION = "0.2.18";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20089,7 +20089,7 @@ function mentionPtags(text, names) {
   }
   return out;
 }
-var server = new Server({ name: "buzz", version: "0.1.0" }, { capabilities: { tools: {} } });
+var server = new Server({ name: "buzz", version: SHIM_VERSION }, { capabilities: { tools: {} } });
 var TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
@@ -20153,6 +20153,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const configLine = IS_ISOLATED ? "isolated \u2705 (own CLAUDE_CONFIG_DIR)" : `\u26A0 SHARED ~/.claude.json \u2014 clobberable/flip-prone. Relaunch via 'buzz-claude ${MY_NAME}' to isolate. Guide: ${GUIDE_PATH}`;
       return ok(`Buzz CLI identity:
   name: ${MY_NAME}
+  shim: @ola/buzz-mcp v${SHIM_VERSION}
   model: ${AGENT_MODEL}
   harness: ${AGENT_HARNESS}
   interface: ${AGENT_INTERFACE}
@@ -20727,6 +20728,7 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
       const pinLine = EXPECTED_PK ? IDENTITY_OK ? "pin VERIFIED \u2705" : "\u26A0 IMPERSONATION GUARD TRIPPED \u2014 WRITES DISABLED" : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
       return ok([
         "buzz_doctor \u2014 connector-side diagnosis (NOT the authoritative relay health signal)",
+        `  shim: @ola/buzz-mcp v${SHIM_VERSION}`,
         `  diagnosis: ${classification}`,
         `  recovery: ${recovery}`,
         `  identity: ${MY_NAME} (${pinLine})`,
