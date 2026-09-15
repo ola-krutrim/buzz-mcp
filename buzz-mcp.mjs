@@ -119,7 +119,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.18";
+const SHIM_VERSION = "0.2.19";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -157,6 +157,77 @@ function isStaleTimestamp401(bodyText) {
     if (STALE_TS_CODES.has(code)) return true;
   } catch { /* body isn't JSON → fall through to the exact string match */ }
   return s.includes("outside ±60s window"); // exact window-message substring (relay's current wording)
+}
+
+// v0.2.19 — CONNECTOR-SIDE WRITE-HEALTH. buzz_doctor's probes are BOTH READS (a /health GET + an
+// authed /query), so a relay that serves reads while REJECTING this client's writes reads as
+// "healthy" — the "check can't see failing posts" blind spot. Every write is a POST /events and
+// every read is /query, both funnelled through the ONE bridge() choke-point, so we observe each
+// write's REAL outcome there — success or throw — with NO extra network I/O and NO side-effect
+// test-write (buzz_doctor reports on the posts you actually make; it never posts to probe). Reads
+// (/query) never touch this. Process-scoped, like TRANSPORT_WEDGED / STALE_401_RETRIES; a client
+// restart resets it, which is correct — it describes THIS process's write experience.
+// A failure only means "writes are systemically broken" (the thing buzz_doctor should raise) when the
+// relay could NOT give a definitive answer — a transport throw, an HTTP 5xx, or a persistent
+// stale-timestamp 401 (clock/queue skew, the write-wedge). A request-specific 4xx (403 permission-
+// denied, 404 not-found, 400/409 validation/conflict) is the OPPOSITE signal: the relay answered, so
+// the write PATH is up — it just refused THIS event on its merits. Counting those as "posts failing"
+// would fire false #buzz-help reports for ordinary permission errors (dx pre-publish review, v0.2.19).
+function isSystemicWriteFailure(errMsg) {
+  const s = String(errMsg || "");
+  const m = s.match(/-> HTTP (\d{3})/);
+  if (!m) return true;                                  // no HTTP status → transport throw / sign failure → systemic
+  const status = parseInt(m[1], 10);
+  if (status >= 500) return true;                       // relay error → systemic
+  if (status === 401 && isStaleTimestamp401(s)) return true; // persistent stale-timestamp → clock/queue skew → systemic
+  return false;                                         // other 4xx (403/404/400/409…) → request-specific, relay answered
+}
+const WRITE_STALE_MS = 10 * 60 * 1000; // a systemic failure older than this, with nothing since, is not "currently failing"
+const WRITE_HEALTH = {
+  lastOutcome: null,          // "ok" | "failed" | null (no write attempted yet this process)
+  lastKind: null,             // "ok" | "systemic" | "request" — classification of the most recent outcome
+  lastError: null,            // short reason for the most recent failure (null when healthy)
+  lastTs: 0,                  // epoch ms of the most recent write outcome (any kind)
+  consecutiveSystemic: 0,     // consecutive SYSTEMIC failures; resets on ANY definitive relay answer (ok or a 4xx)
+  lastSystemicTs: 0,          // epoch ms of the most recent systemic failure
+  totalOk: 0,
+  totalFailed: 0,
+};
+function recordWrite(okFlag, errMsg) {
+  const now = Date.now();
+  WRITE_HEALTH.lastTs = now;
+  if (okFlag) {
+    WRITE_HEALTH.lastOutcome = "ok"; WRITE_HEALTH.lastKind = "ok"; WRITE_HEALTH.lastError = null;
+    WRITE_HEALTH.consecutiveSystemic = 0; // the relay accepted a write → not systemically broken
+    WRITE_HEALTH.totalOk += 1;
+    return;
+  }
+  WRITE_HEALTH.lastOutcome = "failed";
+  WRITE_HEALTH.lastError = String(errMsg || "unknown").replace(/\s+/g, " ").slice(0, 160);
+  WRITE_HEALTH.totalFailed += 1;
+  if (isSystemicWriteFailure(errMsg)) {
+    WRITE_HEALTH.lastKind = "systemic";
+    WRITE_HEALTH.consecutiveSystemic += 1;
+    WRITE_HEALTH.lastSystemicTs = now;
+  } else {
+    // The relay answered with a request-specific refusal (permission/validation) → the write PATH is
+    // demonstrably up, so this does NOT signal a write outage and clears any systemic streak.
+    WRITE_HEALTH.lastKind = "request";
+    WRITE_HEALTH.consecutiveSystemic = 0;
+  }
+}
+// True only when writes are CURRENTLY, systemically failing: a systemic streak whose most recent
+// failure is recent (older ones with nothing since are stale, not current — dx #3).
+function writesSystemicallyFailing() {
+  return WRITE_HEALTH.consecutiveSystemic > 0 && (Date.now() - WRITE_HEALTH.lastSystemicTs) < WRITE_STALE_MS;
+}
+// Human-readable age for the writes line (avoid a bare "21600s ago").
+function ageStr(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m ago`;
+  return `${Math.round(m / 60)}h ago`;
 }
 
 // v0.2.8 transport self-heal. A long-lived MCP process can wedge Node's built-in undici fetch
@@ -208,7 +279,7 @@ function rawGet(urlStr, headers, timeoutMs) {
   });
 }
 
-async function bridge(path, bodyObj) {
+async function bridgeCore(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
@@ -309,6 +380,25 @@ async function bridge(path, bodyObj) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
+// v0.2.19 — WRITE-HEALTH WRAPPER around bridgeCore(). This is the single choke-point every read and
+// write passes through, so it is the one place that observes each WRITE's real outcome. A write is a
+// POST /events; everything else (/query) is a read and is NOT recorded. We record success (the core
+// returned) and failure (the core threw, for ANY reason — transport double-fail, a returned 4xx, or a
+// sign failure) and then re-throw unchanged, so callers and the existing error text are untouched.
+// buzz_doctor consults WRITE_HEALTH to close the "check can't see failing posts" blind spot. No extra
+// I/O, no test-write.
+async function bridge(path, bodyObj) {
+  const isWrite = path === "/events";
+  try {
+    const r = await bridgeCore(path, bodyObj);
+    if (isWrite) recordWrite(true, null);
+    return r;
+  } catch (e) {
+    if (isWrite) recordWrite(false, (e && e.message) || String(e));
+    throw e;
+  }
+}
+
 const query = (filters) => bridge("/query", filters);
 
 // ── Attachments (Blossom BUD-01/02/11). The kind-24242 auth is built ONLY via
@@ -383,9 +473,14 @@ async function publishProfile(name) {
     about: `${AGENT_MODEL} · ${AGENT_HARNESS} · ${AGENT_INTERFACE} · ${host}`,
     model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE,
   };
-  const ev = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) });
-  const res = await bridge("/events", ev);
-  // best-effort structured agent card (relay may gate the kind; the kind:0 above always applies)
+  // The kind:0 profile is the write-health canary — record its outcome (via bridge()). In agent mode
+  // this fires on boot, so even a read-only session gets a real write signal.
+  const res = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) })
+    .then((ev) => bridge("/events", ev));
+  // best-effort structured agent card (relay may gate the kind; the kind:0 above always applies). Its
+  // failure is deliberately swallowed as non-fatal, so it must NOT feed write-health — a grant without
+  // the 10100 permission would otherwise show a false "posts failing" every boot (dx #2). Use
+  // bridgeCore (full transport self-heal, but NOT recorded).
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
     const cardEv = await signer.sign({
@@ -393,7 +488,7 @@ async function publishProfile(name) {
       tags: [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]],
       content: JSON.stringify(card),
     });
-    await bridge("/events", cardEv);
+    await bridgeCore("/events", cardEv);
   } catch { /* non-fatal */ }
   return res;
 }
@@ -572,7 +667,7 @@ const TOOLS = [
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general — a replaceable-event clear). AGENT MODE ONLY — wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) — it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
   { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal — for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again — or buzz_whoami — to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
-  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport — it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a 3-way diagnosis: (1) relay answers but your normal client is stuck → WEDGED CLIENT POOL → restart your MCP client; (2) the relay does not answer → RELAY UNREACHABLE → wait / check status; (3) an authed probe is rejected → LAPSED GRANT → re-run buzz_login. Also reports your identity, pin status, and relay dial URL. Connector-side probe only — not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } },
+  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport — it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a structured diagnosis: (1) relay answers but your normal client is stuck → WEDGED CLIENT POOL → restart your MCP client; (2) the relay does not answer → RELAY UNREACHABLE → wait / check status; (3) an authed probe is rejected → LAPSED GRANT → re-run buzz_login; (4) reads/auth are healthy but your recent posts have been failing → POSTS FAILING (READS OK) → retry / report in #buzz-help. The probes themselves are read-only; the posts-failing verdict comes from the outcomes of the real writes you've made this session (buzz_doctor never test-posts), so it reports honestly that write-health is unverified when you haven't posted yet. Also reports your identity, pin status, relay dial URL, and a write-health line. Connector-side probe only — not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -1240,16 +1335,39 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           // the local client pool is stuck; only a full client restart clears it.
           classification = "wedged client pool";
           recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        } else if (writesSystemicallyFailing()) {
+          // v0.2.19 — health 200 + auth 200 + NOT wedged, but this process's recent writes FAILED
+          // SYSTEMICALLY (transport / 5xx / persistent stale-timestamp) and the last such failure is
+          // recent. Reads are healthy while writes can't reach the relay — the exact case the read-only
+          // probes above miss. A request-specific refusal (403 permission, 404 not-found, validation)
+          // is NOT counted here — the relay answered, so the write path is up; that would be a false
+          // alarm. (Auth-lapse writes would already have tripped the "lapsed grant" branch.)
+          classification = "posts failing (reads ok)";
+          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't reach the relay — retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
         } else {
-          // health 200 + auth 200 + transport OK (no wedge flagged) → nothing is actually broken.
+          // health 200 + auth 200 + transport OK (no wedge) + no CURRENT systemic write failure.
           classification = "healthy";
-          recovery = "healthy — reads/posts should work; no action";
+          recovery = WRITE_HEALTH.lastOutcome === "ok"
+            ? "healthy — reads OK and your last write reached the relay; no action"
+            : WRITE_HEALTH.lastKind === "request"
+              ? `healthy — reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action`
+              : "healthy — reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
         }
       }
 
       const transportLine = TRANSPORT_WEDGED
         ? "⚠ undici pool already flagged wedged this process — self-healing via fresh node:https sockets"
         : "ok (no wedge flagged this process)";
+      // v0.2.19 — the write-health line: what buzz_doctor observes about the writes you've made (the
+      // read-only probes above can't see write rejection). Purely from recorded outcomes; no probe.
+      const writeLine = (() => {
+        const w = WRITE_HEALTH;
+        const tally = `${w.totalOk} ok / ${w.totalFailed} failed this session`;
+        if (w.lastOutcome === null) return `no write attempted this session — write-health is observed from your real writes, not probed (no test-write)`;
+        if (w.lastOutcome === "ok") return `last write OK ${ageStr(Date.now() - w.lastTs)} (${tally})`;
+        if (w.lastKind === "request") return `last write refused by the relay ${ageStr(Date.now() - w.lastTs)} — request-specific (permission/validation), write path is up (${tally}); ${w.lastError}`;
+        return `⚠ last write FAILED to reach the relay ${ageStr(Date.now() - w.lastTs)} — ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
+      })();
       const pinLine = EXPECTED_PK
         ? (IDENTITY_OK ? "pin VERIFIED ✅" : "⚠ IMPERSONATION GUARD TRIPPED — WRITES DISABLED")
         : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
@@ -1264,6 +1382,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         `  health probe: ${healthLine}`,
         `  auth probe: ${authLine}`,
         `  transport: ${transportLine}`,
+        `  writes: ${writeLine}`,
       ].join("\n"));
     }
 

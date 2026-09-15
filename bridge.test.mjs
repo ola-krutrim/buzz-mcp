@@ -724,7 +724,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.18), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.19), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -735,7 +735,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.18", `serverInfo.version === '0.2.18' (got '${si.version}')`);
+    ok(si.version === "0.2.19", `serverInfo.version === '0.2.19' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -753,7 +753,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.18/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.18'");
+    ok(/@ola\/buzz-mcp v0\.2\.19/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.19'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -770,8 +770,172 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.18/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.18'");
+    ok(/@ola\/buzz-mcp v0\.2\.19/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.19'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ============================================================================
+// v0.2.19 — CONNECTOR-SIDE WRITE-HEALTH ("check can't see failing posts")
+// ----------------------------------------------------------------------------
+// buzz_doctor's probes are both READS (health GET + authed /query). A relay that
+// serves reads while REJECTING writes used to read as "healthy". The fix records
+// each real write's outcome in bridge() and lets buzz_doctor consult it. These
+// cases drive ONE process: a real buzz_post (which the mock relay accepts or
+// rejects), THEN buzz_doctor in the SAME process, so the per-process write-health
+// state persists across the two calls. No test-write is performed by the doctor
+// itself — it only reports the outcome of the post the test made.
+// ============================================================================
+
+// Drive the shim over stdio: initialize → buzz_post (id 2) → buzz_doctor (id 3),
+// both in the SAME process. Returns { postText, doctorText }.
+function probePostThenDoctor(env, { channel = "testchan", waitMs = 13000 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn("node", [SHIM], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    const send = (o) => { try { p.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bridge-test", version: "1" } } });
+    setTimeout(() => send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "buzz_post", arguments: { channel, text: "write-health probe" } } }), 1200);
+    setTimeout(() => send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "buzz_doctor", arguments: { timeout_s: 3 } } }), 5000);
+    setTimeout(() => {
+      p.kill();
+      const msgs = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } });
+      const at = (id) => { const m = msgs.find((j) => j && j.id === id); return m ? JSON.stringify(m.result ?? m.error) : null; };
+      resolve({ postText: at(2), doctorText: at(3) });
+    }, waitMs);
+  });
+}
+
+// A mock relay parameterised by the status it returns on POST /events. Reads
+// (GET /health, POST /query) always succeed so the doctor's read probes are green
+// and channel resolution proceeds to the write.
+function writeHealthRelay(eventsStatus, eventsBody) {
+  const SK = "66".repeat(32);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (obj, status = 200) => { rs.writeHead(status, { "Content-Type": "application/json" }); rs.end(typeof obj === "string" ? obj : JSON.stringify(obj)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") return reply(eventsBody, eventsStatus);
+      if (rq.url === "/query") {
+        let filters = []; try { filters = JSON.parse(body); } catch {}
+        const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+        if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+        if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+        return reply([]); // kind 0 profiles + the doctor's authed "[]" probe → 200, empty
+      }
+      reply({});
+    });
+  });
+  return { relay, SK };
+}
+
+// ---- Case 21 (v0.2.19): write fails SYSTEMICALLY (relay 5xx /events) → 'posts failing (reads ok)' --
+// A 5xx (or transport throw / persistent stale-401) means the write couldn't reach the relay — the
+// systemic case buzz_doctor SHOULD raise. (A 403 permission refusal is tested separately in case 24
+// and must NOT trip this — the relay answered, so the write path is up.)
+console.log("\ncase 21: buzz_post fails systemically (relay 5xx /events) → buzz_doctor → 'posts failing (reads ok)', NOT 'healthy'");
+{
+  const { relay, SK } = writeHealthRelay(500, { error: "relay_down" });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { postText, doctorText } = await probePostThenDoctor({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  });
+  relay.close();
+  if (doctorText == null) skipped("no buzz_doctor reply for write-fail case");
+  else {
+    console.log("  post sees:   " + String(postText).slice(0, 140));
+    console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/HTTP 500|relay_down/i.test(String(postText)), "buzz_post → surfaces the relay's systemic write failure");
+    ok(/posts failing \(reads ok\)/i.test(doctorText), "buzz_doctor → classifies reads-ok-but-writes-systemically-failing as 'posts failing (reads ok)'");
+    ok(!/diagnosis: healthy/i.test(doctorText), "buzz_doctor → does NOT report 'healthy' while writes are systemically failing");
+    ok(/#buzz-help/i.test(doctorText), "buzz_doctor → gives the posts-failing recovery (report in #buzz-help)");
+    ok(/last write FAILED to reach the relay/i.test(doctorText), "buzz_doctor → the writes line shows the systemic write failure");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ---- Case 22 (v0.2.19): write succeeds → buzz_doctor → 'healthy' (last post succeeded) -----------
+console.log("\ncase 22: buzz_post succeeds → buzz_doctor → 'healthy' and the writes line confirms the post");
+{
+  const { relay, SK } = writeHealthRelay(200, { message: "response:{}" });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { postText, doctorText } = await probePostThenDoctor({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  });
+  relay.close();
+  if (doctorText == null) skipped("no buzz_doctor reply for write-ok case");
+  else {
+    console.log("  post sees:   " + String(postText).slice(0, 140));
+    console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/posted to #testchan/i.test(String(postText)), "buzz_post → confirms the post went through");
+    ok(/diagnosis: healthy/i.test(doctorText), "buzz_doctor → a reachable relay that accepts the write → 'healthy'");
+    ok(/last write reached the relay/i.test(doctorText), "buzz_doctor → the healthy recovery notes the successful write");
+    ok(/last write OK/i.test(doctorText), "buzz_doctor → the writes line records the OK write");
+    ok(!/posts failing/i.test(doctorText), "buzz_doctor → does NOT report posts-failing after a successful write");
+  }
+}
+
+// ---- Case 23 (v0.2.19): the BOOT-PUBLISH CANARY — a read-only session still catches broken writes.
+// In agent mode the shim fire-and-forgets its kind:0 profile publish on boot (publishProfile), so
+// WRITE_HEALTH is populated even when the USER never calls buzz_post. If that boot write fails
+// SYSTEMICALLY (5xx here), buzz_doctor reports 'posts failing (reads ok)' with NO explicit post — the
+// user learns writes are down before they even try. Only the kind:0 profile is recorded; the kind:10100
+// agent card publishes via bridgeCore and is NOT recorded (dx #2), so the systemic count here is 1, not
+// 2. (The null/"unverified" branch is reached only in wire mode, where the boot publish is skipped.)
+console.log("\ncase 23: read-only session, relay 5xx's the boot profile publish → buzz_doctor → 'posts failing (reads ok)' with NO user post");
+{
+  const { relay, SK } = writeHealthRelay(500, { error: "relay_down" });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  // Only ever call buzz_doctor — never buzz_post. The only recorded write is the shim's boot kind:0.
+  const doctorText = await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", { timeout_s: 3 }, { waitMs: 9000, callDelay: 2500 });
+  relay.close();
+  if (doctorText == null) skipped("no buzz_doctor reply for boot-canary case");
+  else {
+    console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/posts failing \(reads ok\)/i.test(doctorText), "buzz_doctor → the failed boot publish alone trips 'posts failing (reads ok)' — no user post needed");
+    ok(!/diagnosis: healthy/i.test(doctorText), "buzz_doctor → does NOT report 'healthy' when the boot write failed systemically");
+    ok(/last write FAILED to reach the relay/i.test(doctorText), "buzz_doctor → the writes line records the failed boot write");
+    ok(/1 consecutive systemic/i.test(doctorText), "buzz_doctor → the agent card is NOT counted (systemic count is 1: kind:0 only)");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ---- Case 24 (v0.2.19): a PERMISSION-DENIED write (403) must NOT read as 'posts failing' (dx #1) ----
+// Every /events failure used to trip 'posts failing (reads ok)', so an ordinary 403 (e.g. add_member
+// without admin, deleting someone else's message) produced a false "report in #buzz-help" while posting
+// worked fine. A request-specific 4xx means the relay ANSWERED — the write path is up — so it must NOT
+// flip the verdict. The doctor stays 'healthy' and explains the refusal was request-specific.
+console.log("\ncase 24: buzz_post refused with 403 (permission) → buzz_doctor stays 'healthy', NOT 'posts failing' (no false #buzz-help)");
+{
+  const { relay, SK } = writeHealthRelay(403, { error: "forbidden" });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { postText, doctorText } = await probePostThenDoctor({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  });
+  relay.close();
+  if (doctorText == null) skipped("no buzz_doctor reply for permission-denied case");
+  else {
+    console.log("  post sees:   " + String(postText).slice(0, 140));
+    console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/HTTP 403|forbidden/i.test(String(postText)), "buzz_post → the 403 still surfaces to the caller verbatim");
+    ok(!/posts failing/i.test(doctorText), "buzz_doctor → a 403 permission refusal does NOT read as 'posts failing' (dx #1 fix)");
+    ok(/diagnosis: healthy/i.test(doctorText), "buzz_doctor → stays 'healthy' — the relay answered, the write path is up");
+    ok(!/#buzz-help/i.test(doctorText), "buzz_doctor → no false 'report in #buzz-help' for an ordinary permission error");
+    ok(/request-specific/i.test(doctorText), "buzz_doctor → explains the refusal was request-specific (permission/validation)");
   }
 }
 

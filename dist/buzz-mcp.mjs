@@ -19719,7 +19719,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.18";
+var SHIM_VERSION = "0.2.19";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19741,6 +19741,65 @@ function isStaleTimestamp401(bodyText) {
   } catch {
   }
   return s.includes("outside \xB160s window");
+}
+function isSystemicWriteFailure(errMsg) {
+  const s = String(errMsg || "");
+  const m = s.match(/-> HTTP (\d{3})/);
+  if (!m) return true;
+  const status = parseInt(m[1], 10);
+  if (status >= 500) return true;
+  if (status === 401 && isStaleTimestamp401(s)) return true;
+  return false;
+}
+var WRITE_STALE_MS = 10 * 60 * 1e3;
+var WRITE_HEALTH = {
+  lastOutcome: null,
+  // "ok" | "failed" | null (no write attempted yet this process)
+  lastKind: null,
+  // "ok" | "systemic" | "request" — classification of the most recent outcome
+  lastError: null,
+  // short reason for the most recent failure (null when healthy)
+  lastTs: 0,
+  // epoch ms of the most recent write outcome (any kind)
+  consecutiveSystemic: 0,
+  // consecutive SYSTEMIC failures; resets on ANY definitive relay answer (ok or a 4xx)
+  lastSystemicTs: 0,
+  // epoch ms of the most recent systemic failure
+  totalOk: 0,
+  totalFailed: 0
+};
+function recordWrite(okFlag, errMsg) {
+  const now2 = Date.now();
+  WRITE_HEALTH.lastTs = now2;
+  if (okFlag) {
+    WRITE_HEALTH.lastOutcome = "ok";
+    WRITE_HEALTH.lastKind = "ok";
+    WRITE_HEALTH.lastError = null;
+    WRITE_HEALTH.consecutiveSystemic = 0;
+    WRITE_HEALTH.totalOk += 1;
+    return;
+  }
+  WRITE_HEALTH.lastOutcome = "failed";
+  WRITE_HEALTH.lastError = String(errMsg || "unknown").replace(/\s+/g, " ").slice(0, 160);
+  WRITE_HEALTH.totalFailed += 1;
+  if (isSystemicWriteFailure(errMsg)) {
+    WRITE_HEALTH.lastKind = "systemic";
+    WRITE_HEALTH.consecutiveSystemic += 1;
+    WRITE_HEALTH.lastSystemicTs = now2;
+  } else {
+    WRITE_HEALTH.lastKind = "request";
+    WRITE_HEALTH.consecutiveSystemic = 0;
+  }
+}
+function writesSystemicallyFailing() {
+  return WRITE_HEALTH.consecutiveSystemic > 0 && Date.now() - WRITE_HEALTH.lastSystemicTs < WRITE_STALE_MS;
+}
+function ageStr(ms) {
+  const s = Math.max(0, Math.round(ms / 1e3));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m ago`;
+  return `${Math.round(m / 60)}h ago`;
 }
 var TRANSPORT_WEDGED = false;
 function rawPost(urlStr, headers, body) {
@@ -19793,7 +19852,7 @@ function rawGet(urlStr, headers, timeoutMs) {
     req.end();
   });
 }
-async function bridge(path, bodyObj) {
+async function bridgeCore(path, bodyObj) {
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
@@ -19847,6 +19906,17 @@ async function bridge(path, bodyObj) {
     return JSON.parse(text);
   } catch {
     return text;
+  }
+}
+async function bridge(path, bodyObj) {
+  const isWrite = path === "/events";
+  try {
+    const r = await bridgeCore(path, bodyObj);
+    if (isWrite) recordWrite(true, null);
+    return r;
+  } catch (e) {
+    if (isWrite) recordWrite(false, e && e.message || String(e));
+    throw e;
   }
 }
 var query = (filters) => bridge("/query", filters);
@@ -19939,8 +20009,7 @@ async function publishProfile(name) {
     harness: AGENT_HARNESS,
     interface: AGENT_INTERFACE
   };
-  const ev = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) });
-  const res = await bridge("/events", ev);
+  const res = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }).then((ev) => bridge("/events", ev));
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
     const cardEv = await signer.sign({
@@ -19948,7 +20017,7 @@ async function publishProfile(name) {
       tags: [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]],
       content: JSON.stringify(card)
     });
-    await bridge("/events", cardEv);
+    await bridgeCore("/events", cardEv);
   } catch {
   }
   return res;
@@ -20114,7 +20183,7 @@ var TOOLS = [
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general \u2014 a replaceable-event clear). AGENT MODE ONLY \u2014 wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) \u2014 it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
   { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal \u2014 for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again \u2014 or buzz_whoami \u2014 to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
-  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport \u2014 it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a 3-way diagnosis: (1) relay answers but your normal client is stuck \u2192 WEDGED CLIENT POOL \u2192 restart your MCP client; (2) the relay does not answer \u2192 RELAY UNREACHABLE \u2192 wait / check status; (3) an authed probe is rejected \u2192 LAPSED GRANT \u2192 re-run buzz_login. Also reports your identity, pin status, and relay dial URL. Connector-side probe only \u2014 not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } }
+  { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport \u2014 it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a structured diagnosis: (1) relay answers but your normal client is stuck \u2192 WEDGED CLIENT POOL \u2192 restart your MCP client; (2) the relay does not answer \u2192 RELAY UNREACHABLE \u2192 wait / check status; (3) an authed probe is rejected \u2192 LAPSED GRANT \u2192 re-run buzz_login; (4) reads/auth are healthy but your recent posts have been failing \u2192 POSTS FAILING (READS OK) \u2192 retry / report in #buzz-help. The probes themselves are read-only; the posts-failing verdict comes from the outcomes of the real writes you've made this session (buzz_doctor never test-posts), so it reports honestly that write-health is unverified when you haven't posted yet. Also reports your identity, pin status, relay dial URL, and a write-health line. Connector-side probe only \u2014 not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } }
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 var RELAY_INFO = null;
@@ -20719,12 +20788,23 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         } else if (TRANSPORT_WEDGED) {
           classification = "wedged client pool";
           recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
+        } else if (writesSystemicallyFailing()) {
+          classification = "posts failing (reads ok)";
+          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't reach the relay \u2014 retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
         } else {
           classification = "healthy";
-          recovery = "healthy \u2014 reads/posts should work; no action";
+          recovery = WRITE_HEALTH.lastOutcome === "ok" ? "healthy \u2014 reads OK and your last write reached the relay; no action" : WRITE_HEALTH.lastKind === "request" ? `healthy \u2014 reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action` : "healthy \u2014 reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
         }
       }
       const transportLine = TRANSPORT_WEDGED ? "\u26A0 undici pool already flagged wedged this process \u2014 self-healing via fresh node:https sockets" : "ok (no wedge flagged this process)";
+      const writeLine = (() => {
+        const w = WRITE_HEALTH;
+        const tally = `${w.totalOk} ok / ${w.totalFailed} failed this session`;
+        if (w.lastOutcome === null) return `no write attempted this session \u2014 write-health is observed from your real writes, not probed (no test-write)`;
+        if (w.lastOutcome === "ok") return `last write OK ${ageStr(Date.now() - w.lastTs)} (${tally})`;
+        if (w.lastKind === "request") return `last write refused by the relay ${ageStr(Date.now() - w.lastTs)} \u2014 request-specific (permission/validation), write path is up (${tally}); ${w.lastError}`;
+        return `\u26A0 last write FAILED to reach the relay ${ageStr(Date.now() - w.lastTs)} \u2014 ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
+      })();
       const pinLine = EXPECTED_PK ? IDENTITY_OK ? "pin VERIFIED \u2705" : "\u26A0 IMPERSONATION GUARD TRIPPED \u2014 WRITES DISABLED" : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
       return ok([
         "buzz_doctor \u2014 connector-side diagnosis (NOT the authoritative relay health signal)",
@@ -20735,7 +20815,8 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         `  relay (dial): ${RELAY}`,
         `  health probe: ${healthLine}`,
         `  auth probe: ${authLine}`,
-        `  transport: ${transportLine}`
+        `  transport: ${transportLine}`,
+        `  writes: ${writeLine}`
       ].join("\n"));
     }
     return ok(`unknown tool: ${name}`);
