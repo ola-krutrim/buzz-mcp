@@ -19719,7 +19719,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.19";
+var SHIM_VERSION = "0.2.20";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -19750,6 +19750,12 @@ function isSystemicWriteFailure(errMsg) {
   if (status >= 500) return true;
   if (status === 401 && isStaleTimestamp401(s)) return true;
   return false;
+}
+function rateLimitHint(errMsg) {
+  const s = String(errMsg || "");
+  if (!/-> HTTP 429\b/.test(s) && !/\brate.?limit/i.test(s)) return null;
+  const m = s.match(/retry in (\d+)\s*s/i) || s.match(/retry.?after["' :=]+(\d+)/i);
+  return m ? `retry in ${m[1]}s` : "wait briefly and retry";
 }
 var WRITE_STALE_MS = 10 * 60 * 1e3;
 var WRITE_HEALTH = {
@@ -19786,6 +19792,9 @@ function recordWrite(okFlag, errMsg) {
     WRITE_HEALTH.lastKind = "systemic";
     WRITE_HEALTH.consecutiveSystemic += 1;
     WRITE_HEALTH.lastSystemicTs = now2;
+  } else if (rateLimitHint(errMsg)) {
+    WRITE_HEALTH.lastKind = "rate_limited";
+    WRITE_HEALTH.consecutiveSystemic = 0;
   } else {
     WRITE_HEALTH.lastKind = "request";
     WRITE_HEALTH.consecutiveSystemic = 0;
@@ -20790,10 +20799,23 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
           recovery = "restart your MCP client (a reconnect does NOT clear a wedged connection pool)";
         } else if (writesSystemicallyFailing()) {
           classification = "posts failing (reads ok)";
-          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't reach the relay \u2014 retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
+          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't be delivered \u2014 retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
+        } else if (WRITE_HEALTH.lastKind === "rate_limited" && Date.now() - WRITE_HEALTH.lastTs < WRITE_STALE_MS) {
+          classification = "rate-limited";
+          recovery = `reads OK \u2014 your last write was rate-limited by the relay (${rateLimitHint(WRITE_HEALTH.lastError)}); wait and retry, nothing to fix`;
         } else {
           classification = "healthy";
-          recovery = WRITE_HEALTH.lastOutcome === "ok" ? "healthy \u2014 reads OK and your last write reached the relay; no action" : WRITE_HEALTH.lastKind === "request" ? `healthy \u2014 reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action` : "healthy \u2014 reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
+          if (WRITE_HEALTH.lastOutcome === "ok") {
+            recovery = "healthy \u2014 reads OK and your last write reached the relay; no action";
+          } else if (WRITE_HEALTH.lastKind === "request") {
+            recovery = `healthy \u2014 reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action`;
+          } else if (WRITE_HEALTH.lastKind === "rate_limited") {
+            recovery = `healthy \u2014 reads OK; an earlier write was rate-limited (${ageStr(Date.now() - WRITE_HEALTH.lastTs)}), nothing failing now; no action`;
+          } else if (WRITE_HEALTH.lastKind === "systemic") {
+            recovery = `healthy \u2014 reads OK; an earlier write didn't go through (${ageStr(Date.now() - WRITE_HEALTH.lastTs)}), but nothing is failing now; no action`;
+          } else {
+            recovery = "healthy \u2014 reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
+          }
         }
       }
       const transportLine = TRANSPORT_WEDGED ? "\u26A0 undici pool already flagged wedged this process \u2014 self-healing via fresh node:https sockets" : "ok (no wedge flagged this process)";
@@ -20802,8 +20824,9 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         const tally = `${w.totalOk} ok / ${w.totalFailed} failed this session`;
         if (w.lastOutcome === null) return `no write attempted this session \u2014 write-health is observed from your real writes, not probed (no test-write)`;
         if (w.lastOutcome === "ok") return `last write OK ${ageStr(Date.now() - w.lastTs)} (${tally})`;
+        if (w.lastKind === "rate_limited") return `last write rate-limited ${ageStr(Date.now() - w.lastTs)} \u2014 throttled, not a failure; ${rateLimitHint(w.lastError)} (${tally})`;
         if (w.lastKind === "request") return `last write refused by the relay ${ageStr(Date.now() - w.lastTs)} \u2014 request-specific (permission/validation), write path is up (${tally}); ${w.lastError}`;
-        return `\u26A0 last write FAILED to reach the relay ${ageStr(Date.now() - w.lastTs)} \u2014 ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
+        return `\u26A0 last write couldn't be delivered ${ageStr(Date.now() - w.lastTs)} \u2014 ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
       })();
       const pinLine = EXPECTED_PK ? IDENTITY_OK ? "pin VERIFIED \u2705" : "\u26A0 IMPERSONATION GUARD TRIPPED \u2014 WRITES DISABLED" : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
       return ok([

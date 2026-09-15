@@ -724,7 +724,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.19), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.20), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -735,7 +735,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.19", `serverInfo.version === '0.2.19' (got '${si.version}')`);
+    ok(si.version === "0.2.20", `serverInfo.version === '0.2.20' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -753,7 +753,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.19/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.19'");
+    ok(/@ola\/buzz-mcp v0\.2\.20/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.20'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -770,7 +770,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.19/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.19'");
+    ok(/@ola\/buzz-mcp v0\.2\.20/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.20'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -855,7 +855,7 @@ console.log("\ncase 21: buzz_post fails systemically (relay 5xx /events) → buz
     ok(/posts failing \(reads ok\)/i.test(doctorText), "buzz_doctor → classifies reads-ok-but-writes-systemically-failing as 'posts failing (reads ok)'");
     ok(!/diagnosis: healthy/i.test(doctorText), "buzz_doctor → does NOT report 'healthy' while writes are systemically failing");
     ok(/#buzz-help/i.test(doctorText), "buzz_doctor → gives the posts-failing recovery (report in #buzz-help)");
-    ok(/last write FAILED to reach the relay/i.test(doctorText), "buzz_doctor → the writes line shows the systemic write failure");
+    ok(/last write couldn't be delivered/i.test(doctorText), "buzz_doctor → the writes line shows the systemic write failure");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
   }
 }
@@ -906,7 +906,7 @@ console.log("\ncase 23: read-only session, relay 5xx's the boot profile publish 
     console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
     ok(/posts failing \(reads ok\)/i.test(doctorText), "buzz_doctor → the failed boot publish alone trips 'posts failing (reads ok)' — no user post needed");
     ok(!/diagnosis: healthy/i.test(doctorText), "buzz_doctor → does NOT report 'healthy' when the boot write failed systemically");
-    ok(/last write FAILED to reach the relay/i.test(doctorText), "buzz_doctor → the writes line records the failed boot write");
+    ok(/last write couldn't be delivered/i.test(doctorText), "buzz_doctor → the writes line records the failed boot write");
     ok(/1 consecutive systemic/i.test(doctorText), "buzz_doctor → the agent card is NOT counted (systemic count is 1: kind:0 only)");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
   }
@@ -936,6 +936,33 @@ console.log("\ncase 24: buzz_post refused with 403 (permission) → buzz_doctor 
     ok(/diagnosis: healthy/i.test(doctorText), "buzz_doctor → stays 'healthy' — the relay answered, the write path is up");
     ok(!/#buzz-help/i.test(doctorText), "buzz_doctor → no false 'report in #buzz-help' for an ordinary permission error");
     ok(/request-specific/i.test(doctorText), "buzz_doctor → explains the refusal was request-specific (permission/validation)");
+  }
+}
+
+// ---- Case 25 (v0.2.20): a 429 rate-limit reads as 'rate-limited — retry', not a failure or a refusal
+// dx v0.2.20 nit: a throttle isn't a write outage (not "posts failing") and isn't a permission refusal
+// ("refused on its merits / no action") — the useful action is to WAIT. buzz_doctor should say so and
+// surface the relay's "retry in Ns" hint.
+console.log("\ncase 25: buzz_post rate-limited (429) → buzz_doctor → 'rate-limited' with the retry hint, NOT 'posts failing' or a permission refusal");
+{
+  const { relay, SK } = writeHealthRelay(429, { error: "rate-limited: quota exceeded; retry in 30s" });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { postText, doctorText } = await probePostThenDoctor({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "", BUZZ_WIRE_SIGN: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  });
+  relay.close();
+  if (doctorText == null) skipped("no buzz_doctor reply for rate-limit case");
+  else {
+    console.log("  post sees:   " + String(postText).slice(0, 140));
+    console.log("  doctor sees: " + String(doctorText).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/HTTP 429|rate-limited/i.test(String(postText)), "buzz_post → the 429 still surfaces to the caller");
+    ok(/diagnosis: rate-limited/i.test(doctorText), "buzz_doctor → a 429 reads as 'rate-limited', its own verdict");
+    ok(!/posts failing/i.test(doctorText), "buzz_doctor → a 429 is NOT 'posts failing' (throttle, not outage)");
+    ok(!/on its merits/i.test(doctorText), "buzz_doctor → a 429 is NOT the generic 'refused on its merits' wording");
+    ok(/retry in 30s/i.test(doctorText), "buzz_doctor → surfaces the relay's 'retry in Ns' hint");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
   }
 }
 

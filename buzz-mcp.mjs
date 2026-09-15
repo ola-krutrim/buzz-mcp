@@ -119,7 +119,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.19";
+const SHIM_VERSION = "0.2.20";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -182,6 +182,17 @@ function isSystemicWriteFailure(errMsg) {
   if (status === 401 && isStaleTimestamp401(s)) return true; // persistent stale-timestamp → clock/queue skew → systemic
   return false;                                         // other 4xx (403/404/400/409…) → request-specific, relay answered
 }
+// v0.2.20 (dx nit) — a 429 is neither a write outage nor a "refused on its merits" error: the write is
+// fine, the client is being throttled, and the useful action is to WAIT, not to report or re-check
+// permissions. Detect it so buzz_doctor says "rate-limited — retry in Ns" instead of the generic
+// request-refusal wording. NOT systemic (isSystemicWriteFailure already returns false for 429). Returns
+// the relay's retry hint when present ("retry in Ns"), else null.
+function rateLimitHint(errMsg) {
+  const s = String(errMsg || "");
+  if (!/-> HTTP 429\b/.test(s) && !/\brate.?limit/i.test(s)) return null;
+  const m = s.match(/retry in (\d+)\s*s/i) || s.match(/retry.?after["' :=]+(\d+)/i);
+  return m ? `retry in ${m[1]}s` : "wait briefly and retry";
+}
 const WRITE_STALE_MS = 10 * 60 * 1000; // a systemic failure older than this, with nothing since, is not "currently failing"
 const WRITE_HEALTH = {
   lastOutcome: null,          // "ok" | "failed" | null (no write attempted yet this process)
@@ -209,6 +220,11 @@ function recordWrite(okFlag, errMsg) {
     WRITE_HEALTH.lastKind = "systemic";
     WRITE_HEALTH.consecutiveSystemic += 1;
     WRITE_HEALTH.lastSystemicTs = now;
+  } else if (rateLimitHint(errMsg)) {
+    // 429 throttle — the write path is up, you're just being rate-limited. Its own kind so the doctor
+    // says "rate-limited — retry", not "refused on its merits". Clears the systemic streak (relay answered).
+    WRITE_HEALTH.lastKind = "rate_limited";
+    WRITE_HEALTH.consecutiveSystemic = 0;
   } else {
     // The relay answered with a request-specific refusal (permission/validation) → the write PATH is
     // demonstrably up, so this does NOT signal a write outage and clears any systemic streak.
@@ -1343,15 +1359,32 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           // is NOT counted here — the relay answered, so the write path is up; that would be a false
           // alarm. (Auth-lapse writes would already have tripped the "lapsed grant" branch.)
           classification = "posts failing (reads ok)";
-          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't reach the relay — retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
+          // v0.2.20 (dx nit): "couldn't be delivered" covers both a transport failure (never reached the
+          // relay) and a 5xx (reached, relay errored) — "couldn't reach the relay" was wrong for the 5xx case.
+          recovery = `reads are healthy but your last ${WRITE_HEALTH.consecutiveSystemic} write(s) (posts/reactions/edits) couldn't be delivered — retry; if it keeps failing, report in #buzz-help (last write error: ${WRITE_HEALTH.lastError})`;
+        } else if (WRITE_HEALTH.lastKind === "rate_limited" && (Date.now() - WRITE_HEALTH.lastTs) < WRITE_STALE_MS) {
+          // v0.2.20 (dx nit): a 429 is a throttle, not a failure or a permission refusal — its own verdict
+          // with the wait action, not the generic "refused on its merits". RECENCY-GATED like the systemic
+          // branch (dx v0.2.20 r2): a throttle from hours ago is stale, not current, so it falls through
+          // to healthy below rather than telling you to "retry in 30s" six hours later.
+          classification = "rate-limited";
+          recovery = `reads OK — your last write was rate-limited by the relay (${rateLimitHint(WRITE_HEALTH.lastError)}); wait and retry, nothing to fix`;
         } else {
-          // health 200 + auth 200 + transport OK (no wedge) + no CURRENT systemic write failure.
+          // health 200 + auth 200 + transport OK + nothing CURRENTLY failing. A failure or throttle may be
+          // on record but now stale (older than the window) — read as healthy, with an honest note of what
+          // happened, never as "no write attempted" (which would misreport a real past write).
           classification = "healthy";
-          recovery = WRITE_HEALTH.lastOutcome === "ok"
-            ? "healthy — reads OK and your last write reached the relay; no action"
-            : WRITE_HEALTH.lastKind === "request"
-              ? `healthy — reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action`
-              : "healthy — reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
+          if (WRITE_HEALTH.lastOutcome === "ok") {
+            recovery = "healthy — reads OK and your last write reached the relay; no action";
+          } else if (WRITE_HEALTH.lastKind === "request") {
+            recovery = `healthy — reads OK; your last write was refused by the relay on its merits (not a write outage: ${WRITE_HEALTH.lastError}); no action`;
+          } else if (WRITE_HEALTH.lastKind === "rate_limited") {
+            recovery = `healthy — reads OK; an earlier write was rate-limited (${ageStr(Date.now() - WRITE_HEALTH.lastTs)}), nothing failing now; no action`;
+          } else if (WRITE_HEALTH.lastKind === "systemic") {
+            recovery = `healthy — reads OK; an earlier write didn't go through (${ageStr(Date.now() - WRITE_HEALTH.lastTs)}), but nothing is failing now; no action`;
+          } else {
+            recovery = "healthy — reads OK; no write has been attempted yet this session, so write-health is unverified (buzz_doctor observes the writes you make; it never test-writes); no action";
+          }
         }
       }
 
@@ -1365,8 +1398,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const tally = `${w.totalOk} ok / ${w.totalFailed} failed this session`;
         if (w.lastOutcome === null) return `no write attempted this session — write-health is observed from your real writes, not probed (no test-write)`;
         if (w.lastOutcome === "ok") return `last write OK ${ageStr(Date.now() - w.lastTs)} (${tally})`;
+        if (w.lastKind === "rate_limited") return `last write rate-limited ${ageStr(Date.now() - w.lastTs)} — throttled, not a failure; ${rateLimitHint(w.lastError)} (${tally})`;
         if (w.lastKind === "request") return `last write refused by the relay ${ageStr(Date.now() - w.lastTs)} — request-specific (permission/validation), write path is up (${tally}); ${w.lastError}`;
-        return `⚠ last write FAILED to reach the relay ${ageStr(Date.now() - w.lastTs)} — ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
+        return `⚠ last write couldn't be delivered ${ageStr(Date.now() - w.lastTs)} — ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
       })();
       const pinLine = EXPECTED_PK
         ? (IDENTITY_OK ? "pin VERIFIED ✅" : "⚠ IMPERSONATION GUARD TRIPPED — WRITES DISABLED")
