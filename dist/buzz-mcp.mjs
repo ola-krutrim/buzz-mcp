@@ -19697,14 +19697,24 @@ function fmtTime(created_at, withDate = false) {
   }
 }
 var MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME || (signer.mode === "wire" ? wireNameGet(wirePersistId(process.env)) : null) || contextName();
-var AUTH_TAG = (() => {
+function parseTagEnv(raw, head) {
+  if (!String(raw || "").trim()) return { tag: null, malformed: false };
   try {
-    const t = JSON.parse(process.env.BUZZ_AUTH_TAG || "");
-    return Array.isArray(t) && t[0] === "auth" && t.length === 4 ? t : null;
+    const t = JSON.parse(raw);
+    if (Array.isArray(t) && t[0] === head && t.length === 4) return { tag: t, malformed: false };
+    return { tag: null, malformed: true };
   } catch {
-    return null;
+    return { tag: null, malformed: true };
   }
-})();
+}
+var { tag: AUTH_TAG, malformed: AUTH_TAG_MALFORMED } = parseTagEnv(process.env.BUZZ_AUTH_TAG, "auth");
+var { tag: PICKER_OWNER_TAG, malformed: PICKER_OWNER_TAG_MALFORMED } = parseTagEnv(process.env.BUZZ_PICKER_OWNER_TAG, "picker-owner");
+if (AUTH_TAG_MALFORMED)
+  process.stderr.write(`[buzz-mcp] \u26A0 BUZZ_AUTH_TAG is set but is not a valid ["auth",owner,conditions,sig] JSON array \u2014 owner attestation OMITTED, so the relay will reject membership/posts with 403 relay_membership_required. Most common cause: sourcing agent.env in bash strips the JSON quotes. Fix: single-quote the value (BUZZ_AUTH_TAG='["auth",...]') or avoid \`source\`. Run buzz_doctor for the same diagnosis.
+`);
+if (PICKER_OWNER_TAG_MALFORMED)
+  process.stderr.write(`[buzz-mcp] \u26A0 BUZZ_PICKER_OWNER_TAG is set but is not a valid ["picker-owner",owner,conditions,sig] JSON array \u2014 the discovery attestation will be OMITTED from your kind:10100 card (same bash quote-strip cause; single-quote the value).
+`);
 var EXPECTED_PK = (process.env.BUZZ_EXPECTED_PUBKEY || "").trim().toLowerCase() || null;
 var IDENTITY_OK = !EXPECTED_PK || PK.toLowerCase() === EXPECTED_PK;
 var IS_ISOLATED = (process.env.CLAUDE_CONFIG_DIR || "").includes("/buzz-agents/");
@@ -19719,7 +19729,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.20";
+var SHIM_VERSION = "0.2.21";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20021,13 +20031,14 @@ async function publishProfile(name) {
   const res = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }).then((ev) => bridge("/events", ev));
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
-    const cardEv = await signer.sign({
-      kind: KIND_AGENT_PROFILE,
-      tags: [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]],
-      content: JSON.stringify(card)
-    });
+    const cardTags = [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]];
+    if (PICKER_OWNER_TAG) cardTags.push(PICKER_OWNER_TAG);
+    const cardEv = await signer.sign({ kind: KIND_AGENT_PROFILE, tags: cardTags, content: JSON.stringify(card) });
     await bridgeCore("/events", cardEv);
-  } catch {
+  } catch (e) {
+    if (PICKER_OWNER_TAG)
+      process.stderr.write(`[buzz-mcp] \u26A0 kind:10100 agent-card publish failed while carrying the picker-owner attestation (${retryClass(e)}) \u2014 the owner-admission picker will not resolve your owner until the next successful profile publish.
+`);
   }
   return res;
 }
@@ -20241,7 +20252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   config: ${configLine}
   relay (dial): ${RELAY}
   relay (self-report): ${relayLine}
-  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : "none"}
+  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : AUTH_TAG_MALFORMED ? "\u26A0 set but MALFORMED (quote-stripped? single-quote it in agent.env) \u2014 omitted \u2192 403 membership" : "none"}
   transport: ${TRANSPORT_WEDGED ? "\u26A0 undici pool wedged \u2014 self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}
   NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) \u2014 compare it before claiming "X is deployed". reachable \u2260 up-to-date.`);
     }
@@ -20818,7 +20829,12 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
           }
         }
       }
+      if (AUTH_TAG_MALFORMED && health) {
+        classification = "config: BUZZ_AUTH_TAG malformed";
+        recovery = `BUZZ_AUTH_TAG is set but not valid ["auth",\u2026] JSON, so owner attestation is omitted and the relay will 403 membership/posts. Most likely a bash \`source\` of agent.env stripped the JSON quotes \u2014 single-quote the value (BUZZ_AUTH_TAG='["auth",...]') and relaunch.`;
+      }
       const transportLine = TRANSPORT_WEDGED ? "\u26A0 undici pool already flagged wedged this process \u2014 self-healing via fresh node:https sockets" : "ok (no wedge flagged this process)";
+      const authTagLine = AUTH_TAG_MALFORMED ? `\u26A0 set but MALFORMED (not valid ["auth",\u2026] JSON) \u2192 owner attestation omitted \u2192 403 membership/posts; likely a bash \`source\` of agent.env stripping the quotes \u2014 single-quote it` : AUTH_TAG ? `present (["auth",\u2026] parsed OK)` : "none (unset)";
       const writeLine = (() => {
         const w = WRITE_HEALTH;
         const tally = `${w.totalOk} ok / ${w.totalFailed} failed this session`;
@@ -20839,6 +20855,7 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         `  health probe: ${healthLine}`,
         `  auth probe: ${authLine}`,
         `  transport: ${transportLine}`,
+        `  auth tag (config): ${authTagLine}`,
         `  writes: ${writeLine}`
       ].join("\n"));
     }

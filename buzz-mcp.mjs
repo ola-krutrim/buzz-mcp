@@ -89,7 +89,29 @@ let MY_NAME = process.env.BUZZ_IDENTITY_NAME || process.env.BUZZ_NAME
   || contextName();
 // NIP-OA owner attestation: if BUZZ_AUTH_TAG is set (a signed ["auth",owner,conditions,sig] JSON),
 // attach it to signed events so the desktop shows "Agent managed by <owner>" instead of "owner unavailable".
-const AUTH_TAG = (() => { try { const t = JSON.parse(process.env.BUZZ_AUTH_TAG || ""); return (Array.isArray(t) && t[0] === "auth" && t.length === 4) ? t : null; } catch { return null; } })();
+// parseTagEnv distinguishes UNSET (fine → null) from SET-BUT-MALFORMED (loud). A bash `source` of
+// agent.env strips the JSON double-quotes, so JSON.parse fails; silently nulling the tag here (the old
+// behavior) yields an opaque `403 relay_membership_required` downstream that gives the operator no clue.
+// Surface it with the exact remedy instead of swallowing it. All NIP-OA tags are 4-element arrays.
+function parseTagEnv(raw, head) {
+  if (!String(raw || "").trim()) return { tag: null, malformed: false };   // unset/empty — legitimate (e.g. wire mode)
+  try {
+    const t = JSON.parse(raw);
+    if (Array.isArray(t) && t[0] === head && t.length === 4) return { tag: t, malformed: false };
+    return { tag: null, malformed: true };
+  } catch { return { tag: null, malformed: true }; }
+}
+const { tag: AUTH_TAG, malformed: AUTH_TAG_MALFORMED } = parseTagEnv(process.env.BUZZ_AUTH_TAG, "auth");
+// 2b — individual-signed owner attestation for the owner-admission picker. Read from its OWN env var,
+// kept entirely separate from BUZZ_AUTH_TAG; it goes ONLY on the kind:10100 agent card, NEVER on the
+// NIP-42/NIP-98 credential or kind:0 (C3). Consumed VERBATIM — never re-encoded: the signature binds
+// [1] owner xonly + [2] "created_at<0" + the agent pubkey, and only [0] is swappable ("picker-owner"
+// ↔ "auth") for verification, so any re-serialization of [2] would break the signature.
+const { tag: PICKER_OWNER_TAG, malformed: PICKER_OWNER_TAG_MALFORMED } = parseTagEnv(process.env.BUZZ_PICKER_OWNER_TAG, "picker-owner");
+if (AUTH_TAG_MALFORMED)
+  process.stderr.write(`[buzz-mcp] ⚠ BUZZ_AUTH_TAG is set but is not a valid ["auth",owner,conditions,sig] JSON array — owner attestation OMITTED, so the relay will reject membership/posts with 403 relay_membership_required. Most common cause: sourcing agent.env in bash strips the JSON quotes. Fix: single-quote the value (BUZZ_AUTH_TAG='["auth",...]') or avoid \`source\`. Run buzz_doctor for the same diagnosis.\n`);
+if (PICKER_OWNER_TAG_MALFORMED)
+  process.stderr.write(`[buzz-mcp] ⚠ BUZZ_PICKER_OWNER_TAG is set but is not a valid ["picker-owner",owner,conditions,sig] JSON array — the discovery attestation will be OMITTED from your kind:10100 card (same bash quote-strip cause; single-quote the value).\n`);
 
 // ---- fail-CLOSED identity pinning (anti-impersonation) ----
 // If BUZZ_EXPECTED_PUBKEY is pinned and the running key does NOT derive to it, this session is
@@ -119,7 +141,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.20";
+const SHIM_VERSION = "0.2.21";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -499,13 +521,21 @@ async function publishProfile(name) {
   // bridgeCore (full transport self-heal, but NOT recorded).
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
-    const cardEv = await signer.sign({
-      kind: KIND_AGENT_PROFILE,
-      tags: [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]],
-      content: JSON.stringify(card),
-    });
+    const cardTags = [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]];
+    // 2b — individual-signed owner attestation for the owner-admission picker. kind:10100 ONLY,
+    // appended VERBATIM as its own ["picker-owner",…] tag (NOT a second ["auth",…], so it never rides
+    // the relay's auth-tag / >1-auth-tag-multiplicity path). C3: it is placed here and nowhere else.
+    if (PICKER_OWNER_TAG) cardTags.push(PICKER_OWNER_TAG);
+    const cardEv = await signer.sign({ kind: KIND_AGENT_PROFILE, tags: cardTags, content: JSON.stringify(card) });
     await bridgeCore("/events", cardEv);
-  } catch { /* non-fatal */ }
+  } catch (e) {
+    // The card stays NON-FATAL (dx #2: a relay that gates kind:10100 must not surface a false "posts
+    // failing" every boot) — so it is not recorded in write-health. C2: but when we are carrying the 2b
+    // discovery attestation, a SILENT failure would hide the owner-admission picker never resolving the
+    // owner; make THAT case observable on stderr, without making it fatal.
+    if (PICKER_OWNER_TAG)
+      process.stderr.write(`[buzz-mcp] ⚠ kind:10100 agent-card publish failed while carrying the picker-owner attestation (${retryClass(e)}) — the owner-admission picker will not resolve your owner until the next successful profile publish.\n`);
+  }
   return res;
 }
 
@@ -732,7 +762,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const info = await relayInfo();
       const relayLine = info.error ? `⚠ UNREACHABLE: ${info.error}` : `${info.name} · v${info.version}${info.sha ? ` · deploy ${info.sha.slice(0, 12)}` : " · (no software_sha — stale build?)"}`;
       const configLine = IS_ISOLATED ? "isolated ✅ (own CLAUDE_CONFIG_DIR)" : `⚠ SHARED ~/.claude.json — clobberable/flip-prone. Relaunch via 'buzz-claude ${MY_NAME}' to isolate. Guide: ${GUIDE_PATH}`;
-      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  shim: @ola/buzz-mcp v${SHIM_VERSION}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : "none"}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
+      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  shim: @ola/buzz-mcp v${SHIM_VERSION}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : (AUTH_TAG_MALFORMED ? "⚠ set but MALFORMED (quote-stripped? single-quote it in agent.env) — omitted → 403 membership" : "none")}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
     }
 
     if (name === "buzz_setname") {
@@ -1388,9 +1418,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       }
 
+      // A malformed BUZZ_AUTH_TAG is a deterministic cause of membership/post 403s that the read-only
+      // probes above cannot see — a read /query probe can pass while writes 403 for the missing owner
+      // tag. When the relay answered, surface it as the actionable root cause; let a genuinely
+      // unreachable relay keep top billing.
+      if (AUTH_TAG_MALFORMED && health) {
+        classification = "config: BUZZ_AUTH_TAG malformed";
+        recovery = `BUZZ_AUTH_TAG is set but not valid ["auth",…] JSON, so owner attestation is omitted and the relay will 403 membership/posts. Most likely a bash \`source\` of agent.env stripped the JSON quotes — single-quote the value (BUZZ_AUTH_TAG='["auth",...]') and relaunch.`;
+      }
+
       const transportLine = TRANSPORT_WEDGED
         ? "⚠ undici pool already flagged wedged this process — self-healing via fresh node:https sockets"
         : "ok (no wedge flagged this process)";
+      const authTagLine = AUTH_TAG_MALFORMED
+        ? `⚠ set but MALFORMED (not valid ["auth",…] JSON) → owner attestation omitted → 403 membership/posts; likely a bash \`source\` of agent.env stripping the quotes — single-quote it`
+        : (AUTH_TAG ? `present (["auth",…] parsed OK)` : "none (unset)");
       // v0.2.19 — the write-health line: what buzz_doctor observes about the writes you've made (the
       // read-only probes above can't see write rejection). Purely from recorded outcomes; no probe.
       const writeLine = (() => {
@@ -1416,6 +1458,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         `  health probe: ${healthLine}`,
         `  auth probe: ${authLine}`,
         `  transport: ${transportLine}`,
+        `  auth tag (config): ${authTagLine}`,
         `  writes: ${writeLine}`,
       ].join("\n"));
     }
