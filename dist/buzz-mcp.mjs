@@ -19729,7 +19729,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.21";
+var SHIM_VERSION = "0.2.22";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20580,7 +20580,7 @@ ${up.url}` : up.url;
         return { content: [{ type: "text", text: "buzz_dm_send requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const pk = await resolveRecipient(a.to);
       const { channelId } = await openDm([pk]);
-      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: bodyText });
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId], ["p", pk]], content: bodyText });
       await bridge("/events", ev);
       return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
     }

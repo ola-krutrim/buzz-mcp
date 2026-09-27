@@ -141,7 +141,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.21";
+const SHIM_VERSION = "0.2.22";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -1140,7 +1140,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: "text", text: "buzz_dm_send requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const pk = await resolveRecipient(a.to);
       const { channelId } = await openDm([pk]);
-      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: bodyText });
+      // ["p", recipient] alongside ["h", channel]: desktop and mobile tag every DM
+      // recipient, and the relay's push lease matches `#p=self` -- a DM without it
+      // can never wake the recipient's phone (ola-silicon/buzz#1152; measured
+      // 2026-09-27: no agent-sent DM had ever produced a push).
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId], ["p", pk]], content: bodyText });
       await bridge("/events", ev);
       return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
     }
