@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO="${BUZZ_CLI_REPO:-ola-krutrim/buzz-mcp}"
-VERSION="${BUZZ_CLI_VERSION:-buzz-cli-v0.1.0}"     # pinned; bump per release
+VERSION="${BUZZ_CLI_VERSION:-buzz-cli-v0.1.1}"     # pinned; bump per release
 BINDIR="${BUZZ_CLI_BIN:-$HOME/.local/bin}"
 BASE="https://github.com/$REPO/releases/download/$VERSION"
 
