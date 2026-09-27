@@ -724,7 +724,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.20), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.22), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -735,7 +735,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.20", `serverInfo.version === '0.2.20' (got '${si.version}')`);
+    ok(si.version === "0.2.22", `serverInfo.version === '0.2.22' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -753,7 +753,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.20/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.20'");
+    ok(/@ola\/buzz-mcp v0\.2\.22/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.22'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -770,7 +770,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.20/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.20'");
+    ok(/@ola\/buzz-mcp v0\.2\.22/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.22'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -963,6 +963,124 @@ console.log("\ncase 25: buzz_post rate-limited (429) → buzz_doctor → 'rate-l
     ok(!/on its merits/i.test(doctorText), "buzz_doctor → a 429 is NOT the generic 'refused on its merits' wording");
     ok(/retry in 30s/i.test(doctorText), "buzz_doctor → surfaces the relay's 'retry in Ns' hint");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(doctorText), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// A mock relay that CAPTURES every event posted to /events (for asserting which tags land on which
+// kind). GET → health 200; /query → empty; /events → records the event and returns accepted.
+function captureRelay() {
+  const SK = "77".repeat(32);
+  const posted = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (obj, status = 200) => { rs.writeHead(status, { "Content-Type": "application/json" }); rs.end(typeof obj === "string" ? obj : JSON.stringify(obj)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+      if (rq.url === "/query") return reply([]);
+      reply({});
+    });
+  });
+  return { relay, SK, posted };
+}
+
+// ---- Case 26 (v0.2.22): BUZZ_AUTH_TAG malformed (bash quote-strip) → LOUD, not silent -----------
+// `source`-ing agent.env in bash strips the JSON double-quotes, so JSON.parse fails. v0.2.20 nulled the
+// tag SILENTLY → the relay then 403s membership with no clue why. v0.2.22 must (a) warn on stderr with
+// the single-quote remedy, and (b) have buzz_doctor name it as the root cause (a read probe can pass
+// while writes 403 for the missing owner tag, so only an explicit config check catches it).
+console.log("\ncase 26: BUZZ_AUTH_TAG malformed → stderr warning + buzz_doctor 'config: BUZZ_AUTH_TAG malformed'");
+{
+  const { relay, SK } = writeHealthRelay(200, {});
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "",
+    BUZZ_AUTH_TAG: "[auth,aabbcc,,deadbeef]",   // quote-stripped: looks like a tag, is NOT valid JSON
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", {}, { waitMs: 8000 });
+  relay.close();
+  if (text == null) skipped("no buzz_doctor reply for malformed-auth-tag case");
+  else {
+    console.log("  doctor: " + String(text).replace(/\\n/g, " | ").slice(0, 260));
+    ok(/BUZZ_AUTH_TAG is set but is not a valid/i.test(err), "startup → loud stderr warning naming BUZZ_AUTH_TAG");
+    ok(/single-quote/i.test(err), "startup → warning gives the single-quote remedy");
+    ok(/config: BUZZ_AUTH_TAG malformed/i.test(text), "buzz_doctor → classifies it as 'config: BUZZ_AUTH_TAG malformed'");
+    ok(/single-quote/i.test(text), "buzz_doctor → recovery gives the single-quote fix");
+    ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
+  }
+}
+
+// ---- Case 27: a VALID BUZZ_AUTH_TAG does NOT warn, and buzz_doctor does NOT flag config (control) --
+console.log("\ncase 27: valid BUZZ_AUTH_TAG → no malformed warning, no config verdict (control)");
+{
+  const { relay, SK } = writeHealthRelay(200, {});
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const validTag = JSON.stringify(["auth", "aa".repeat(32), "", "bb".repeat(32)]);
+  const { text, err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "",
+    BUZZ_AUTH_TAG: validTag,
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", {}, { waitMs: 8000 });
+  relay.close();
+  if (text == null) skipped("no buzz_doctor reply for valid-auth-tag case");
+  else {
+    ok(!/BUZZ_AUTH_TAG is set but is not a valid/i.test(err), "valid tag → NO malformed stderr warning");
+    ok(!/config: BUZZ_AUTH_TAG malformed/i.test(text), "valid tag → buzz_doctor does NOT flag config");
+    ok(/auth tag \(config\): present/i.test(text), "buzz_doctor → auth-tag config line reads 'present'");
+  }
+}
+
+// ---- Case 28: BUZZ_PICKER_OWNER_TAG malformed → its own distinct loud warning (2b) ---------------
+console.log("\ncase 28: BUZZ_PICKER_OWNER_TAG malformed → distinct stderr warning (2b)");
+{
+  const { relay, SK } = writeHealthRelay(200, {});
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const { err } = await probeToolErr({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_PICKER_OWNER_TAG: "[picker-owner,aabb,,ccdd]",   // quote-stripped
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_doctor", {}, { waitMs: 6000 });
+  relay.close();
+  ok(/BUZZ_PICKER_OWNER_TAG is set but is not a valid/i.test(err), "startup → distinct stderr warning for BUZZ_PICKER_OWNER_TAG");
+  ok(/single-quote/i.test(err), "picker warning → gives the single-quote remedy");
+}
+
+// ---- Case 29 (2b): a valid BUZZ_PICKER_OWNER_TAG lands on kind:10100 ONLY, never on kind:0 (C3) ---
+// The whole safety property of 2b lives in the shim: the individual-signed tag goes on the discovery
+// card (kind:10100) and NOWHERE near the auth credential or kind:0 (which stays team-signed).
+console.log("\ncase 29 (2b): picker-owner tag threads onto kind:10100 verbatim, never onto kind:0 (C3)");
+{
+  const { relay, SK, posted } = captureRelay();
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const pickerTag = ["picker-owner", "cd".repeat(32), "created_at<0", "ef".repeat(32)];
+  const authTag = ["auth", "12".repeat(32), "", "34".repeat(32)];
+  await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "",
+    BUZZ_AUTH_TAG: JSON.stringify(authTag),
+    BUZZ_PICKER_OWNER_TAG: JSON.stringify(pickerTag),
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_whoami", {}, { waitMs: 6000, callDelay: 1500 });
+  relay.close();
+  const k0 = posted.find((e) => e && e.kind === 0);
+  const k10100 = posted.find((e) => e && e.kind === 10100);
+  const tagHead = (ev, head) => (ev && (ev.tags || []).find((t) => Array.isArray(t) && t[0] === head)) || null;
+  if (!k10100) skipped("no kind:10100 card captured (boot profile publish did not land in time)");
+  else {
+    console.log("  10100 tags: " + JSON.stringify(k10100.tags));
+    const pk = tagHead(k10100, "picker-owner");
+    ok(!!pk, "kind:10100 card carries the ['picker-owner',…] tag");
+    ok(JSON.stringify(pk) === JSON.stringify(pickerTag), "picker-owner tag threaded VERBATIM (no re-encode of [2])");
+    ok(!tagHead(k10100, "auth"), "kind:10100 card does NOT carry an ['auth',…] tag");
+    if (k0) {
+      ok(!tagHead(k0, "picker-owner"), "C3: kind:0 does NOT carry the picker-owner tag");
+      ok(!!tagHead(k0, "auth"), "kind:0 still carries the team ['auth',…] delegation");
+    } else {
+      skipped("no kind:0 event captured to cross-check C3");
+    }
   }
 }
 
