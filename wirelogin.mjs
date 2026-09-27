@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign } from "./signer.mjs";
+import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
@@ -85,8 +85,8 @@ export async function bindLoopback(ports) {
 const __entry = (() => { try { return realpathSync(process.argv[1] || ""); } catch { return process.argv[1] || ""; } })();
 if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
-  if (!clientId) { console.error("[wire-login] set BUZZ_EKAM_CLIENT_ID (from the DCR registration)"); process.exit(1); }
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  if (!clientId) { console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)"); process.exit(1); }
   const base = ekamBase(env);
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge } = pkce();
