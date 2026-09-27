@@ -2513,7 +2513,7 @@ var __entry = (() => {
 })();
 if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   if (!clientId) {
     console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)");
     process.exit(1);

@@ -1218,7 +1218,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // wirelogin.mjs + signer.mjs primitives — no OAuth logic re-implemented here.
     if (name === "buzz_login") {
       const env = process.env;
-      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+      const clientId = (a.client_id || (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID) || "").trim();
       const base = ekamBase(env);
       const persistId = wirePersistId(env);
       const whoLabel = () => wireNameGet(persistId) || wirePubkeyGet(persistId) || "your account";
