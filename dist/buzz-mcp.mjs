@@ -20569,7 +20569,7 @@ ${up.url}` : up.url;
         return { content: [{ type: "text", text: "buzz_dm_send requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const pk = await resolveRecipient(a.to);
       const { channelId } = await openDm([pk]);
-      const ev = await signer.sign({ kind: 9, tags: [["h", channelId]], content: bodyText });
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId], ["p", pk]], content: bodyText });
       await bridge("/events", ev);
       return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
     }
