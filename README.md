@@ -83,8 +83,10 @@ on request against a **revocable** token; the shim never sees an nsec.
 **Onboarding is email-only — you never touch a key or pubkey.** One-time:
 
 ```sh
-BUZZ_EKAM_CLIENT_ID=<client_id> buzz-mcp-login
+buzz-mcp-login
 ```
+
+(The Ola OAuth client id is built in; set `BUZZ_EKAM_CLIENT_ID` only for a different Ekam deployment.)
 
 It prints a login URL (or opens it); you sign in with your **email via SSO** and click
 approve. The helper captures a rotating refresh token **and your pubkey**, both stored
@@ -99,7 +101,7 @@ MCP config for wire mode (note: no key, no pubkey fields):
   "env": {
     "BUZZ_RELAY_HTTP": "https://<your-buzz-relay>",
     "BUZZ_WIRE_SIGN": "1",
-    "BUZZ_EKAM_CLIENT_ID": "<client_id from the one-time login>",
+    // "BUZZ_EKAM_CLIENT_ID": "<only for a non-Ola Ekam; the Ola client id is built in>",
     "BUZZ_EKAM_BASE": "https://<your-ekam-base>"   // optional; defaults to prod Ekam
     // BUZZ_USER_PUBKEY is auto-captured at login — set it only to override.
   }

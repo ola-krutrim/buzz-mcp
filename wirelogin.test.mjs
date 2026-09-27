@@ -61,11 +61,12 @@ const cleanEnv = { ...process.env }; delete cleanEnv.BUZZ_EKAM_CLIENT_ID;
   const tmpd = mkdtempSync(join(tmpdir(), "wirelogin-symlink-"));
   const link = join(tmpd, "buzz-mcp-login"); // mimic npm's .bin symlink → dist/wirelogin.mjs
   symlinkSync(realWirelogin, link);
-  // BUZZ_EKAM_CLIENT_ID unset → CLI main hits the client-id guard, prints usage, exits 1. No network.
-  const r = spawnSync(process.execPath, [link], { encoding: "utf8", env: cleanEnv, timeout: 15000 });
+  // BUZZ_EKAM_CLIENT_ID unset → CLI main runs, the built-in Ola client id applies, and the
+  // dry-run hook exits 0 before any port/browser/network. Proves the symlink guard (was zero output).
+  const r = spawnSync(process.execPath, [link], { encoding: "utf8", env: { ...cleanEnv, BUZZ_WIRE_LOGIN_DRY_RUN: "1" }, timeout: 15000 });
   const out = (r.stdout || "") + (r.stderr || "");
-  ok(/set BUZZ_EKAM_CLIENT_ID/.test(out), "node <symlink→wirelogin.mjs> runs CLI main → prints usage (THE FIX; was zero output)");
-  ok(r.status === 1, `symlink CLI exits 1 when BUZZ_EKAM_CLIENT_ID unset (got ${r.status})`);
+  ok(/dry-run client_id=clt_37501bdddf3c4e43a0ff/.test(out), "node <symlink→wirelogin.mjs> runs CLI main → default Ola client id applies (THE FIX; was zero output)");
+  ok(r.status === 0, `symlink CLI dry-run exits 0 with the built-in client id (got ${r.status})`);
 }
 {
   // Importing wirelogin.mjs as a module must NOT run CLI main (no argv[1] script → guard false).

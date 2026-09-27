@@ -19,6 +19,11 @@ import { resolveKey } from "./loadkey_v2.mjs";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// Ola's registered PUBLIC OAuth client for "post as me" (PKCE, localhost redirect;
+// no secret). Users kept getting "set BUZZ_EKAM_CLIENT_ID" at the one-time login
+// because every install shares this one id — so it is the default; the env var
+// still overrides it for another Ekam deployment.
+export const DEFAULT_EKAM_CLIENT_ID = "clt_37501bdddf3c4e43a0ff";
 
 const now = () => Math.floor(Date.now() / 1000);
 export const ekamBase = (env) => (env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
@@ -79,7 +84,7 @@ export function wireNameSet(id, name) {
 // pre-empt expiry IFF expires_in returned, else fall back on the 401→re-mint retry.
 export function makeWireTokenProvider(env, fetchFn) {
   const base = ekamBase(env);
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
   const persistId = wirePersistId(env);
   let refresh = wireRefreshGet(persistId) || (env.BUZZ_WIRE_REFRESH || "").trim() || null;
   let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;

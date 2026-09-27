@@ -19098,6 +19098,7 @@ ${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
+var DEFAULT_EKAM_CLIENT_ID = "clt_37501bdddf3c4e43a0ff";
 var now = () => Math.floor(Date.now() / 1e3);
 var ekamBase2 = (env) => (env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
 var wirePersistId = (env) => (env.BUZZ_WIRE_ID || "wire").trim() || "wire";
@@ -19169,7 +19170,7 @@ function wireNameSet(id, name) {
 }
 function makeWireTokenProvider(env, fetchFn) {
   const base = ekamBase2(env);
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
   const persistId = wirePersistId(env);
   let refresh = wireRefreshGet(persistId) || (env.BUZZ_WIRE_REFRESH || "").trim() || null;
   let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
@@ -19530,12 +19531,16 @@ var __entry = (() => {
 })();
 if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || "").trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
   if (!clientId) {
-    console.error("[wire-login] set BUZZ_EKAM_CLIENT_ID (from the DCR registration)");
+    console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)");
     process.exit(1);
   }
   const base = ekamBase2(env);
+  if (env.BUZZ_WIRE_LOGIN_DRY_RUN === "1") {
+    console.log(`[wire-login] dry-run client_id=${clientId} base=${base}`);
+    process.exit(0);
+  }
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge: challenge2 } = pkce();
   const state = b64url(randomBytes2(16));
@@ -20641,7 +20646,7 @@ Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
     }
     if (name === "buzz_login") {
       const env = process.env;
-      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || "").trim();
+      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
       const base = ekamBase2(env);
       const persistId = wirePersistId(env);
       const whoLabel = () => wireNameGet(persistId) || wirePubkeyGet(persistId) || "your account";
