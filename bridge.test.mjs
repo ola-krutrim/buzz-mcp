@@ -27,6 +27,8 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { statSync } from "node:fs";
 import { getPublicKey } from "nostr-tools/pure";
@@ -347,6 +349,10 @@ console.log("\ncase 8: buzz_login with no client_id/env → clear BUZZ_EKAM_CLIE
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "", BUZZ_WIRE_ID: "loginprobe-noclient",
+    // A real "post as me" login on the developer's machine persists a refresh under the
+    // default id; isolate HOME so this case never finds one and short-circuits to
+    // "already connected" (seen 2026-09-27 right after a real buzz-mcp-login).
+    HOME: mkdtempSync(join(tmpdir(), "bridge-login-noclient-")),
     BUZZ_RELAY_HTTP: "http://127.0.0.1:1", BUZZ_RELAY_URL: "ws://127.0.0.1:1" };
   const text = await probeTool(AGENT, "buzz_login", {});
   if (text == null) skipped("no reply for buzz_login no-client case");
