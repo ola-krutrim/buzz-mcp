@@ -88,6 +88,9 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
   const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
   if (!clientId) { console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)"); process.exit(1); }
   const base = ekamBase(env);
+  // Test hook: prove CLI main ran (symlink guard) and show the resolved client id without
+  // binding a port, opening a browser or touching the network.
+  if (env.BUZZ_WIRE_LOGIN_DRY_RUN === "1") { console.log(`[wire-login] dry-run client_id=${clientId} base=${base}`); process.exit(0); }
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge } = pkce();
   const state = b64url(randomBytes(16));
