@@ -85,7 +85,7 @@ export async function bindLoopback(ports) {
 const __entry = (() => { try { return realpathSync(process.argv[1] || ""); } catch { return process.argv[1] || ""; } })();
 if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   if (!clientId) { console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)"); process.exit(1); }
   const base = ekamBase(env);
   // Test hook: prove CLI main ran (symlink guard) and show the resolved client id without

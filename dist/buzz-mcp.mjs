@@ -19170,7 +19170,7 @@ function wireNameSet(id, name) {
 }
 function makeWireTokenProvider(env, fetchFn) {
   const base = ekamBase2(env);
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   const persistId = wirePersistId(env);
   let refresh = wireRefreshGet(persistId) || (env.BUZZ_WIRE_REFRESH || "").trim() || null;
   let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
@@ -19531,7 +19531,7 @@ var __entry = (() => {
 })();
 if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry)) {
   const env = process.env;
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   if (!clientId) {
     console.error("[wire-login] no OAuth client id (set BUZZ_EKAM_CLIENT_ID for a non-Ola Ekam)");
     process.exit(1);
@@ -20646,7 +20646,7 @@ Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
     }
     if (name === "buzz_login") {
       const env = process.env;
-      const clientId = (a.client_id || env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+      const clientId = (a.client_id || (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID) || "").trim();
       const base = ekamBase2(env);
       const persistId = wirePersistId(env);
       const whoLabel = () => wireNameGet(persistId) || wirePubkeyGet(persistId) || "your account";

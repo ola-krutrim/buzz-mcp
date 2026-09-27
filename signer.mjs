@@ -84,7 +84,8 @@ export function wireNameSet(id, name) {
 // pre-empt expiry IFF expires_in returned, else fall back on the 401→re-mint retry.
 export function makeWireTokenProvider(env, fetchFn) {
   const base = ekamBase(env);
-  const clientId = (env.BUZZ_EKAM_CLIENT_ID || DEFAULT_EKAM_CLIENT_ID).trim();
+  // unset → built-in Ola client; set (even empty) → used as-is, so a deployment can opt out.
+  const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   const persistId = wirePersistId(env);
   let refresh = wireRefreshGet(persistId) || (env.BUZZ_WIRE_REFRESH || "").trim() || null;
   let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
