@@ -3837,7 +3837,7 @@ var require_fast_uri = __commonJS({
         normalizeString(uri, options);
       } else if (typeof uri === "object") {
         uri = /** @type {T} */
-        parse3(serialize(uri, options), options);
+        parse4(serialize(uri, options), options);
       }
       return uri;
     }
@@ -3877,8 +3877,8 @@ var require_fast_uri = __commonJS({
     function resolveComponent(base, relative, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
-        base = parse3(serialize(base, options), options);
-        relative = parse3(serialize(relative, options), options);
+        base = parse4(serialize(base, options), options);
+        relative = parse4(serialize(relative, options), options);
       }
       options = options || {};
       if (!options.tolerant && relative.scheme) {
@@ -4176,7 +4176,7 @@ var require_fast_uri = __commonJS({
       }
       return { parsed, malformedAuthorityOrPort, malformedPercentEncoding, malformedSchemeSpecific, malformedHost, malformedScheme };
     }
-    function parse3(uri, opts) {
+    function parse4(uri, opts) {
       return parseWithStatus(uri, opts).parsed;
     }
     function normalizeString(uri, opts) {
@@ -4213,7 +4213,7 @@ var require_fast_uri = __commonJS({
       resolveComponent,
       equal,
       serialize,
-      parse: parse3
+      parse: parse4
     };
     module.exports = fastUri;
     module.exports.default = fastUri;
@@ -8332,17 +8332,17 @@ var _safeParseAsync = (_Err) => async (schema, value, _ctx) => {
 };
 var safeParseAsync = /* @__PURE__ */ _safeParseAsync($ZodRealError);
 var _encode = (_Err) => {
-  const parse3 = _parse(_Err);
+  const parse4 = _parse(_Err);
   const fn = (schema, value, _ctx, _params) => {
     const ctx = _ctx ? { ..._ctx, direction: "backward" } : { direction: "backward" };
-    return parse3(schema, value, ctx, finalizeParams(fn, _params));
+    return parse4(schema, value, ctx, finalizeParams(fn, _params));
   };
   return fn;
 };
 var _decode = (_Err) => {
-  const parse3 = _parse(_Err);
+  const parse4 = _parse(_Err);
   const fn = (schema, value, _ctx, _params) => {
-    return parse3(schema, value, _ctx, finalizeParams(fn, _params));
+    return parse4(schema, value, _ctx, finalizeParams(fn, _params));
   };
   return fn;
 };
@@ -19456,6 +19456,63 @@ async function resolveSigner(opts = {}) {
   };
 }
 
+// clientversion.mjs
+function parse3(v) {
+  if (typeof v !== "string") return null;
+  const core = v.trim().replace(/^v/, "").split(/[-+]/, 1)[0];
+  if (!/^\d+(\.\d+)*$/.test(core)) return null;
+  return core.split(".").map((n) => parseInt(n, 10));
+}
+function cmpVersions(a, b) {
+  const pa = parse3(a), pb = parse3(b);
+  if (!pa || !pb) return null;
+  const n = Math.max(pa.length, pb.length);
+  for (let i2 = 0; i2 < n; i2++) {
+    const x = pa[i2] || 0, y = pb[i2] || 0;
+    if (x < y) return -1;
+    if (x > y) return 1;
+  }
+  return 0;
+}
+function pickAdvertised(nip11) {
+  if (!nip11 || typeof nip11 !== "object") return {};
+  const ns = nip11.ola_buzz && typeof nip11.ola_buzz === "object" ? nip11.ola_buzz : {};
+  const latest = nip11.shim_latest ?? ns.shim_latest;
+  const min = nip11.shim_min ?? ns.shim_min;
+  return {
+    latest: typeof latest === "string" ? latest : void 0,
+    min: typeof min === "string" ? min : void 0
+  };
+}
+function clientVersionStatus(running, advertised) {
+  const { latest, min } = advertised || {};
+  if (min) {
+    const c = cmpVersions(running, min);
+    if (c !== null && c < 0) {
+      return {
+        level: "below-min",
+        running,
+        latest,
+        min,
+        message: `[buzz-mcp] \u26A0 this shim is v${running}, but the relay requires at least v${min}. Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli). Older clients may be refused.`
+      };
+    }
+  }
+  if (latest) {
+    const c = cmpVersions(running, latest);
+    if (c !== null && c < 0) {
+      return {
+        level: "update",
+        running,
+        latest,
+        min,
+        message: `[buzz-mcp] \u2139 a newer shim is available: v${latest} (you're on v${running}). Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli).`
+      };
+    }
+  }
+  return { level: "ok", running, latest, min, message: null };
+}
+
 // wirelogin.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -19734,7 +19791,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.22";
+var SHIM_VERSION = "0.2.23";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20214,12 +20271,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 var RELAY_INFO = null;
 var RELAY_INFO_AT = 0;
 var RELAY_INFO_TTL = 3e4;
+var CLIENT_VERSION = { level: "ok", running: SHIM_VERSION, latest: void 0, min: void 0, message: null };
+var VERSION_NUDGED = false;
 async function relayInfo() {
   if (RELAY_INFO && Date.now() - RELAY_INFO_AT < RELAY_INFO_TTL) return RELAY_INFO;
   try {
     const r = await fetch(`${RELAY}/`, { headers: { Accept: "application/nostr+json" } });
     const j = await r.json();
     RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null };
+    try {
+      CLIENT_VERSION = clientVersionStatus(SHIM_VERSION, pickAdvertised(j));
+      if (CLIENT_VERSION.message && !VERSION_NUDGED) {
+        VERSION_NUDGED = true;
+        process.stderr.write(CLIENT_VERSION.message + "\n");
+      }
+    } catch {
+    }
   } catch (e) {
     RELAY_INFO = { error: e.message };
   }
@@ -20245,9 +20312,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const info = await relayInfo();
       const relayLine = info.error ? `\u26A0 UNREACHABLE: ${info.error}` : `${info.name} \xB7 v${info.version}${info.sha ? ` \xB7 deploy ${info.sha.slice(0, 12)}` : " \xB7 (no software_sha \u2014 stale build?)"}`;
       const configLine = IS_ISOLATED ? "isolated \u2705 (own CLAUDE_CONFIG_DIR)" : `\u26A0 SHARED ~/.claude.json \u2014 clobberable/flip-prone. Relaunch via 'buzz-claude ${MY_NAME}' to isolate. Guide: ${GUIDE_PATH}`;
+      const skewNote = CLIENT_VERSION.message ? CLIENT_VERSION.level === "below-min" ? ` \u2014 \u26A0 below the relay's minimum v${CLIENT_VERSION.min}, update soon` : ` \u2014 \u2139 update available: v${CLIENT_VERSION.latest}` : "";
       return ok(`Buzz CLI identity:
   name: ${MY_NAME}
-  shim: @ola/buzz-mcp v${SHIM_VERSION}
+  shim: @ola/buzz-mcp v${SHIM_VERSION}${skewNote}
   model: ${AGENT_MODEL}
   harness: ${AGENT_HARNESS}
   interface: ${AGENT_INTERFACE}
@@ -20850,9 +20918,16 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         return `\u26A0 last write couldn't be delivered ${ageStr(Date.now() - w.lastTs)} \u2014 ${w.consecutiveSystemic} consecutive systemic (${tally}); ${w.lastError}`;
       })();
       const pinLine = EXPECTED_PK ? IDENTITY_OK ? "pin VERIFIED \u2705" : "\u26A0 IMPERSONATION GUARD TRIPPED \u2014 WRITES DISABLED" : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
+      let cv = CLIENT_VERSION;
+      try {
+        const r = await rawGet(`${RELAY}/`, { Accept: "application/nostr+json" }, timeoutMs);
+        if (r.ok) cv = clientVersionStatus(SHIM_VERSION, pickAdvertised(JSON.parse(r.text)));
+      } catch {
+      }
+      const shimLine = cv.level === "below-min" ? `@ola/buzz-mcp v${SHIM_VERSION} \u2014 \u26A0 BELOW the relay's minimum v${cv.min}${cv.latest ? `; latest v${cv.latest}` : ""}, update soon` : cv.level === "update" ? `@ola/buzz-mcp v${SHIM_VERSION} \u2014 \u2139 update available (relay advertises v${cv.latest})` : cv.latest ? `@ola/buzz-mcp v${SHIM_VERSION} (up to date; relay advertises v${cv.latest})` : `@ola/buzz-mcp v${SHIM_VERSION} (relay advertises no shim version \u2014 skew-check inert)`;
       return ok([
         "buzz_doctor \u2014 connector-side diagnosis (NOT the authoritative relay health signal)",
-        `  shim: @ola/buzz-mcp v${SHIM_VERSION}`,
+        `  shim: ${shimLine}`,
         `  diagnosis: ${classification}`,
         `  recovery: ${recovery}`,
         `  identity: ${MY_NAME} (${pinLine})`,

@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
 import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
+import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
 // buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
 // import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
 // (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
@@ -141,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.22";
+const SHIM_VERSION = "0.2.23";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -722,12 +723,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 // so no "live"/identity claim is ever made blind (see: 3x non-prod false-positives). ----
 let RELAY_INFO = null, RELAY_INFO_AT = 0;
 const RELAY_INFO_TTL = 30_000; // re-fetch NIP-11 if older than 30s, so a mid-session relay roll (software_sha) is visible instead of a process-lifetime stale cache
+// v0.2.23 — client-version skew. The relay advertises the current/minimum shim version
+// in its NIP-11 doc (shim_latest / shim_min); we read it off the fetch we already do.
+// FAIL-OPEN: if the relay advertises nothing (its half not shipped yet) or the value is
+// unparseable, CLIENT_VERSION stays "ok"/silent and nothing changes. We nudge to stderr
+// (NEVER stdout — that's the MCP channel) at most once per process, so a long-lived
+// session isn't nagged; buzz_doctor/buzz_whoami surface the status every time on demand.
+let CLIENT_VERSION = { level: "ok", running: SHIM_VERSION, latest: undefined, min: undefined, message: null };
+let VERSION_NUDGED = false;
 async function relayInfo() {
   if (RELAY_INFO && Date.now() - RELAY_INFO_AT < RELAY_INFO_TTL) return RELAY_INFO;
   try {
     const r = await fetch(`${RELAY}/`, { headers: { Accept: "application/nostr+json" } });
     const j = await r.json();
     RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null };
+    try {
+      CLIENT_VERSION = clientVersionStatus(SHIM_VERSION, pickAdvertised(j));
+      if (CLIENT_VERSION.message && !VERSION_NUDGED) { VERSION_NUDGED = true; process.stderr.write(CLIENT_VERSION.message + "\n"); }
+    } catch { /* fail-open: a skew-check bug must never break relay info */ }
   } catch (e) { RELAY_INFO = { error: e.message }; }
   RELAY_INFO_AT = Date.now();
   return RELAY_INFO;
@@ -762,7 +775,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const info = await relayInfo();
       const relayLine = info.error ? `⚠ UNREACHABLE: ${info.error}` : `${info.name} · v${info.version}${info.sha ? ` · deploy ${info.sha.slice(0, 12)}` : " · (no software_sha — stale build?)"}`;
       const configLine = IS_ISOLATED ? "isolated ✅ (own CLAUDE_CONFIG_DIR)" : `⚠ SHARED ~/.claude.json — clobberable/flip-prone. Relaunch via 'buzz-claude ${MY_NAME}' to isolate. Guide: ${GUIDE_PATH}`;
-      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  shim: @ola/buzz-mcp v${SHIM_VERSION}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : (AUTH_TAG_MALFORMED ? "⚠ set but MALFORMED (quote-stripped? single-quote it in agent.env) — omitted → 403 membership" : "none")}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
+      const skewNote = CLIENT_VERSION.message
+        ? (CLIENT_VERSION.level === "below-min" ? ` — ⚠ below the relay's minimum v${CLIENT_VERSION.min}, update soon` : ` — ℹ update available: v${CLIENT_VERSION.latest}`)
+        : "";
+      return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  shim: @ola/buzz-mcp v${SHIM_VERSION}${skewNote}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : (AUTH_TAG_MALFORMED ? "⚠ set but MALFORMED (quote-stripped? single-quote it in agent.env) — omitted → 403 membership" : "none")}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
     }
 
     if (name === "buzz_setname") {
@@ -1452,9 +1468,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         ? (IDENTITY_OK ? "pin VERIFIED ✅" : "⚠ IMPERSONATION GUARD TRIPPED — WRITES DISABLED")
         : "no pin set (BUZZ_EXPECTED_PUBKEY unset)";
 
+      // v0.2.23 — authoritative version status over the SAME fresh socket as the probes
+      // above (so it holds even when the normal client is wedged). Best-effort: on any
+      // failure fall back to the cached CLIENT_VERSION, then to a plain version string.
+      let cv = CLIENT_VERSION;
+      try {
+        const r = await rawGet(`${RELAY}/`, { Accept: "application/nostr+json" }, timeoutMs);
+        if (r.ok) cv = clientVersionStatus(SHIM_VERSION, pickAdvertised(JSON.parse(r.text)));
+      } catch { /* keep cached CLIENT_VERSION */ }
+      const shimLine = cv.level === "below-min"
+        ? `@ola/buzz-mcp v${SHIM_VERSION} — ⚠ BELOW the relay's minimum v${cv.min}${cv.latest ? `; latest v${cv.latest}` : ""}, update soon`
+        : cv.level === "update"
+          ? `@ola/buzz-mcp v${SHIM_VERSION} — ℹ update available (relay advertises v${cv.latest})`
+          : (cv.latest ? `@ola/buzz-mcp v${SHIM_VERSION} (up to date; relay advertises v${cv.latest})`
+                       : `@ola/buzz-mcp v${SHIM_VERSION} (relay advertises no shim version — skew-check inert)`);
+
       return ok([
         "buzz_doctor — connector-side diagnosis (NOT the authoritative relay health signal)",
-        `  shim: @ola/buzz-mcp v${SHIM_VERSION}`,
+        `  shim: ${shimLine}`,
         `  diagnosis: ${classification}`,
         `  recovery: ${recovery}`,
         `  identity: ${MY_NAME} (${pinLine})`,
