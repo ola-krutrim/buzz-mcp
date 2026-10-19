@@ -20510,9 +20510,13 @@ ${body}`);
       const names = await profiles();
       const tags = [["h", ch.id]];
       if (AUTH_TAG) tags.push(AUTH_TAG);
-      const rootTag = (target.tags || []).filter((t) => t[0] === "e").find((t) => t[3] === "root");
-      const rootId = rootTag && rootTag[1] && rootTag[1] !== target.id ? rootTag[1] : null;
-      if (rootId) {
+      let mRoot = null, mReply = null;
+      for (const t of target.tags || []) if (t[0] === "e" && /^[0-9a-f]{64}$/i.test(t[1] || "")) {
+        if (t[3] === "root") mRoot = t[1];
+        if (t[3] === "reply") mReply = t[1];
+      }
+      const rootId = mReply ? mRoot || mReply : null;
+      if (rootId && rootId !== target.id) {
         tags.push(["e", rootId, "", "root"]);
         tags.push(["e", target.id, "", "reply"]);
       } else tags.push(["e", target.id, "", "reply"]);

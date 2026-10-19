@@ -1092,21 +1092,31 @@ console.log("\ncase 29 (2b): picker-owner tag threads onto kind:10100 verbatim, 
 
 // ---- Case 30: buzz_reply e-tag markers resolve the way the relay resolves them -----------------
 // The relay (buzz-core nip10.rs ThreadMarkers::resolve) reads (root+reply) → nested, (reply only) →
-// direct reply to the root, and (root only) → TOP-LEVEL. v0.2.23 and earlier sent a lone "root" for a
-// direct reply to a thread head, so the relay stored it as top-level: no thread_metadata, no thread
-// wake, and replying to it was refused 400 "root tag does not match thread ancestry".
-// `resolve` below is a port of that match, so the assertion is about how the relay will read the tags.
-console.log("\ncase 30: buzz_reply → a direct reply to a thread head carries a 'reply' marker, not a lone 'root'");
+// direct reply to the root, and (root only) → TOP-LEVEL. Ingest (buzz-relay ingest.rs) then refuses a
+// reply whose root is not the parent's own thread root: 400 "root tag does not match thread ancestry".
+// v0.2.23 sent a lone "root" to a thread head (stored flat). A first v0.2.24 draft sent reply-only to
+// every target without a "root" marker, which 400s on a target that is itself a direct reply
+// (reply-only is how desktop, mobile and the shim all tag those). Both are checked here, against
+// ports of the relay's resolve rule AND its ancestry check, fed the target's tags as well.
+console.log("\ncase 30: buzz_reply → e-tags the relay resolves under the target's real thread root");
 {
   const resolve = (tags) => {
     let root = null, reply = null;
-    for (const t of tags) if (t[0] === "e" && /^[0-9a-f]{64}$/.test(t[1] || "")) {
+    for (const t of tags || []) if (t[0] === "e" && /^[0-9a-f]{64}$/.test(t[1] || "")) {
       if (t[3] === "root") root = t[1];
       if (t[3] === "reply") reply = t[1];
     }
     if (root && reply) return [root, reply];
     if (reply) return [reply, reply];
     return null;   // root-only or neither → top-level
+  };
+  // ingest.rs: the reply's resolved root must equal the parent's effective root, which is the
+  // parent's own resolved root when the parent is in a thread, else the parent itself.
+  const ancestryOk = (replyTags, parent) => {
+    const r = resolve(replyTags);
+    if (!r || r[1] !== parent.id) return false;
+    const parentRoot = (resolve(parent.tags) || [parent.id])[0];
+    return r[0] === parentRoot;
   };
   const replyRelay = (target) => {
     const SK = "88".repeat(32);
@@ -1132,12 +1142,17 @@ console.log("\ncase 30: buzz_reply → a direct reply to a thread head carries a
     });
     return { relay, SK, posted };
   };
-  const HEAD = "a1".repeat(32), MID = "b2".repeat(32), AUTHOR = "c3".repeat(32);
+  const HEAD = "a1".repeat(32), MID = "b2".repeat(32), DEEP = "d4".repeat(32), OLD = "e5".repeat(32), AUTHOR = "c3".repeat(32);
+  const ev = (id, tags) => ({ id, pubkey: AUTHOR, kind: 9, created_at: 1, content: "x", tags: [["h", "chanA"], ...tags] });
   const cases = [
-    { name: "direct reply to a thread head", target: { id: HEAD, pubkey: AUTHOR, kind: 9, created_at: 1, content: "head", tags: [["h", "chanA"]] },
-      wantE: [["e", HEAD, "", "reply"]], wantResolve: [HEAD, HEAD] },
-    { name: "reply to a reply", target: { id: MID, pubkey: AUTHOR, kind: 9, created_at: 2, content: "mid", tags: [["h", "chanA"], ["e", HEAD, "", "reply"], ["e", HEAD, "", "root"]] },
-      wantE: [["e", HEAD, "", "root"], ["e", MID, "", "reply"]], wantResolve: [HEAD, MID] },
+    { name: "reply to a thread head", target: ev(HEAD, []),
+      wantE: [["e", HEAD, "", "reply"]] },
+    { name: "reply to a direct reply (reply-only, as desktop/mobile/shim send it)", target: ev(MID, [["e", HEAD, "", "reply"]]),
+      wantE: [["e", HEAD, "", "root"], ["e", MID, "", "reply"]] },
+    { name: "reply to a nested reply (root+reply)", target: ev(DEEP, [["e", HEAD, "", "root"], ["e", MID, "", "reply"]]),
+      wantE: [["e", HEAD, "", "root"], ["e", DEEP, "", "reply"]] },
+    { name: "reply to a legacy root-only reply (stored top-level)", target: ev(OLD, [["e", HEAD, "", "root"]]),
+      wantE: [["e", OLD, "", "reply"]] },
   ];
   for (const c of cases) {
     const { relay, SK, posted } = replyRelay(c.target);
@@ -1148,12 +1163,12 @@ console.log("\ncase 30: buzz_reply → a direct reply to a thread head carries a
       BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
     }, "buzz_reply", { channel: "testchan", event: c.target.id, text: "threaded" }, { waitMs: 7000, callDelay: 1500 });
     relay.close();
-    const ev = posted.find((e) => e && e.kind === 9);
-    if (!ev) { skipped(`no kind:9 reply captured for '${c.name}'`); continue; }
-    const eTags = (ev.tags || []).filter((t) => t[0] === "e");
+    const sent = posted.find((e) => e && e.kind === 9);
+    if (!sent) { skipped(`no kind:9 reply captured for '${c.name}'`); continue; }
+    const eTags = (sent.tags || []).filter((t) => t[0] === "e");
     console.log(`  ${c.name}: e-tags ${JSON.stringify(eTags)}`);
     ok(JSON.stringify(eTags) === JSON.stringify(c.wantE), `${c.name} → e-tags ${JSON.stringify(c.wantE)}`);
-    ok(JSON.stringify(resolve(ev.tags || [])) === JSON.stringify(c.wantResolve), `${c.name} → the relay's rule resolves (root, parent) = (${c.wantResolve.map((x) => x.slice(0, 4)).join(", ")}), not top-level`);
+    ok(ancestryOk(sent.tags, c.target), `${c.name} → passes the relay's ancestry check (not top-level, not a 400)`);
   }
 }
 
