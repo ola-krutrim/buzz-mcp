@@ -730,7 +730,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.22), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.23), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -741,7 +741,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.22", `serverInfo.version === '0.2.22' (got '${si.version}')`);
+    ok(si.version === "0.2.23", `serverInfo.version === '0.2.23' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -759,7 +759,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.22/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.22'");
+    ok(/@ola\/buzz-mcp v0\.2\.23/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.23'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -776,7 +776,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.22/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.22'");
+    ok(/@ola\/buzz-mcp v0\.2\.23/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.23'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
