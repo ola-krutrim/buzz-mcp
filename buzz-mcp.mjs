@@ -142,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.23";
+const SHIM_VERSION = "0.2.24";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -990,11 +990,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation
       // NIP-10 marked threading. If the target is itself a reply (carries a marked "root" e-tag),
       // thread under that same root and mark the target as the direct reply; otherwise the target
-      // IS the root of the thread → a single marked "root" e-tag (a direct reply to the root).
+      // IS the root of the thread → a single marked "reply" e-tag (a direct reply to the root).
+      // NOT a lone "root": the relay's resolver (buzz-core nip10.rs ThreadMarkers::resolve) reads
+      // root-only as top-level, so such a reply got no thread_metadata (no thread wake, no reply
+      // count) and replies to it were refused 400 "root tag does not match thread ancestry".
+      // Desktop (threading.ts) and mobile (send_message_provider.dart) send "reply" here too.
       const rootTag = (target.tags || []).filter((t) => t[0] === "e").find((t) => t[3] === "root");
       const rootId = (rootTag && rootTag[1] && rootTag[1] !== target.id) ? rootTag[1] : null;
       if (rootId) { tags.push(["e", rootId, "", "root"]); tags.push(["e", target.id, "", "reply"]); }
-      else tags.push(["e", target.id, "", "root"]);
+      else tags.push(["e", target.id, "", "reply"]);
       // p-tags: the author being replied to (NIP-10) + any @-mentions in the body (buzz_post idiom).
       const ptags = new Set();
       if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());

@@ -730,7 +730,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.23), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.24), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -741,7 +741,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.23", `serverInfo.version === '0.2.23' (got '${si.version}')`);
+    ok(si.version === "0.2.24", `serverInfo.version === '0.2.24' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -759,7 +759,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.23/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.23'");
+    ok(/@ola\/buzz-mcp v0\.2\.24/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.24'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -776,7 +776,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.23/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.23'");
+    ok(/@ola\/buzz-mcp v0\.2\.24/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.24'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1087,6 +1087,73 @@ console.log("\ncase 29 (2b): picker-owner tag threads onto kind:10100 verbatim, 
     } else {
       skipped("no kind:0 event captured to cross-check C3");
     }
+  }
+}
+
+// ---- Case 30: buzz_reply e-tag markers resolve the way the relay resolves them -----------------
+// The relay (buzz-core nip10.rs ThreadMarkers::resolve) reads (root+reply) → nested, (reply only) →
+// direct reply to the root, and (root only) → TOP-LEVEL. v0.2.23 and earlier sent a lone "root" for a
+// direct reply to a thread head, so the relay stored it as top-level: no thread_metadata, no thread
+// wake, and replying to it was refused 400 "root tag does not match thread ancestry".
+// `resolve` below is a port of that match, so the assertion is about how the relay will read the tags.
+console.log("\ncase 30: buzz_reply → a direct reply to a thread head carries a 'reply' marker, not a lone 'root'");
+{
+  const resolve = (tags) => {
+    let root = null, reply = null;
+    for (const t of tags) if (t[0] === "e" && /^[0-9a-f]{64}$/.test(t[1] || "")) {
+      if (t[3] === "root") root = t[1];
+      if (t[3] === "reply") reply = t[1];
+    }
+    if (root && reply) return [root, reply];
+    if (reply) return [reply, reply];
+    return null;   // root-only or neither → top-level
+  };
+  const replyRelay = (target) => {
+    const SK = "88".repeat(32);
+    const PK = getPublicKey(Uint8Array.from(Buffer.from(SK, "hex")));
+    const now = Math.floor(Date.now() / 1000);
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (obj, status = 200) => { rs.writeHead(status, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let filters = []; try { filters = JSON.parse(body); } catch {}
+          if (filters.some((f) => (f.ids || []).includes(target.id))) return reply([target]);
+          const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, SK, posted };
+  };
+  const HEAD = "a1".repeat(32), MID = "b2".repeat(32), AUTHOR = "c3".repeat(32);
+  const cases = [
+    { name: "direct reply to a thread head", target: { id: HEAD, pubkey: AUTHOR, kind: 9, created_at: 1, content: "head", tags: [["h", "chanA"]] },
+      wantE: [["e", HEAD, "", "reply"]], wantResolve: [HEAD, HEAD] },
+    { name: "reply to a reply", target: { id: MID, pubkey: AUTHOR, kind: 9, created_at: 2, content: "mid", tags: [["h", "chanA"], ["e", HEAD, "", "reply"], ["e", HEAD, "", "root"]] },
+      wantE: [["e", HEAD, "", "root"], ["e", MID, "", "reply"]], wantResolve: [HEAD, MID] },
+  ];
+  for (const c of cases) {
+    const { relay, SK, posted } = replyRelay(c.target);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    await probeTool({
+      BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_reply", { channel: "testchan", event: c.target.id, text: "threaded" }, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9);
+    if (!ev) { skipped(`no kind:9 reply captured for '${c.name}'`); continue; }
+    const eTags = (ev.tags || []).filter((t) => t[0] === "e");
+    console.log(`  ${c.name}: e-tags ${JSON.stringify(eTags)}`);
+    ok(JSON.stringify(eTags) === JSON.stringify(c.wantE), `${c.name} → e-tags ${JSON.stringify(c.wantE)}`);
+    ok(JSON.stringify(resolve(ev.tags || [])) === JSON.stringify(c.wantResolve), `${c.name} → the relay's rule resolves (root, parent) = (${c.wantResolve.map((x) => x.slice(0, 4)).join(", ")}), not top-level`);
   }
 }
 

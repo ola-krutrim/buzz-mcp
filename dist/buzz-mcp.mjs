@@ -19791,7 +19791,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.23";
+var SHIM_VERSION = "0.2.24";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20515,7 +20515,7 @@ ${body}`);
       if (rootId) {
         tags.push(["e", rootId, "", "root"]);
         tags.push(["e", target.id, "", "reply"]);
-      } else tags.push(["e", target.id, "", "root"]);
+      } else tags.push(["e", target.id, "", "reply"]);
       const ptags = /* @__PURE__ */ new Set();
       if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());
       for (const pk of mentionPtags(bodyText, names)) ptags.add(pk);
