@@ -142,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.23";
+const SHIM_VERSION = "0.2.24";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -988,13 +988,25 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const names = await profiles();
       const tags = [["h", ch.id]];
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation
-      // NIP-10 marked threading. If the target is itself a reply (carries a marked "root" e-tag),
-      // thread under that same root and mark the target as the direct reply; otherwise the target
-      // IS the root of the thread → a single marked "root" e-tag (a direct reply to the root).
-      const rootTag = (target.tags || []).filter((t) => t[0] === "e").find((t) => t[3] === "root");
-      const rootId = (rootTag && rootTag[1] && rootTag[1] !== target.id) ? rootTag[1] : null;
-      if (rootId) { tags.push(["e", rootId, "", "root"]); tags.push(["e", target.id, "", "reply"]); }
-      else tags.push(["e", target.id, "", "root"]);
+      // NIP-10 marked threading, resolved the way the relay resolves it (buzz-core nip10.rs
+      // ThreadMarkers::resolve): read the TARGET's own markers — 64-hex e-ids only, last of each
+      // kind wins — and derive the thread root the reply must declare:
+      //   target root+reply (a nested reply) → thread root is its "root" marker
+      //   target reply-only (a direct reply)  → thread root is its "reply" marker  ← mobile/desktop shape
+      //   target root-only / none             → target is top-level, i.e. its own root
+      // then emit root+reply when the root differs from the target, else a lone "reply" on the target.
+      // Two bugs this closes: (1) a lone "root" marker read as top-level (no thread_metadata → no thread
+      // wake, no reply count, and replies to it were refused 400 "root tag does not match ancestry");
+      // (2) replying to a reply-only target (the most common shape) must declare the real root, or the
+      // relay's ancestry check (ingest.rs) 400s it. Matches threading.ts / send_message_provider.dart.
+      let mRoot = null, mReply = null;
+      for (const t of (target.tags || [])) if (t[0] === "e" && /^[0-9a-f]{64}$/i.test(t[1] || "")) {
+        if (t[3] === "root") mRoot = t[1];
+        if (t[3] === "reply") mReply = t[1];
+      }
+      const rootId = mReply ? (mRoot || mReply) : null;
+      if (rootId && rootId !== target.id) { tags.push(["e", rootId, "", "root"]); tags.push(["e", target.id, "", "reply"]); }
+      else tags.push(["e", target.id, "", "reply"]);
       // p-tags: the author being replied to (NIP-10) + any @-mentions in the body (buzz_post idiom).
       const ptags = new Set();
       if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());
