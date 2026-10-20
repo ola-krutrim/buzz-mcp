@@ -19791,7 +19791,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.26";
+var SHIM_VERSION = "0.2.27";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20240,14 +20240,33 @@ function mentionPtags(text, names) {
   }
   return out;
 }
+var CHANNEL_NAME_MAX = 80;
+var CHANNEL_ABOUT_MAX = 500;
+var CTRL_ANY = /[\u0000-\u001f\u007f]/;
+var CTRL_NON_WS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+var cpLen = (s) => [...String(s)].length;
+function channelNameError(name) {
+  if (cpLen(name) > CHANNEL_NAME_MAX)
+    return `channel name is too long (${cpLen(name)} chars; max ${CHANNEL_NAME_MAX}).`;
+  if (CTRL_ANY.test(name))
+    return "channel name can't contain control characters or line breaks.";
+  return null;
+}
+function channelAboutError(about) {
+  if (cpLen(about) > CHANNEL_ABOUT_MAX)
+    return `channel description is too long (${cpLen(about)} chars; max ${CHANNEL_ABOUT_MAX}).`;
+  if (CTRL_NON_WS.test(about))
+    return "channel description can't contain control characters.";
+  return null;
+}
 var server = new Server({ name: "buzz", version: SHIM_VERSION }, { capabilities: { tools: {} } });
 var TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_create_channel", description: 'Create a new channel (NIP-29 kind 9007), as you \u2014 you become its owner. `name` is required. `visibility`: "private" (invite-only; the DEFAULT \u2014 fail-closed) or "open" (searchable, anyone self-joins). `type`: "stream" (default) or "forum". Optional `description`, and `ttl` (seconds \u2014 an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it.', inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed)" }, visibility: { type: "string", description: '"private" (default) or "open"' }, type: { type: "string", description: '"stream" (default) or "forum"' }, description: { type: "string", description: "optional channel description/about" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
-  { name: "buzz_edit_channel", description: 'Edit a channel\'s metadata (NIP-29 kind 9002), as you \u2014 owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` ("open"/"private"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`.', inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name" }, visibility: { type: "string", description: '"open" or "private"' }, description: { type: "string", description: "new about/description (empty string clears it)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
-  { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent \u2014 a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member). `channel` = a channel name (if you can already see it) or its id (UUID \u2014 needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
+  { name: "buzz_create_channel", description: 'Create a new channel (NIP-29 kind 9007), as you \u2014 you become its owner. `name` is required. `visibility`: "private" (invite-only; the DEFAULT \u2014 fail-closed) or "open" (searchable, anyone self-joins). `type`: "stream" (default) or "forum". Optional `description`, and `ttl` (seconds \u2014 an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.', inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; \u226480 chars, no control characters)" }, visibility: { type: "string", description: '"private" (default) or "open"' }, type: { type: "string", description: '"stream" (default) or "forum"' }, description: { type: "string", description: "optional channel description/about (\u2264500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
+  { name: "buzz_edit_channel", description: 'Edit a channel\'s metadata (NIP-29 kind 9002), as you \u2014 owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` ("open"/"private"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.', inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (\u226480 chars, no control characters)" }, visibility: { type: "string", description: '"open" or "private"' }, description: { type: "string", description: "new about/description (empty string clears it; \u2264500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
+  { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent \u2014 a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member) \u2014 the shim refuses a private target client-side when it can tell, rather than signing a request the relay bounces. `channel` = a channel name (if you can already see it) or its id (UUID \u2014 needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
   { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
@@ -20595,6 +20614,8 @@ ${up.url}` : up.url;
       const chName = (typeof a.name === "string" ? a.name : "").replace(/^[#\s]+/, "").replace(/\s+$/, "");
       if (!chName)
         return { content: [{ type: "text", text: "buzz_create_channel needs a non-empty `name`." }], isError: true };
+      const nameErr = channelNameError(chName);
+      if (nameErr) return { content: [{ type: "text", text: `buzz_create_channel: ${nameErr}` }], isError: true };
       const vis = a.visibility == null || a.visibility === "" ? "private" : String(a.visibility).toLowerCase();
       if (vis !== "open" && vis !== "private")
         return { content: [{ type: "text", text: `buzz_create_channel: \`visibility\` must be "open" or "private" (got "${vis}").` }], isError: true };
@@ -20603,7 +20624,11 @@ ${up.url}` : up.url;
         return { content: [{ type: "text", text: `buzz_create_channel: \`type\` must be "stream" or "forum" (got "${ct}").` }], isError: true };
       const channelId = randomUUID();
       const tags = [["h", channelId], ["name", chName], ["visibility", vis], ["channel_type", ct]];
-      if (typeof a.description === "string" && a.description.trim()) tags.push(["about", a.description]);
+      if (typeof a.description === "string" && a.description.trim()) {
+        const aboutErr = channelAboutError(a.description);
+        if (aboutErr) return { content: [{ type: "text", text: `buzz_create_channel: ${aboutErr}` }], isError: true };
+        tags.push(["about", a.description]);
+      }
       if (Number.isFinite(a.ttl) && a.ttl > 0) tags.push(["ttl", String(Math.floor(a.ttl))]);
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: 9007, tags, content: "" });
@@ -20618,6 +20643,8 @@ ${up.url}` : up.url;
       if (a.name != null && String(a.name).trim() !== "") {
         const nn = String(a.name).replace(/^[#\s]+/, "").replace(/\s+$/, "");
         if (!nn) return { content: [{ type: "text", text: "buzz_edit_channel: `name` can't be only '#'/whitespace." }], isError: true };
+        const nameErr = channelNameError(nn);
+        if (nameErr) return { content: [{ type: "text", text: `buzz_edit_channel: ${nameErr}` }], isError: true };
         tags.push(["name", nn]);
         changed.push(`name \u2192 "${nn}"`);
       }
@@ -20639,6 +20666,10 @@ ${up.url}` : up.url;
         changed.push(`visibility \u2192 ${v}`);
       }
       if (typeof a.description === "string") {
+        if (a.description) {
+          const aboutErr = channelAboutError(a.description);
+          if (aboutErr) return { content: [{ type: "text", text: `buzz_edit_channel: ${aboutErr}` }], isError: true };
+        }
         tags.push(["about", a.description]);
         changed.push(a.description.trim() ? "description" : "description cleared");
       }
@@ -20659,9 +20690,19 @@ ${up.url}` : up.url;
       if (!IDENTITY_OK) return modRefuse("joining a channel");
       const q = String(a.channel || "").trim();
       if (!q) return { content: [{ type: "text", text: "buzz_join_channel needs a `channel` (name or id)." }], isError: true };
-      let chId = null, chName = q;
+      const privateRefusal = (nm) => ({ content: [{ type: "text", text: `buzz_join_channel: #${nm} is private \u2014 you can't self-join it. Ask an owner/admin to add you with buzz_add_member.` }], isError: true });
+      let chId = null, chName = q, knownPrivate = false;
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q)) {
         chId = q;
+        try {
+          const meta2 = (await query([{ kinds: [39e3], "#d": [chId], limit: 5 }]) || [])[0];
+          if (meta2) {
+            const nm = (meta2.tags || []).find((x) => x[0] === "name");
+            if (nm && nm[1]) chName = nm[1];
+            if ((meta2.tags || []).some((x) => x[0] === "private")) knownPrivate = true;
+          }
+        } catch {
+        }
       } else {
         try {
           const hit = await resolveChannel(q);
@@ -20676,13 +20717,14 @@ ${up.url}` : up.url;
             const isPrivate = (e.tags || []).some((x) => x[0] === "private");
             return { id: t.d, name: t.name || "", open: !isPrivate };
           }).filter((c) => c.id && c.name.toLowerCase() === q.toLowerCase());
-          const pick2 = named.find((c) => c.open) || named[0];
-          if (pick2) {
-            chId = pick2.id;
-            chName = pick2.name;
-          }
+          const open2 = named.find((c) => c.open);
+          if (open2) {
+            chId = open2.id;
+            chName = open2.name;
+          } else if (named.length > 0) return privateRefusal(named[0].name || q);
         }
       }
+      if (knownPrivate) return privateRefusal(chName);
       if (!chId)
         return { content: [{ type: "text", text: `buzz_join_channel: couldn't find a channel named "${q}". If it's an open channel you're not in, pass its id (UUID) instead \u2014 those aren't always discoverable by name.` }], isError: true };
       const tags = [["h", chId]];

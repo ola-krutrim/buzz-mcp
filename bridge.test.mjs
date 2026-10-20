@@ -734,7 +734,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.26), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.27), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -745,7 +745,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.26", `serverInfo.version === '0.2.26' (got '${si.version}')`);
+    ok(si.version === "0.2.27", `serverInfo.version === '0.2.27' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -763,7 +763,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.26/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.26'");
+    ok(/@ola\/buzz-mcp v0\.2\.27/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.27'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -780,7 +780,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.26/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.26'");
+    ok(/@ola\/buzz-mcp v0\.2\.27/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.27'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1204,6 +1204,11 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
       wantName: "town-square", wantVis: "open", wantType: "stream", wantAbout: undefined },
     { name: "private forum, #-prefixed padded name + description", args: { name: "#  Ops Review ", visibility: "private", type: "forum", description: "weekly ops" },
       wantName: "Ops Review", wantVis: "private", wantType: "forum", wantAbout: "weekly ops" },
+    // v0.2.27 client-side limits (per buzz_security's 0.2.26 GO notes) — each must be refused, no 9007 signed.
+    { name: "name too long (81 chars) is refused", args: { name: "x".repeat(81) }, wantRefused: true },
+    { name: "name with a control char is refused", args: { name: "ops\u0007room" }, wantRefused: true },
+    { name: "name with a line break is refused", args: { name: "ops\nroom" }, wantRefused: true },
+    { name: "description too long (501 chars) is refused", args: { name: "notes", description: "y".repeat(501) }, wantRefused: true },
   ];
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   for (const c of cases) {
@@ -1216,6 +1221,7 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
     }, "buzz_create_channel", c.args, { waitMs: 7000, callDelay: 1500 });
     relay.close();
     const ev = posted.find((e) => e && e.kind === 9007);
+    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9007 posted (client-side validation blocked it)`); continue; }
     if (!ev) { skipped(`no kind:9007 event captured for '${c.name}'`); continue; }
     const tg = (k) => { const t = (ev.tags || []).find((x) => x[0] === k); return t ? t[1] : undefined; };
     console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
@@ -1270,6 +1276,9 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
       wantRefused: true },
     { name: "private→open WITH confirm_make_public", args: { channel: "projects", visibility: "open", confirm_make_public: true },
       wantTags: [["h", CHID], ["visibility", "open"]] },
+    // v0.2.27 client-side limits (per buzz_security's 0.2.26 GO notes) — refused, no 9002 signed.
+    { name: "rename to a too-long name is refused", args: { channel: "projects", name: "z".repeat(81) }, wantRefused: true },
+    { name: "description too long is refused", args: { channel: "projects", description: "w".repeat(501) }, wantRefused: true },
   ];
   for (const c of cases) {
     const { relay, posted } = relayWith();
@@ -1288,37 +1297,70 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
   }
 }
 
-// ---- Case 33: buzz_join_channel emits a NIP-29 join-request (kind 9021) under the channel id ----
-// Joining by UUID needs no membership to resolve; the shim just signs a 9021 with the channel h-tag
-// and lets the relay decide (open → join, idempotent; private → refused with "request an invitation").
-console.log("\ncase 33: buzz_join_channel → kind:9021 join-request carrying the channel id as h");
+// ---- Case 33: buzz_join_channel self-joins only OPEN channels; refuses private targets ---------
+// The relay self-joins only an OPEN channel (handle_join_request: visibility must be "open"), and
+// 39000 metadata marks visibility "public" vs "private" (group_metadata_tags; a "closed" tag is on
+// EVERY channel and is not the gate). v0.2.27 refuses a known-private target client-side — on the
+// UUID path (reading the channel's 39000) and the name path (no fallback to a private name match) —
+// rather than signing a 9021 the relay bounces. The mock serves 39002 empty (member of nothing), so
+// a name resolves only via directory discovery, and serves 39000 for #d lookups and the limit scan.
+console.log("\ncase 33: buzz_join_channel → self-join only OPEN channels; refuse private targets client-side");
 {
-  const CHID = "0b57a11e-9999-8888-7777-666655554444";
-  const posted = [];
-  const relay = createServer((rq, rs) => {
-    let body = ""; rq.on("data", (c) => (body += c));
-    rq.on("end", () => {
-      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
-      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
-      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
-      return reply([]);
+  const AGENT_PK = getPublicKey(Uint8Array.from(Buffer.from("77".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const meta39000 = (ch) => ({ id: `meta-${ch.id}`, pubkey: AGENT_PK, kind: 39000, created_at: now,
+    tags: [["d", ch.id], ["name", ch.name], [ch.visibility === "private" ? "private" : "public"], ["closed"]], content: "" });
+  const mkJoin = (dir) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let filters = []; try { filters = JSON.parse(body); } catch {}
+          const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+          if (kinds.has(39002)) return reply([]);                 // agent is a member of nothing
+          if (kinds.has(39000)) {
+            const dfilter = filters.flatMap((f) => f["#d"] || []);
+            const pool = dfilter.length ? dir.filter((c) => dfilter.includes(c.id)) : dir;
+            return reply(pool.map(meta39000));
+          }
+          return reply([]);
+        }
+        reply({});
+      });
     });
-  });
-  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
-  const port = relay.address().port;
-  await probeTool({
-    BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
-    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
-  }, "buzz_join_channel", { channel: CHID }, { waitMs: 7000, callDelay: 1500 });
-  relay.close();
-  const ev = posted.find((e) => e && e.kind === 9021);
-  if (!ev) { skipped("no kind:9021 captured"); }
-  else {
-    console.log(`  join: tags ${JSON.stringify(ev.tags)}`);
-    ok(ev.kind === 9021 && ev.content === "", "join → kind 9021, empty content");
-    ok(JSON.stringify((ev.tags || []).filter((t) => t[0] === "e")) === "[]", "join → no e-tags");
+    return { relay, posted };
+  };
+  const OPEN = { id: "0b57a11e-9999-8888-7777-666655554444", name: "town-square", visibility: "open" };
+  const PRIV = { id: "0b57a11e-0000-1111-2222-333344445555", name: "leadership", visibility: "private" };
+  const cases = [
+    { name: "open channel by UUID → 9021 posted", dir: [OPEN], args: { channel: OPEN.id }, wantH: OPEN.id },
+    { name: "private channel by UUID → refused, no 9021", dir: [PRIV], args: { channel: PRIV.id }, wantRefused: true },
+    { name: "UUID with no readable metadata → proceeds (relay is the gate)", dir: [], args: { channel: OPEN.id }, wantH: OPEN.id },
+    { name: "open channel by name (discovery) → 9021 posted", dir: [OPEN], args: { channel: "town-square" }, wantH: OPEN.id },
+    { name: "private channel by name → refused, no named[0] fallback", dir: [PRIV], args: { channel: "leadership" }, wantRefused: true },
+    { name: "unknown name → error, no 9021", dir: [OPEN], args: { channel: "no-such-channel" }, wantRefused: true },
+  ];
+  for (const c of cases) {
+    const { relay, posted } = mkJoin(c.dir);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    await probeTool({
+      BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_join_channel", c.args, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9021);
+    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9021 posted`); continue; }
+    if (!ev) { skipped(`no kind:9021 captured for '${c.name}'`); continue; }
+    console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
+    ok(ev.kind === 9021 && ev.content === "", `${c.name} → kind 9021, empty content`);
+    ok(JSON.stringify((ev.tags || []).filter((t) => t[0] === "e")) === "[]", `${c.name} → no e-tags`);
     const h = (ev.tags || []).find((t) => t[0] === "h");
-    ok(h && h[1] === CHID, `join → h-tag is the channel id ${CHID}`);
+    ok(h && h[1] === c.wantH, `${c.name} → h-tag is ${c.wantH}`);
   }
 }
 
