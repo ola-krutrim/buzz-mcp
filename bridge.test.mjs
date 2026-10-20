@@ -320,10 +320,11 @@ console.log("\ncase 6: buzz_unread returns a digest shape (mock relay)");
   }
 }
 
-// ---- Case 7 (v0.2.16): buzz_login + buzz_doctor registered and the tool count is now 24 -------
+// ---- Case 7 (v0.2.16): buzz_login + buzz_doctor registered and the tool count is now 27 -------
 // Static: tools/list is answered from the in-process TOOLS array — no network, no OAuth. Agent
 // mode boots cleanly offline; the black-hole relay is never dialed for tools/list.
-console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 24 (static, no OAuth)");
+// (Count: 24 through v0.2.24; 27 at v0.2.25 with buzz_create_channel + buzz_edit_channel + buzz_join_channel.)
+console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 27 (static, no OAuth)");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -335,7 +336,10 @@ console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 24 (s
     console.log("  tools: " + names.length + " → " + names.join(", "));
     ok(names.includes("buzz_login"), "buzz_login is registered in tools/list");
     ok(names.includes("buzz_doctor"), "buzz_doctor is registered in tools/list");
-    ok(names.length === 24, `total tool count is 24 (got ${names.length})`);
+    ok(names.includes("buzz_create_channel"), "buzz_create_channel is registered in tools/list");
+    ok(names.includes("buzz_edit_channel"), "buzz_edit_channel is registered in tools/list");
+    ok(names.includes("buzz_join_channel"), "buzz_join_channel is registered in tools/list");
+    ok(names.length === 27, `total tool count is 27 (got ${names.length})`);
   }
 }
 
@@ -730,7 +734,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.24), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.25), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -741,7 +745,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.24", `serverInfo.version === '0.2.24' (got '${si.version}')`);
+    ok(si.version === "0.2.25", `serverInfo.version === '0.2.25' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -759,7 +763,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.24/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.24'");
+    ok(/@ola\/buzz-mcp v0\.2\.25/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.24'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -776,7 +780,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.24/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.24'");
+    ok(/@ola\/buzz-mcp v0\.2\.25/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.24'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1169,6 +1173,144 @@ console.log("\ncase 30: buzz_reply → e-tags the relay resolves under the targe
     console.log(`  ${c.name}: e-tags ${JSON.stringify(eTags)}`);
     ok(JSON.stringify(eTags) === JSON.stringify(c.wantE), `${c.name} → e-tags ${JSON.stringify(c.wantE)}`);
     ok(ancestryOk(sent.tags, c.target), `${c.name} → passes the relay's ancestry check (not top-level, not a 400)`);
+  }
+}
+
+// ---- Case 31: buzz_create_channel emits a valid NIP-29 create-group (kind 9007) --------------
+// The relay (buzz-sdk build_create_channel + buzz-relay kind:9007 ingest) expects an h-tag channel
+// UUID, a canonicalized `name`, `visibility` (open|private), `channel_type` (stream|forum), and
+// optional `about`/`ttl`; the signer becomes the channel owner. This asserts the shim emits exactly
+// that shape — defaults (open/stream) and an explicit private forum with a #-prefixed, padded name
+// that must come out canonicalized. Local mock relay (no network): GET=NIP-11, POST /events captures.
+console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the relay's expected tags");
+{
+  const mk = () => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (obj) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        return reply([]);
+      });
+    });
+    return { relay, posted };
+  };
+  const cases = [
+    { name: "defaults (open stream)", args: { name: "data-lake" },
+      wantName: "data-lake", wantVis: "open", wantType: "stream", wantAbout: undefined },
+    { name: "private forum, #-prefixed padded name + description", args: { name: "#  Ops Review ", visibility: "private", type: "forum", description: "weekly ops" },
+      wantName: "Ops Review", wantVis: "private", wantType: "forum", wantAbout: "weekly ops" },
+  ];
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  for (const c of cases) {
+    const { relay, posted } = mk();
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    await probeTool({
+      BUZZ_PRIVATE_KEY: "66".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_create_channel", c.args, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9007);
+    if (!ev) { skipped(`no kind:9007 event captured for '${c.name}'`); continue; }
+    const tg = (k) => { const t = (ev.tags || []).find((x) => x[0] === k); return t ? t[1] : undefined; };
+    console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
+    ok(ev.kind === 9007, `${c.name} → kind 9007`);
+    ok(ev.content === "", `${c.name} → empty content`);
+    ok(UUID_RE.test(tg("h") || ""), `${c.name} → h is a channel UUID`);
+    ok(tg("name") === c.wantName, `${c.name} → name "${c.wantName}" (canonicalized)`);
+    ok(tg("visibility") === c.wantVis, `${c.name} → visibility ${c.wantVis}`);
+    ok(tg("channel_type") === c.wantType, `${c.name} → channel_type ${c.wantType}`);
+    ok(tg("about") === c.wantAbout, `${c.name} → about ${c.wantAbout === undefined ? "(absent)" : `"${c.wantAbout}"`}`);
+  }
+}
+
+// ---- Case 32: buzz_edit_channel emits a PATCH-style NIP-29 edit-metadata (kind 9002) ----------
+// Only the fields passed appear as tags (the relay applies each as its own ChannelUpdate and leaves
+// omitted fields untouched), always under the target channel's h-tag. Resolving the channel by NAME
+// exercises resolveChannel, so the mock serves the member (39002) + metadata (39000) events.
+console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed fields, under the channel h-tag");
+{
+  const CHID = "c0ffee00-1111-2222-3333-444455556666";
+  const relayWith = () => {
+    const posted = [];
+    const PK = getPublicKey(Uint8Array.from(Buffer.from("77".repeat(32), "hex")));
+    const now = Math.floor(Date.now() / 1000);
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let filters = []; try { filters = JSON.parse(body); } catch {}
+          const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", CHID], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", CHID], ["name", "projects"]], content: "" }]);
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, posted };
+  };
+  const cases = [
+    { name: "rename only", args: { channel: "projects", name: "#  Projects X " },
+      wantTags: [["h", CHID], ["name", "Projects X"]] },
+    { name: "visibility + description", args: { channel: "projects", visibility: "private", description: "internal" },
+      wantTags: [["h", CHID], ["visibility", "private"], ["about", "internal"]] },
+    { name: "clear ttl", args: { channel: "projects", ttl: 0 },
+      wantTags: [["h", CHID], ["ttl", ""]] },
+  ];
+  for (const c of cases) {
+    const { relay, posted } = relayWith();
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    await probeTool({
+      BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_edit_channel", c.args, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9002);
+    if (!ev) { skipped(`no kind:9002 captured for '${c.name}'`); continue; }
+    console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
+    ok(JSON.stringify(ev.tags) === JSON.stringify(c.wantTags), `${c.name} → tags ${JSON.stringify(c.wantTags)} (patch — only the changed fields)`);
+  }
+}
+
+// ---- Case 33: buzz_join_channel emits a NIP-29 join-request (kind 9021) under the channel id ----
+// Joining by UUID needs no membership to resolve; the shim just signs a 9021 with the channel h-tag
+// and lets the relay decide (open → join, idempotent; private → refused with "request an invitation").
+console.log("\ncase 33: buzz_join_channel → kind:9021 join-request carrying the channel id as h");
+{
+  const CHID = "0b57a11e-9999-8888-7777-666655554444";
+  const posted = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+      return reply([]);
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  await probeTool({
+    BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_join_channel", { channel: CHID }, { waitMs: 7000, callDelay: 1500 });
+  relay.close();
+  const ev = posted.find((e) => e && e.kind === 9021);
+  if (!ev) { skipped("no kind:9021 captured"); }
+  else {
+    console.log(`  join: tags ${JSON.stringify(ev.tags)}`);
+    ok(ev.kind === 9021 && ev.content === "", "join → kind 9021, empty content");
+    ok(JSON.stringify((ev.tags || []).filter((t) => t[0] === "e")) === "[]", "join → no e-tags");
+    const h = (ev.tags || []).find((t) => t[0] === "h");
+    ok(h && h[1] === CHID, `join → h-tag is the channel id ${CHID}`);
   }
 }
 
