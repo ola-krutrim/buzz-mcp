@@ -166,7 +166,14 @@ export function makeWireTokenProvider(env, fetchFn) {
 //   7     = NIP-25 reaction (ekam #325 / v203) — a low-sensitivity ack, not a command.
 //   24242 = Blossom media auth (ekam #326 / v204) — signs upload/get auth for attachments;
 //           the shim only ever builds these via blossomAuthTemplate() (fail-closed shape).
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005]);
+//   9000/9001/9005 = NIP-29 governed moderation (add / remove / delete-message) — Ekam v206.
+//   9007/9002/9021 = NIP-29 channel lifecycle (create-group / edit-metadata / join-request),
+//           live server-side via ekam#464 (853feda, deployed Hyd v297 on 2026-10-20). Same
+//           role-gated shape as the moderation kinds: Ekam stays content-agnostic; the relay's
+//           validate_admin_event authorizes each against the SIGNER's OWN channel role (a wire-signed
+//           create/edit only works where the human is already owner/admin; 9021 is open-channel
+//           self-join, private refused) — so mirroring these does not widen authority.
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021]);
 
 // NIP-29 governed moderation (kinds 9000 add-member / 9001 remove-member / 9005 delete-message),
 // live server-side via Ekam v206 (allowlist {…,9000,9001,9005}). Ekam stays content-agnostic; the

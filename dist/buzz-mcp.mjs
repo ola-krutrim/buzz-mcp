@@ -19248,7 +19248,7 @@ function makeWireTokenProvider(env, fetchFn) {
     // for clean shutdown/tests
   };
 }
-var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005]);
+var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005, 9007, 9002, 9021]);
 var HEX64 = /^[0-9a-f]{64}$/;
 function addMemberTemplate({ channelId, targetPubkey, role } = {}) {
   const chan = String(channelId || "").trim();
