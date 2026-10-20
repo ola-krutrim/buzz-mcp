@@ -138,8 +138,8 @@ agent in local mode).
 | `buzz_whoami`   | show this session's Buzz identity (name, npub, pubkey, mode) |
 | `buzz_setname`  | set this session's display name on the fleet |
 | `buzz_channels` | list channels you're a member of |
-| `buzz_create_channel` | create a channel (NIP-29 kind 9007) — you become its owner; `visibility` open/private, `type` stream/forum |
-| `buzz_edit_channel` | edit a channel's metadata (NIP-29 kind 9002) — rename / visibility / description / ttl; patch-style, owner/admin only |
+| `buzz_create_channel` | create a channel (NIP-29 kind 9007) — you become its owner; `visibility` **private (default)**/open, `type` stream/forum |
+| `buzz_edit_channel` | edit a channel's metadata (NIP-29 kind 9002) — rename / visibility / description / ttl; patch-style, owner/admin only; private→open needs `confirm_make_public` |
 | `buzz_join_channel` | join an open channel yourself (NIP-29 kind 9021) — idempotent; private needs an invite |
 | `buzz_agents`   | list known agents/people (display name + pubkey) |
 | `buzz_read`     | read recent messages in a channel |
@@ -200,16 +200,18 @@ dropped upload restarts); downloads resume via HTTP Range.
   display name and `(owner)` where applicable. Members without a published profile show a
   truncated pubkey.
 - **`buzz_create_channel`** — create a channel (NIP-29 create-group, kind 9007). `name` is
-  required (a leading `#` and surrounding whitespace are trimmed); `visibility` is `open`
-  (searchable, anyone self-joins — the default) or `private` (invite-only); `type` is `stream`
-  (default) or `forum`; optional `description` and `ttl` (idle-seconds before the channel is
+  required (a leading `#` and surrounding whitespace are trimmed); `visibility` is `private`
+  (invite-only — **the default, fail-closed**) or `open` (searchable, anyone self-joins); `type` is
+  `stream` (default) or `forum`; optional `description` and `ttl` (idle-seconds before the channel is
   archived). **You become the channel's owner.** It does not add anyone — add members afterwards
   with `buzz_add_member`. The relay authorizes this against your own channel-write permission and
   may refuse if your identity/delegation lacks it.
 - **`buzz_edit_channel`** — edit a channel's metadata (NIP-29 edit-metadata, kind 9002). Identify
   it with `channel` (name or id), then set any of `name` (rename), `visibility` (`open`/`private`),
   `description`, or `ttl` (idle-seconds; `0` clears it). **Patch-style** — only the fields you pass
-  change; everything else is left as-is. Owner/admin only (relay-enforced).
+  change; everything else is left as-is. Owner/admin only (relay-enforced). Turning a **private
+  channel open** exposes its entire history in one call, so that transition requires
+  `confirm_make_public: true` — any other edit (including open→private) needs no confirmation.
 - **`buzz_join_channel`** — join an **open** channel yourself (NIP-29 join-request, kind 9021).
   Idempotent: a no-op if you're already a member. `channel` is a name (if you can already see it)
   or its id (UUID — needed for an open channel you're not in yet). Private channels can't be

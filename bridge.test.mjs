@@ -734,7 +734,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.25), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.26), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -745,7 +745,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.25", `serverInfo.version === '0.2.25' (got '${si.version}')`);
+    ok(si.version === "0.2.26", `serverInfo.version === '0.2.26' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -763,7 +763,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.25/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.24'");
+    ok(/@ola\/buzz-mcp v0\.2\.26/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.26'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -780,7 +780,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.25/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.24'");
+    ok(/@ola\/buzz-mcp v0\.2\.26/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.26'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1198,8 +1198,10 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
     return { relay, posted };
   };
   const cases = [
-    { name: "defaults (open stream)", args: { name: "data-lake" },
-      wantName: "data-lake", wantVis: "open", wantType: "stream", wantAbout: undefined },
+    { name: "defaults (private stream — fail-closed)", args: { name: "data-lake" },
+      wantName: "data-lake", wantVis: "private", wantType: "stream", wantAbout: undefined },
+    { name: "explicit open stream", args: { name: "town-square", visibility: "open" },
+      wantName: "town-square", wantVis: "open", wantType: "stream", wantAbout: undefined },
     { name: "private forum, #-prefixed padded name + description", args: { name: "#  Ops Review ", visibility: "private", type: "forum", description: "weekly ops" },
       wantName: "Ops Review", wantVis: "private", wantType: "forum", wantAbout: "weekly ops" },
   ];
@@ -1248,7 +1250,7 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
           let filters = []; try { filters = JSON.parse(body); } catch {}
           const kinds = new Set(filters.flatMap((f) => f.kinds || []));
           if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", CHID], ["p", PK]], content: "" }]);
-          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", CHID], ["name", "projects"]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", CHID], ["name", "projects"], ["private"]], content: "" }]);
           return reply([]);
         }
         reply({});
@@ -1263,6 +1265,11 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
       wantTags: [["h", CHID], ["visibility", "private"], ["about", "internal"]] },
     { name: "clear ttl", args: { channel: "projects", ttl: 0 },
       wantTags: [["h", CHID], ["ttl", ""]] },
+    // The mock channel's current visibility is private, so flipping it open is the exposing transition.
+    { name: "private→open WITHOUT confirm is refused (history-exposure guard)", args: { channel: "projects", visibility: "open" },
+      wantRefused: true },
+    { name: "private→open WITH confirm_make_public", args: { channel: "projects", visibility: "open", confirm_make_public: true },
+      wantTags: [["h", CHID], ["visibility", "open"]] },
   ];
   for (const c of cases) {
     const { relay, posted } = relayWith();
@@ -1274,6 +1281,7 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
     }, "buzz_edit_channel", c.args, { waitMs: 7000, callDelay: 1500 });
     relay.close();
     const ev = posted.find((e) => e && e.kind === 9002);
+    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9002 posted (guard blocked the write)`); continue; }
     if (!ev) { skipped(`no kind:9002 captured for '${c.name}'`); continue; }
     console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
     ok(JSON.stringify(ev.tags) === JSON.stringify(c.wantTags), `${c.name} → tags ${JSON.stringify(c.wantTags)} (patch — only the changed fields)`);
