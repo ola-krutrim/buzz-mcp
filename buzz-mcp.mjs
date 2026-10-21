@@ -142,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.27";
+const SHIM_VERSION = "0.2.28";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -593,17 +593,63 @@ async function dmChannels() {
     })
     .filter((c) => c.id);
 }
-// Resolve a recipient token → pubkey hex. npub / hex / exact display-name today;
-// email → Ekam directory resolver (v0.2.1, isolated in resolveEmail below).
+// Fetch kind:0 profiles matching a free-text term via the relay's NIP-50 profile search
+// (buzz-search prefix/typeahead on kinds:[0]) — NOT the 200-newest {kinds:[0]} window that
+// profiles() uses. A profile that hasn't been updated recently (pushed past that window by
+// hundreds of newer ones) is still found this way. Returns the candidate set, unparsed names
+// kept verbatim so resolveRecipient* can exact-match. Fails SOFT (returns []) so a relay that
+// doesn't serve profile search degrades to "not found", never to a wrong match.
+async function searchProfiles(term, limit = 50) {
+  const q = String(term || "").trim();
+  if (!q) return [];
+  let evs = [];
+  try { evs = await query([{ kinds: [0], search: q, limit }]) || []; } catch { evs = []; }
+  const out = [];
+  for (const e of evs) {
+    try { const c = JSON.parse(e.content); out.push({ pubkey: e.pubkey, name: c.name || "", display_name: c.display_name || "", nip05: c.nip05 || "" }); } catch { /* skip unparseable */ }
+  }
+  return out;
+}
+// Exact (trimmed, case-insensitive) name match against BOTH profile name fields — a client may
+// show `display_name` while the profile's `name` differs (or vice versa), e.g. "Anirban Das" vs
+// "Anirban D Das", so matching one field alone silently misses. FAIL-CLOSED: >1 distinct pubkey
+// is ambiguous and refused (never auto-pick a DM/moderation target); 0 returns null → caller throws.
+async function resolveRecipientByName(s) {
+  const want = s.trim().toLowerCase();
+  const hits = [...new Set((await searchProfiles(s)).filter((p) =>
+    p.name.trim().toLowerCase() === want || p.display_name.trim().toLowerCase() === want
+  ).map((p) => p.pubkey))];
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) — use an npub or email`);
+  return null;
+}
+// Agent-mode email fallback: match the email against the `nip05` on a searchable profile, with NO
+// Ekam call (resolveEmail's directory resolver is wire-mode only). Best-effort — searches the full
+// address, then the local-part if that finds nothing — and FAIL-CLOSED on ambiguity.
+async function resolveRecipientByEmail(s) {
+  const want = s.trim().toLowerCase();
+  let cands = await searchProfiles(s);
+  if (!cands.length) { const local = want.split("@")[0]; if (local && local !== want) cands = await searchProfiles(local); }
+  const hits = [...new Set(cands.filter((p) => p.nip05.trim().toLowerCase() === want).map((p) => p.pubkey))];
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) throw new Error(`email "${s}" matches ${hits.length} profiles — use an npub`);
+  return null;
+}
+// Resolve a recipient token → pubkey hex. npub / hex are exact. An email uses Ekam's directory
+// resolver in wire mode (authoritative), else the local nip05 fallback above. A name is resolved
+// by server-side profile search (not the 200-newest cap), exact on both name fields, fail-closed.
 async function resolveRecipient(to) {
   const s = String(to || "").trim();
   if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
   if (s.startsWith("npub")) { const d = nip19.decode(s); if (d.type === "npub") return d.data; throw new Error(`bad npub: ${s}`); }
-  if (s.includes("@")) return await resolveEmail(s);
-  const names = await profiles();
-  const hits = Object.entries(names).filter(([, n]) => String(n).toLowerCase() === s.toLowerCase()).map(([pk]) => pk);
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`"${to}" is ambiguous (${hits.length} people share that name) — use an npub or email`);
+  if (s.includes("@")) {
+    if (signer.mode === "wire" && typeof signer.ekamToken === "function") return await resolveEmail(s);
+    const pk = await resolveRecipientByEmail(s);
+    if (pk) return pk;
+    throw new Error(`can't resolve email "${s}" — agent mode has no Ekam directory, and no visible profile lists it as nip05. Pass an npub or hex pubkey.`);
+  }
+  const pk = await resolveRecipientByName(s);
+  if (pk) return pk;
   throw new Error(`can't resolve recipient "${to}" — pass an npub, hex pubkey, email, or exact display name`);
 }
 // email→pubkey via Ekam's directory resolver (ekam #324): GET /v1/directory/resolve?email=,

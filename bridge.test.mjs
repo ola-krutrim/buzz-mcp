@@ -734,7 +734,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.27), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.28), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -745,7 +745,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.27", `serverInfo.version === '0.2.27' (got '${si.version}')`);
+    ok(si.version === "0.2.28", `serverInfo.version === '0.2.28' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -763,7 +763,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.27/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.27'");
+    ok(/@ola\/buzz-mcp v0\.2\.28/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.28'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -780,7 +780,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.27/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.27'");
+    ok(/@ola\/buzz-mcp v0\.2\.28/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.28'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1361,6 +1361,68 @@ console.log("\ncase 33: buzz_join_channel → self-join only OPEN channels; refu
     ok(JSON.stringify((ev.tags || []).filter((t) => t[0] === "e")) === "[]", `${c.name} → no e-tags`);
     const h = (ev.tags || []).find((t) => t[0] === "h");
     ok(h && h[1] === c.wantH, `${c.name} → h-tag is ${c.wantH}`);
+  }
+}
+
+// ---- Case 34: resolveRecipient — server-side name search (not the 200-newest cap), BOTH name
+// fields, agent-mode email→nip05 fallback, fail-closed on ambiguity (v0.2.28) ------------------
+// The old resolver matched `to` against the 200 newest kind:0 profiles on a single name field, so
+// an older profile (Anirban's, pushed past the window) or a client-shown name differing from the
+// stored field never resolved. Exercised through buzz_dm_open, which resolves `to` → pubkey → signs
+// a kind:41010 DM_OPEN whose p-tag is the resolved pubkey. The mock serves kind:0 "search" results
+// for any kinds:[0] query and answers /events so openDm gets a channel id (no listing fallback).
+console.log("\ncase 34: resolveRecipient → name search (both fields), email→nip05 fallback, fail-closed");
+{
+  const ANI = "a".repeat(64), BOB = "b".repeat(64), CAR = "c".repeat(64);
+  // Anirban's profile: `name` and `display_name` DIFFER — the real-world bug (a client shows one,
+  // the profile's other field differs: "Anirban Das" vs "Anirban D Das").
+  const DIR = {
+    anirban: [{ pubkey: ANI, name: "Anirban Das", display_name: "Anirban D Das", nip05: "anirban.das@olaelectric.com" }],
+    dupe:    [{ pubkey: BOB, name: "Sam Roy", display_name: "Sam Roy", nip05: "" },
+              { pubkey: CAR, name: "Sam Roy", display_name: "Sam Roy", nip05: "" }],
+    none:    [],
+  };
+  const mkDir = (profs) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: 'response:{"channel_id":"dm-1","created":true}' }); }
+        if (rq.url === "/query") {
+          let filters = []; try { filters = JSON.parse(body); } catch {}
+          const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+          if (kinds.has(0)) return reply(profs.map((p, i) => ({ id: `pf${i}`, pubkey: p.pubkey, kind: 0, created_at: Math.floor(Date.now() / 1000), tags: [], content: JSON.stringify({ name: p.name, display_name: p.display_name, nip05: p.nip05 }) })));
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, posted };
+  };
+  const cases = [
+    { name: "name matches display_name field", profiles: DIR.anirban, to: "Anirban D Das", wantPk: ANI },
+    { name: "name matches the OTHER field (client-shown name ≠ stored field)", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI },
+    { name: "agent-mode email → local nip05 match (no Ekam)", profiles: DIR.anirban, to: "anirban.das@olaelectric.com", wantPk: ANI },
+    { name: "ambiguous name → refused, no DM_OPEN", profiles: DIR.dupe, to: "Sam Roy", wantRefused: true },
+    { name: "unknown name → refused", profiles: DIR.none, to: "Nobody Here", wantRefused: true },
+  ];
+  for (const c of cases) {
+    const { relay, posted } = mkDir(c.profiles);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    await probeTool({
+      BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_dm_open", { to: c.to }, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 41010);
+    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:41010 DM_OPEN posted (resolver refused)`); continue; }
+    if (!ev) { skipped(`no kind:41010 captured for '${c.name}'`); continue; }
+    const p = (ev.tags || []).find((t) => t[0] === "p");
+    console.log(`  ${c.name}: p=${p ? p[1].slice(0, 8) + "…" : "(none)"}`);
+    ok(p && p[1] === c.wantPk, `${c.name} → DM_OPEN p-tag is the resolved pubkey`);
   }
 }
 
