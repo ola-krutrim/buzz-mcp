@@ -734,7 +734,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.28), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.29), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -745,7 +745,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.28", `serverInfo.version === '0.2.28' (got '${si.version}')`);
+    ok(si.version === "0.2.29", `serverInfo.version === '0.2.29' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -763,7 +763,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.28/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.28'");
+    ok(/@ola\/buzz-mcp v0\.2\.29/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.29'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -780,7 +780,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.28/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.28'");
+    ok(/@ola\/buzz-mcp v0\.2\.29/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.29'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1208,6 +1208,8 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
     { name: "name too long (81 chars) is refused", args: { name: "x".repeat(81) }, wantRefused: true },
     { name: "name with a control char is refused", args: { name: "ops\u0007room" }, wantRefused: true },
     { name: "name with a line break is refused", args: { name: "ops\nroom" }, wantRefused: true },
+    { name: "name with a bidi override is refused (v0.2.29 anti-lookalike)", args: { name: "ops‮room" }, wantRefused: true },
+    { name: "name with a zero-width char is refused (v0.2.29 anti-lookalike)", args: { name: "ops​room" }, wantRefused: true },
     { name: "description too long (501 chars) is refused", args: { name: "notes", description: "y".repeat(501) }, wantRefused: true },
   ];
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -1278,6 +1280,7 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
       wantTags: [["h", CHID], ["visibility", "open"]] },
     // v0.2.27 client-side limits (per buzz_security's 0.2.26 GO notes) — refused, no 9002 signed.
     { name: "rename to a too-long name is refused", args: { channel: "projects", name: "z".repeat(81) }, wantRefused: true },
+    { name: "rename with a zero-width char is refused (v0.2.29)", args: { channel: "projects", name: "Proj​ects" }, wantRefused: true },
     { name: "description too long is refused", args: { channel: "projects", description: "w".repeat(501) }, wantRefused: true },
   ];
   for (const c of cases) {
@@ -1365,13 +1368,16 @@ console.log("\ncase 33: buzz_join_channel → self-join only OPEN channels; refu
 }
 
 // ---- Case 34: resolveRecipient — server-side name search (not the 200-newest cap), BOTH name
-// fields, agent-mode email→nip05 fallback, fail-closed on ambiguity (v0.2.28) ------------------
-// The old resolver matched `to` against the 200 newest kind:0 profiles on a single name field, so
-// an older profile (Anirban's, pushed past the window) or a client-shown name differing from the
-// stored field never resolved. Exercised through buzz_dm_open, which resolves `to` → pubkey → signs
-// a kind:41010 DM_OPEN whose p-tag is the resolved pubkey. The mock serves kind:0 "search" results
-// for any kinds:[0] query and answers /events so openDm gets a channel id (no listing fallback).
-console.log("\ncase 34: resolveRecipient → name search (both fields), email→nip05 fallback, fail-closed");
+// fields normalized (NFC + bidi/zero-width stripped), agent-mode email REFUSED, fail-closed (v0.2.29)
+// The old resolver matched `to` against the 200 newest kind:0 profiles on a single name field, so an
+// older profile (Anirban's) or a client-shown name differing from the stored field never resolved.
+// v0.2.28 added a server-side search + both fields; v0.2.29 hardens it: agent-mode email no longer
+// resolves (the self-asserted nip05 fallback let anyone claim a colleague's address — #1492), and a
+// bidi/zero-width lookalike is normalized away so it collides with the real name → fail-closed.
+// Exercised through buzz_dm_open: resolves `to` → pubkey → signs a kind:41010 DM_OPEN whose p-tag is
+// the resolved pubkey. The mock serves kind:0 "search" results for any kinds:[0] query and answers
+// /events so openDm gets a channel id (no listing fallback).
+console.log("\ncase 34: resolveRecipient → name search (both fields, normalized), agent-mode email refused, fail-closed");
 {
   const ANI = "a".repeat(64), BOB = "b".repeat(64), CAR = "c".repeat(64);
   // Anirban's profile: `name` and `display_name` DIFFER — the real-world bug (a client shows one,
@@ -1380,6 +1386,10 @@ console.log("\ncase 34: resolveRecipient → name search (both fields), email→
     anirban: [{ pubkey: ANI, name: "Anirban Das", display_name: "Anirban D Das", nip05: "anirban.das@olaelectric.com" }],
     dupe:    [{ pubkey: BOB, name: "Sam Roy", display_name: "Sam Roy", nip05: "" },
               { pubkey: CAR, name: "Sam Roy", display_name: "Sam Roy", nip05: "" }],
+    // A zero-width twin of the real name (BOB injects U+200B): it normalizes to the same "anirban das"
+    // as ANI, so the two collide → ambiguous → refused, instead of silently resolving to the lookalike.
+    lookalike: [{ pubkey: ANI, name: "Anirban Das", display_name: "", nip05: "" },
+                { pubkey: BOB, name: "Anirban​ Das", display_name: "", nip05: "" }],
     none:    [],
   };
   const mkDir = (profs) => {
@@ -1404,7 +1414,8 @@ console.log("\ncase 34: resolveRecipient → name search (both fields), email→
   const cases = [
     { name: "name matches display_name field", profiles: DIR.anirban, to: "Anirban D Das", wantPk: ANI },
     { name: "name matches the OTHER field (client-shown name ≠ stored field)", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI },
-    { name: "agent-mode email → local nip05 match (no Ekam)", profiles: DIR.anirban, to: "anirban.das@olaelectric.com", wantPk: ANI },
+    { name: "agent-mode email is REFUSED (self-asserted nip05 not trusted — #1492)", profiles: DIR.anirban, to: "anirban.das@olaelectric.com", wantRefused: true },
+    { name: "zero-width lookalike collides with real name → ambiguous, refused", profiles: DIR.lookalike, to: "Anirban Das", wantRefused: true },
     { name: "ambiguous name → refused, no DM_OPEN", profiles: DIR.dupe, to: "Sam Roy", wantRefused: true },
     { name: "unknown name → refused", profiles: DIR.none, to: "Nobody Here", wantRefused: true },
   ];
