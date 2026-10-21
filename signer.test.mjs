@@ -194,6 +194,10 @@ catch (e) { ok(/channel/i.test(e.message), "refuses a reaction with no channel t
 console.log("moderation (v0.2.7) — kinds 9000/9001/9005 in allowlist + fail-closed templates (concrete h + concrete 64-hex target):");
 ok([9000, 9001, 9005].every((k) => WIRE_ALLOWLIST.has(k)), "kinds 9000/9001/9005 are in the wire-sign allowlist");
 ok([9000, 9001, 9005].every((k) => wsigner.canSign(k)), "wire signer canSign(9000/9001/9005) → moderation signable as the user");
+
+console.log("channel lifecycle (v0.2.27) — kinds 9007/9002/9021 in allowlist (ekam#464 / 853feda wire-sign mirror):");
+ok([9007, 9002, 9021].every((k) => WIRE_ALLOWLIST.has(k)), "kinds 9007/9002/9021 are in the wire-sign allowlist");
+ok([9007, 9002, 9021].every((k) => wsigner.canSign(k)), "wire signer canSign(9007/9002/9021) → create/edit/join signable as the user");
 {
   const PK = "c".repeat(64), EV = "d".repeat(64);
   const add = addMemberTemplate({ channelId: "chan-1", targetPubkey: PK });

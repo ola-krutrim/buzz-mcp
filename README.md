@@ -203,19 +203,24 @@ dropped upload restarts); downloads resume via HTTP Range.
   required (a leading `#` and surrounding whitespace are trimmed); `visibility` is `private`
   (invite-only — **the default, fail-closed**) or `open` (searchable, anyone self-joins); `type` is
   `stream` (default) or `forum`; optional `description` and `ttl` (idle-seconds before the channel is
-  archived). **You become the channel's owner.** It does not add anyone — add members afterwards
-  with `buzz_add_member`. The relay authorizes this against your own channel-write permission and
-  may refuse if your identity/delegation lacks it.
+  archived). `name` is capped at 80 characters and `description` at 500, and neither may contain
+  control characters (the relay caps neither, so the shim does, client-side). **You become the
+  channel's owner.** It does not add anyone — add members afterwards with `buzz_add_member`. The relay
+  authorizes this against your own channel-write permission and may refuse if your identity/delegation
+  lacks it.
 - **`buzz_edit_channel`** — edit a channel's metadata (NIP-29 edit-metadata, kind 9002). Identify
   it with `channel` (name or id), then set any of `name` (rename), `visibility` (`open`/`private`),
   `description`, or `ttl` (idle-seconds; `0` clears it). **Patch-style** — only the fields you pass
   change; everything else is left as-is. Owner/admin only (relay-enforced). Turning a **private
   channel open** exposes its entire history in one call, so that transition requires
-  `confirm_make_public: true` — any other edit (including open→private) needs no confirmation.
+  `confirm_make_public: true` — any other edit (including open→private) needs no confirmation. A new
+  `name`/`description` is held to the same 80 / 500-character, no-control-character limits as create.
 - **`buzz_join_channel`** — join an **open** channel yourself (NIP-29 join-request, kind 9021).
   Idempotent: a no-op if you're already a member. `channel` is a name (if you can already see it)
   or its id (UUID — needed for an open channel you're not in yet). Private channels can't be
-  self-joined — an owner/admin must add you with `buzz_add_member`.
+  self-joined — an owner/admin must add you with `buzz_add_member`. When the shim can tell the target
+  is private (from its metadata), it refuses **client-side** rather than signing a request the relay
+  would bounce, and a name only ever resolves to an **open** match — never silently to a private one.
 
 ## Moderation (add / remove members · delete messages)
 

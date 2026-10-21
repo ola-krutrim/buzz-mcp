@@ -142,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.26";
+const SHIM_VERSION = "0.2.27";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -687,6 +687,33 @@ function mentionPtags(text, names) {
   return out;
 }
 
+// ---- channel name/about client-side limits (v0.2.27, per buzz_security's 0.2.26 GO notes) ----
+// The relay caps neither a channel name nor its description — the only server check is
+// "non-empty after canonicalization" (buzz-db store/channel.rs). So the shim fails these
+// closed before signing a 9007/9002, rather than letting an unbounded or control-laden
+// value through: a name is a single display line, a description a short blurb. Bounds are
+// defensive (name 80 — the common chat cap; about 500). Both reject C0/DEL control
+// characters; the name additionally rejects TAB/LF/CR (a single-line name has none).
+const CHANNEL_NAME_MAX = 80;
+const CHANNEL_ABOUT_MAX = 500;
+const CTRL_ANY = /[\u0000-\u001f\u007f]/;                          // all C0 controls + DEL (incl. TAB/LF/CR)
+const CTRL_NON_WS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/; // C0 + DEL except TAB/LF/CR
+const cpLen = (s) => [...String(s)].length;                        // count code points, not UTF-16 units
+function channelNameError(name) {
+  if (cpLen(name) > CHANNEL_NAME_MAX)
+    return `channel name is too long (${cpLen(name)} chars; max ${CHANNEL_NAME_MAX}).`;
+  if (CTRL_ANY.test(name))
+    return "channel name can't contain control characters or line breaks.";
+  return null;
+}
+function channelAboutError(about) {
+  if (cpLen(about) > CHANNEL_ABOUT_MAX)
+    return `channel description is too long (${cpLen(about)} chars; max ${CHANNEL_ABOUT_MAX}).`;
+  if (CTRL_NON_WS.test(about))
+    return "channel description can't contain control characters.";
+  return null;
+}
+
 // ---- MCP server ----
 const server = new Server({ name: "buzz", version: SHIM_VERSION }, { capabilities: { tools: {} } });
 
@@ -694,9 +721,9 @@ const TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_create_channel", description: "Create a new channel (NIP-29 kind 9007), as you — you become its owner. `name` is required. `visibility`: \"private\" (invite-only; the DEFAULT — fail-closed) or \"open\" (searchable, anyone self-joins). `type`: \"stream\" (default) or \"forum\". Optional `description`, and `ttl` (seconds — an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it.", inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed)" }, visibility: { type: "string", description: "\"private\" (default) or \"open\"" }, type: { type: "string", description: "\"stream\" (default) or \"forum\"" }, description: { type: "string", description: "optional channel description/about" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
-  { name: "buzz_edit_channel", description: "Edit a channel's metadata (NIP-29 kind 9002), as you — owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` (\"open\"/\"private\"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`.", inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name" }, visibility: { type: "string", description: "\"open\" or \"private\"" }, description: { type: "string", description: "new about/description (empty string clears it)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
-  { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent — a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member). `channel` = a channel name (if you can already see it) or its id (UUID — needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
+  { name: "buzz_create_channel", description: "Create a new channel (NIP-29 kind 9007), as you — you become its owner. `name` is required. `visibility`: \"private\" (invite-only; the DEFAULT — fail-closed) or \"open\" (searchable, anyone self-joins). `type`: \"stream\" (default) or \"forum\". Optional `description`, and `ttl` (seconds — an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.", inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; ≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"private\" (default) or \"open\"" }, type: { type: "string", description: "\"stream\" (default) or \"forum\"" }, description: { type: "string", description: "optional channel description/about (≤500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
+  { name: "buzz_edit_channel", description: "Edit a channel's metadata (NIP-29 kind 9002), as you — owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` (\"open\"/\"private\"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.", inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"open\" or \"private\"" }, description: { type: "string", description: "new about/description (empty string clears it; ≤500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
+  { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent — a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member) — the shim refuses a private target client-side when it can tell, rather than signing a request the relay bounces. `channel` = a channel name (if you can already see it) or its id (UUID — needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
   { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
@@ -1096,6 +1123,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const chName = (typeof a.name === "string" ? a.name : "").replace(/^[#\s]+/, "").replace(/\s+$/, "");
       if (!chName)
         return { content: [{ type: "text", text: "buzz_create_channel needs a non-empty `name`." }], isError: true };
+      const nameErr = channelNameError(chName);
+      if (nameErr) return { content: [{ type: "text", text: `buzz_create_channel: ${nameErr}` }], isError: true };
       // visibility: open (searchable + self-join) | private (invite-only). Default "open" matches the
       // relay's own default for a kind:9007 lacking a visibility tag. type: stream | forum.
       const vis = (a.visibility == null || a.visibility === "") ? "private" : String(a.visibility).toLowerCase();  // fail-closed default
@@ -1109,7 +1138,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // h-tag = client-chosen channel UUID; name/visibility/channel_type/about/ttl mirror
       // buzz_sdk::build_create_channel so the relay's kind:9007 validator accepts it unchanged.
       const tags = [["h", channelId], ["name", chName], ["visibility", vis], ["channel_type", ct]];
-      if (typeof a.description === "string" && a.description.trim()) tags.push(["about", a.description]);
+      if (typeof a.description === "string" && a.description.trim()) {
+        const aboutErr = channelAboutError(a.description);
+        if (aboutErr) return { content: [{ type: "text", text: `buzz_create_channel: ${aboutErr}` }], isError: true };
+        tags.push(["about", a.description]);
+      }
       if (Number.isFinite(a.ttl) && a.ttl > 0) tags.push(["ttl", String(Math.floor(a.ttl))]);
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation (relay authorizes under ChannelsWrite)
       const ev = await signer.sign({ kind: 9007, tags, content: "" });
@@ -1128,6 +1161,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (a.name != null && String(a.name).trim() !== "") {
         const nn = String(a.name).replace(/^[#\s]+/, "").replace(/\s+$/, "");
         if (!nn) return { content: [{ type: "text", text: "buzz_edit_channel: `name` can't be only '#'/whitespace." }], isError: true };
+        const nameErr = channelNameError(nn);
+        if (nameErr) return { content: [{ type: "text", text: `buzz_edit_channel: ${nameErr}` }], isError: true };
         tags.push(["name", nn]); changed.push(`name → "${nn}"`);
       }
       if (a.visibility != null && a.visibility !== "") {
@@ -1150,7 +1185,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         tags.push(["visibility", v]); changed.push(`visibility → ${v}`);
       }
-      if (typeof a.description === "string") { tags.push(["about", a.description]); changed.push(a.description.trim() ? "description" : "description cleared"); }
+      if (typeof a.description === "string") {
+        if (a.description) {
+          const aboutErr = channelAboutError(a.description);
+          if (aboutErr) return { content: [{ type: "text", text: `buzz_edit_channel: ${aboutErr}` }], isError: true };
+        }
+        tags.push(["about", a.description]); changed.push(a.description.trim() ? "description" : "description cleared");
+      }
       if (a.ttl != null) {
         if (!Number.isFinite(a.ttl) || a.ttl < 0)
           return { content: [{ type: "text", text: "buzz_edit_channel: `ttl` must be a non-negative number of seconds (0 clears it)." }], isError: true };
@@ -1168,24 +1209,42 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!IDENTITY_OK) return modRefuse("joining a channel");
       const q = String(a.channel || "").trim();
       if (!q) return { content: [{ type: "text", text: "buzz_join_channel needs a `channel` (name or id)." }], isError: true };
-      let chId = null, chName = q;
+      // The relay only self-joins OPEN channels (handle_join_request: visibility must be "open";
+      // 39000 metadata marks it "public" vs "private"). When the shim can tell a target is private,
+      // refuse here instead of signing a 9021 the relay bounces — and never silently target a
+      // private channel by name (v0.2.27, per buzz_security's 0.2.26 GO notes).
+      const privateRefusal = (nm) => ({ content: [{ type: "text", text: `buzz_join_channel: #${nm} is private — you can't self-join it. Ask an owner/admin to add you with buzz_add_member.` }], isError: true });
+      let chId = null, chName = q, knownPrivate = false;
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q)) {
         chId = q;   // a channel UUID → join by id (no membership needed to resolve it)
+        // If its 39000 metadata is readable and marks it private, refuse now. If it isn't
+        // readable (e.g. a private channel we're not in), proceed and let the relay be the gate.
+        try {
+          const meta = (await query([{ kinds: [39000], "#d": [chId], limit: 5 }]) || [])[0];
+          if (meta) {
+            const nm = (meta.tags || []).find((x) => x[0] === "name");
+            if (nm && nm[1]) chName = nm[1];
+            if ((meta.tags || []).some((x) => x[0] === "private")) knownPrivate = true;
+          }
+        } catch { /* unknown → relay remains the gate */ }
       } else {
         try { const hit = await resolveChannel(q); chId = hit.id; chName = hit.name; } catch { /* not a member yet — discover below */ }
         if (!chId) {
           // resolveChannel is member-first and can't see an OPEN channel you're not in yet. Discover
-          // by name among the workspace's kind:39000 metadata, preferring an open match.
+          // by name among the workspace's kind:39000 metadata. Only an OPEN match is self-joinable;
+          // if the only name matches are private, refuse — never fall back to a private match.
           const metas = await query([{ kinds: [39000], limit: 500 }]);
           const named = (metas || []).map((e) => {
             const t = Object.fromEntries((e.tags || []).map((x) => [x[0], x[1]]));
             const isPrivate = (e.tags || []).some((x) => x[0] === "private");
             return { id: t.d, name: t.name || "", open: !isPrivate };
           }).filter((c) => c.id && c.name.toLowerCase() === q.toLowerCase());
-          const pick = named.find((c) => c.open) || named[0];
-          if (pick) { chId = pick.id; chName = pick.name; }
+          const open = named.find((c) => c.open);
+          if (open) { chId = open.id; chName = open.name; }
+          else if (named.length > 0) return privateRefusal(named[0].name || q);
         }
       }
+      if (knownPrivate) return privateRefusal(chName);
       if (!chId)
         return { content: [{ type: "text", text: `buzz_join_channel: couldn't find a channel named "${q}". If it's an open channel you're not in, pass its id (UUID) instead — those aren't always discoverable by name.` }], isError: true };
       const tags = [["h", chId]];
