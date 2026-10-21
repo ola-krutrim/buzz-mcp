@@ -19791,7 +19791,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.27";
+var SHIM_VERSION = "0.2.28";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20146,6 +20146,46 @@ async function dmChannels() {
     return { id: t.d, name: t.name || "DM", participants, others: participants.filter((p) => p !== PK) };
   }).filter((c) => c.id);
 }
+async function searchProfiles(term, limit = 50) {
+  const q = String(term || "").trim();
+  if (!q) return [];
+  let evs = [];
+  try {
+    evs = await query([{ kinds: [0], search: q, limit }]) || [];
+  } catch {
+    evs = [];
+  }
+  const out = [];
+  for (const e of evs) {
+    try {
+      const c = JSON.parse(e.content);
+      out.push({ pubkey: e.pubkey, name: c.name || "", display_name: c.display_name || "", nip05: c.nip05 || "" });
+    } catch {
+    }
+  }
+  return out;
+}
+async function resolveRecipientByName(s) {
+  const want = s.trim().toLowerCase();
+  const hits = [...new Set((await searchProfiles(s)).filter(
+    (p) => p.name.trim().toLowerCase() === want || p.display_name.trim().toLowerCase() === want
+  ).map((p) => p.pubkey))];
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) \u2014 use an npub or email`);
+  return null;
+}
+async function resolveRecipientByEmail(s) {
+  const want = s.trim().toLowerCase();
+  let cands = await searchProfiles(s);
+  if (!cands.length) {
+    const local = want.split("@")[0];
+    if (local && local !== want) cands = await searchProfiles(local);
+  }
+  const hits = [...new Set(cands.filter((p) => p.nip05.trim().toLowerCase() === want).map((p) => p.pubkey))];
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) throw new Error(`email "${s}" matches ${hits.length} profiles \u2014 use an npub`);
+  return null;
+}
 async function resolveRecipient(to) {
   const s = String(to || "").trim();
   if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
@@ -20154,11 +20194,14 @@ async function resolveRecipient(to) {
     if (d.type === "npub") return d.data;
     throw new Error(`bad npub: ${s}`);
   }
-  if (s.includes("@")) return await resolveEmail(s);
-  const names = await profiles();
-  const hits = Object.entries(names).filter(([, n]) => String(n).toLowerCase() === s.toLowerCase()).map(([pk]) => pk);
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`"${to}" is ambiguous (${hits.length} people share that name) \u2014 use an npub or email`);
+  if (s.includes("@")) {
+    if (signer.mode === "wire" && typeof signer.ekamToken === "function") return await resolveEmail(s);
+    const pk2 = await resolveRecipientByEmail(s);
+    if (pk2) return pk2;
+    throw new Error(`can't resolve email "${s}" \u2014 agent mode has no Ekam directory, and no visible profile lists it as nip05. Pass an npub or hex pubkey.`);
+  }
+  const pk = await resolveRecipientByName(s);
+  if (pk) return pk;
   throw new Error(`can't resolve recipient "${to}" \u2014 pass an npub, hex pubkey, email, or exact display name`);
 }
 async function resolveEmail(email2) {

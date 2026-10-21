@@ -263,11 +263,18 @@ Four DM tools, working as you in wire mode (and as the agent in local mode):
 - **`buzz_dm_open`** — open (or find) a 1:1 and return its channel id.
 - **`buzz_dm_send`** — send a DM; opens the 1:1 first if needed.
 
-Address a person with `to` = **npub / hex pubkey / exact display-name**, or their
-**email** — email resolves via Ekam's directory to the person's canonical live pubkey.
-If a recipient has no Ekam identity yet (device-key user), email resolution returns a
-clear "use npub/name instead" rather than mis-addressing. DMs are membership-gated
-plaintext (kind:9) — the shim never encrypts/decrypts; the relay enforces who can read.
+Address a person with `to` = **npub / hex pubkey / exact display-name**, or their **email**.
+
+- **By name** (v0.2.28): resolved via the relay's profile search, so an older profile isn't missed
+  the way the previous newest-200 scan missed it — and matched against **both** the profile's `name`
+  and `display_name`, since a client may show one while the other differs. Resolution is
+  **fail-closed**: an exact match on exactly one person, or a clear error (ambiguous names, or none,
+  ask for an npub) — it never silently picks one.
+- **By email**: in wire mode, via Ekam's directory to the person's canonical live pubkey; in agent
+  mode (no Ekam directory), it falls back to matching the address against a visible profile's
+  `nip05` locally — again fail-closed, or a clear "use an npub" otherwise.
+
+DMs are membership-gated plaintext (kind:9) — the shim never encrypts/decrypts; the relay enforces who can read.
 
 ## Security
 
