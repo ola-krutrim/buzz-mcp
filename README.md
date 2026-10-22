@@ -265,14 +265,16 @@ Four DM tools, working as you in wire mode (and as the agent in local mode):
 
 Address a person with `to` = **npub / hex pubkey / exact display-name**, or their **email**.
 
-- **By name** (v0.2.28): resolved via the relay's profile search, so an older profile isn't missed
-  the way the previous newest-200 scan missed it — and matched against **both** the profile's `name`
-  and `display_name`, since a client may show one while the other differs. Resolution is
-  **fail-closed**: an exact match on exactly one person, or a clear error (ambiguous names, or none,
-  ask for an npub) — it never silently picks one.
-- **By email**: in wire mode, via Ekam's directory to the person's canonical live pubkey; in agent
-  mode (no Ekam directory), it falls back to matching the address against a visible profile's
-  `nip05` locally — again fail-closed, or a clear "use an npub" otherwise.
+- **By name**: resolved via the relay's profile search, so an older profile isn't missed the way the
+  previous newest-200 scan missed it — and matched against **both** the profile's `name` and
+  `display_name`, since a client may show one while the other differs. Both sides are **normalized**
+  (NFC, with bidi-override and zero-width characters stripped) so an invisible-character lookalike
+  can't slip past the compare. Resolution is **fail-closed**: an exact match on exactly one person,
+  or a clear error (ambiguous names — including a lookalike that collides — or none, ask for an npub)
+  — it never silently picks one.
+- **By email**: **wire mode only**, via Ekam's directory to the person's canonical live pubkey. In
+  agent mode email is **refused** (use an npub or display name): a profile's `nip05` is self-asserted,
+  so trusting it would let anyone claim a colleague's address and receive their DMs/moderation.
 
 DMs are membership-gated plaintext (kind:9) — the shim never encrypts/decrypts; the relay enforces who can read.
 

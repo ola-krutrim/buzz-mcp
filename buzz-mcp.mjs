@@ -142,7 +142,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.28";
+const SHIM_VERSION = "0.2.29";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -610,43 +610,40 @@ async function searchProfiles(term, limit = 50) {
   }
   return out;
 }
-// Exact (trimmed, case-insensitive) name match against BOTH profile name fields — a client may
-// show `display_name` while the profile's `name` differs (or vice versa), e.g. "Anirban Das" vs
-// "Anirban D Das", so matching one field alone silently misses. FAIL-CLOSED: >1 distinct pubkey
-// is ambiguous and refused (never auto-pick a DM/moderation target); 0 returns null → caller throws.
+// Invisible / direction-manipulating characters used to forge lookalike names: bidi overrides
+// (U+202A–202E, U+2066–2069) and zero-width chars (U+200B–200D, U+2060, U+FEFF). Rejected outright
+// in a channel name (channelNameError), and stripped before name matching so a bidi/zero-width
+// lookalike can't slip past an exact compare (buzz_security #12 note a / #13 note b).
+const NAME_INVIS = /[‪-‮⁦-⁩​-‍⁠﻿]/;
+const NAME_INVIS_G = new RegExp(NAME_INVIS.source, "g");
+const normName = (s) => String(s).normalize("NFC").replace(NAME_INVIS_G, "").trim().toLowerCase();
+// Match against BOTH profile name fields — a client may show `display_name` while the profile's
+// `name` differs (or vice versa), e.g. "Anirban Das" vs "Anirban D Das", so matching one field
+// alone silently misses. Both sides are normalized (NFC + invisible chars stripped) so a
+// bidi/zero-width lookalike can't evade the compare. FAIL-CLOSED: >1 distinct pubkey is ambiguous
+// and refused (never auto-pick a DM/moderation target); 0 returns null → caller throws.
 async function resolveRecipientByName(s) {
-  const want = s.trim().toLowerCase();
+  const want = normName(s);
+  if (!want) return null;
   const hits = [...new Set((await searchProfiles(s)).filter((p) =>
-    p.name.trim().toLowerCase() === want || p.display_name.trim().toLowerCase() === want
+    normName(p.name) === want || normName(p.display_name) === want
   ).map((p) => p.pubkey))];
   if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) — use an npub or email`);
+  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) — use an npub`);
   return null;
 }
-// Agent-mode email fallback: match the email against the `nip05` on a searchable profile, with NO
-// Ekam call (resolveEmail's directory resolver is wire-mode only). Best-effort — searches the full
-// address, then the local-part if that finds nothing — and FAIL-CLOSED on ambiguity.
-async function resolveRecipientByEmail(s) {
-  const want = s.trim().toLowerCase();
-  let cands = await searchProfiles(s);
-  if (!cands.length) { const local = want.split("@")[0]; if (local && local !== want) cands = await searchProfiles(local); }
-  const hits = [...new Set(cands.filter((p) => p.nip05.trim().toLowerCase() === want).map((p) => p.pubkey))];
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`email "${s}" matches ${hits.length} profiles — use an npub`);
-  return null;
-}
-// Resolve a recipient token → pubkey hex. npub / hex are exact. An email uses Ekam's directory
-// resolver in wire mode (authoritative), else the local nip05 fallback above. A name is resolved
-// by server-side profile search (not the 200-newest cap), exact on both name fields, fail-closed.
+// Resolve a recipient token → pubkey hex. npub / hex are exact. An email resolves ONLY via Ekam's
+// directory in wire mode (authoritative): agent mode has no trustworthy email→pubkey source — the
+// former kind:0 `nip05` fallback was self-asserted, so anyone could claim a colleague's address and
+// receive their DMs/moderation (buzz_security #1492) — so it is refused. A name is resolved by
+// server-side profile search (not the 200-newest cap), on both name fields, normalized, fail-closed.
 async function resolveRecipient(to) {
   const s = String(to || "").trim();
   if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
   if (s.startsWith("npub")) { const d = nip19.decode(s); if (d.type === "npub") return d.data; throw new Error(`bad npub: ${s}`); }
   if (s.includes("@")) {
     if (signer.mode === "wire" && typeof signer.ekamToken === "function") return await resolveEmail(s);
-    const pk = await resolveRecipientByEmail(s);
-    if (pk) return pk;
-    throw new Error(`can't resolve email "${s}" — agent mode has no Ekam directory, and no visible profile lists it as nip05. Pass an npub or hex pubkey.`);
+    throw new Error(`email addressing needs wire mode ("post as me") — in agent mode, use an npub, hex pubkey, or exact display name instead`);
   }
   const pk = await resolveRecipientByName(s);
   if (pk) return pk;
@@ -750,6 +747,8 @@ function channelNameError(name) {
     return `channel name is too long (${cpLen(name)} chars; max ${CHANNEL_NAME_MAX}).`;
   if (CTRL_ANY.test(name))
     return "channel name can't contain control characters or line breaks.";
+  if (NAME_INVIS.test(name))
+    return "channel name can't contain bidirectional-override or zero-width characters.";
   return null;
 }
 function channelAboutError(about) {

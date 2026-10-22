@@ -19791,7 +19791,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.28";
+var SHIM_VERSION = "0.2.29";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20165,25 +20165,17 @@ async function searchProfiles(term, limit = 50) {
   }
   return out;
 }
+var NAME_INVIS = /[‪-‮⁦-⁩​-‍⁠﻿]/;
+var NAME_INVIS_G = new RegExp(NAME_INVIS.source, "g");
+var normName = (s) => String(s).normalize("NFC").replace(NAME_INVIS_G, "").trim().toLowerCase();
 async function resolveRecipientByName(s) {
-  const want = s.trim().toLowerCase();
+  const want = normName(s);
+  if (!want) return null;
   const hits = [...new Set((await searchProfiles(s)).filter(
-    (p) => p.name.trim().toLowerCase() === want || p.display_name.trim().toLowerCase() === want
+    (p) => normName(p.name) === want || normName(p.display_name) === want
   ).map((p) => p.pubkey))];
   if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) \u2014 use an npub or email`);
-  return null;
-}
-async function resolveRecipientByEmail(s) {
-  const want = s.trim().toLowerCase();
-  let cands = await searchProfiles(s);
-  if (!cands.length) {
-    const local = want.split("@")[0];
-    if (local && local !== want) cands = await searchProfiles(local);
-  }
-  const hits = [...new Set(cands.filter((p) => p.nip05.trim().toLowerCase() === want).map((p) => p.pubkey))];
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`email "${s}" matches ${hits.length} profiles \u2014 use an npub`);
+  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) \u2014 use an npub`);
   return null;
 }
 async function resolveRecipient(to) {
@@ -20196,9 +20188,7 @@ async function resolveRecipient(to) {
   }
   if (s.includes("@")) {
     if (signer.mode === "wire" && typeof signer.ekamToken === "function") return await resolveEmail(s);
-    const pk2 = await resolveRecipientByEmail(s);
-    if (pk2) return pk2;
-    throw new Error(`can't resolve email "${s}" \u2014 agent mode has no Ekam directory, and no visible profile lists it as nip05. Pass an npub or hex pubkey.`);
+    throw new Error(`email addressing needs wire mode ("post as me") \u2014 in agent mode, use an npub, hex pubkey, or exact display name instead`);
   }
   const pk = await resolveRecipientByName(s);
   if (pk) return pk;
@@ -20293,6 +20283,8 @@ function channelNameError(name) {
     return `channel name is too long (${cpLen(name)} chars; max ${CHANNEL_NAME_MAX}).`;
   if (CTRL_ANY.test(name))
     return "channel name can't contain control characters or line breaks.";
+  if (NAME_INVIS.test(name))
+    return "channel name can't contain bidirectional-override or zero-width characters.";
   return null;
 }
 function channelAboutError(about) {
