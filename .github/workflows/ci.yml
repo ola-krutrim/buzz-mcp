@@ -1,0 +1,42 @@
+# CI for buzz-mcp (v0.2.30): test, rebuild the bundle, and prove dist/ is reproducible —
+# i.e. the committed dist/buzz-mcp.mjs (and dist/wirelogin.mjs) are exactly
+# esbuild(<reviewed source> + package-lock.json), byte for byte (dist/SHA256SUMS).
+# Third-party actions are pinned by full commit SHA (tag in the trailing comment).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-verify-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - name: npm ci
+        run: npm ci
+      - name: npm test
+        run: npm test
+      - name: confusables table matches its pinned source
+        run: |
+          curl -fsSL https://www.unicode.org/Public/security/16.0.0/confusables.txt -o "$RUNNER_TEMP/confusables.txt"
+          node scripts/gen-confusables.mjs --check "$RUNNER_TEMP/confusables.txt"
+      - name: rebuild dist
+        run: npm run build
+      - name: dist matches the committed dist/SHA256SUMS
+        run: |
+          sha256sum dist/buzz-mcp.mjs dist/wirelogin.mjs
+          if ! sha256sum -c dist/SHA256SUMS; then
+            echo "::error::rebuilt dist/ differs from dist/SHA256SUMS — commit the rebuilt bundle and its hash"
+            exit 1
+          fi
+          git diff --exit-code -- dist/
