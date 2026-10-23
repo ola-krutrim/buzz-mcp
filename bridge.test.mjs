@@ -771,7 +771,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.31'");
+    ok(/@ola\/buzz-mcp v0\.2\.31/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.31'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -788,7 +788,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.31'");
+    ok(/@ola\/buzz-mcp v0\.2\.31/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.31'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
