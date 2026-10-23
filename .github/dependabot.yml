@@ -1,0 +1,17 @@
+# v0.2.31: weekly dependency + pinned-action updates. dist/ is a bundle of the lockfile's deps,
+# so an npm bump PR must also rebuild dist/ and dist/SHA256SUMS (CI fails it otherwise).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

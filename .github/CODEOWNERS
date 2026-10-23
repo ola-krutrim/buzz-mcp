@@ -1,0 +1,8 @@
+# Security-sensitive paths need the owner's review (v0.2.31). Everything that decides what gets
+# signed, which key is loaded, or what code users actually run.
+/dist/              @navenduagarwal
+/signer.mjs         @navenduagarwal
+/loadkey_v2.mjs     @navenduagarwal
+/safety.mjs         @navenduagarwal
+/install.sh         @navenduagarwal
+/.github/           @navenduagarwal
