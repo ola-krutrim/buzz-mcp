@@ -403,6 +403,7 @@ export async function resolveSigner(opts = {}) {
       mode: "wire",
       pubkey,
       canSign: (kind) => WIRE_ALLOWLIST.has(kind),
+      wipe() { /* wire mode holds no key */ },
       // Expose a valid wire:sign access token for authed Ekam reads (e.g. the
       // email→pubkey directory resolve) — same WHO-gate as signing, no new credential.
       ekamToken: () => tokens.get(false),
@@ -427,11 +428,17 @@ export async function resolveSigner(opts = {}) {
   // local (default): resolve a key and sign in-process — existing behavior, intact.
   const sk = await resolveKey(opts);
   const pubkey = getPublicKey(sk);
+  let wiped = false;
   return {
     mode: "local",
     pubkey,
     canSign: () => true,
+    // v0.2.31 (item 8): zero the in-memory secret key on shutdown. After wipe() the signer refuses
+    // rather than signing with an all-zero key. (Best effort: JS strings the key passed through as
+    // hex cannot be wiped; the Uint8Array the signer holds can.)
+    wipe() { wiped = true; sk.fill(0); },
     async sign(template) {
+      if (wiped) throw new Error("signer: key already wiped (shutting down)");
       return finalizeEvent(
         { kind: template.kind, created_at: template.created_at ?? now(), tags: template.tags || [], content: template.content ?? "" },
         sk,

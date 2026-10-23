@@ -34,6 +34,10 @@ import { statSync } from "node:fs";
 import { getPublicKey, finalizeEvent } from "nostr-tools/pure";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// v0.2.31 (item 12): the shim drops inbound events that fail verifyEvent. These fixtures are unsigned
+// canned events, so run the suite in "flag" mode (kept, marked ⚠unverified-signature). Drop mode is
+// covered by v031.test.mjs with properly signed fixtures.
+process.env.BUZZ_VERIFY_INBOUND = "flag";
 const SHIM = join(HERE, "buzz-mcp.mjs");
 
 let pass = 0, fail = 0, skip = 0;
@@ -327,8 +331,8 @@ console.log("\ncase 6: buzz_unread returns a digest shape (mock relay)");
 // ---- Case 7 (v0.2.16): buzz_login + buzz_doctor registered and the tool count is now 27 -------
 // Static: tools/list is answered from the in-process TOOLS array — no network, no OAuth. Agent
 // mode boots cleanly offline; the black-hole relay is never dialed for tools/list.
-// (Count: 24 through v0.2.24; 27 at v0.2.25 with buzz_create_channel + buzz_edit_channel + buzz_join_channel.)
-console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 27 (static, no OAuth)");
+// (Count: 24 through v0.2.24; 27 at v0.2.25 with buzz_create_channel + buzz_edit_channel + buzz_join_channel; 38 at v0.2.31 with the 11 Slack-parity tools.)
+console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 38 (static, no OAuth)");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -343,7 +347,7 @@ console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 27 (s
     ok(names.includes("buzz_create_channel"), "buzz_create_channel is registered in tools/list");
     ok(names.includes("buzz_edit_channel"), "buzz_edit_channel is registered in tools/list");
     ok(names.includes("buzz_join_channel"), "buzz_join_channel is registered in tools/list");
-    ok(names.length === 27, `total tool count is 27 (got ${names.length})`);
+    ok(names.length === 38, `total tool count is 38 (got ${names.length})`);
   }
 }
 
@@ -738,7 +742,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.30), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.31), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -749,7 +753,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.30", `serverInfo.version === '0.2.30' (got '${si.version}')`);
+    ok(si.version === "0.2.31", `serverInfo.version === '0.2.31' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -767,7 +771,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.30'");
+    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.31'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -784,7 +788,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.30'");
+    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.31'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }

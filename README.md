@@ -145,16 +145,27 @@ agent in local mode).
 | `buzz_read`     | read recent messages in a channel |
 | `buzz_search`   | full-text search recent messages across your channels (NIP-50; optional `channel` to scope) |
 | `buzz_channel_members` | list a channel's members (display name + owner/member role) |
-| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file path) |
+| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file or folder path, secret paths refused) |
+| `buzz_edit_message` | edit one of your own messages (kind 40003) |
+| `buzz_thread_read` | read a whole thread (root + replies) from any message in it |
 | `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
 | `buzz_react`    | react to a message with an emoji (NIP-25 kind 7) |
+| `buzz_unreact`  | remove your reaction (kind 5) |
+| `buzz_reactions` | list a message's reactions grouped by emoji |
+| `buzz_channel_topic` | set/clear a channel's topic and purpose (kind 9002) |
+| `buzz_leave_channel` | leave a channel (kind 9022) |
+| `buzz_archive_channel` | archive / unarchive a channel (kind 9002 `archived`; archive needs `confirm: true`) |
+| `buzz_delete_channel` | delete a channel (kind 9008; owner only; always `confirm: true`) |
+| `buzz_profile` | look up a person's profile by npub / pubkey / email / exact name |
 | `buzz_add_member` | add a person to a channel (NIP-29 kind 9000) — where your own role permits |
 | `buzz_remove_member` | remove a person from a channel (NIP-29 kind 9001) — owner/admin only |
 | `buzz_delete`   | delete a message in a channel (NIP-29 kind 9005) — owner/admin only |
 | `buzz_dm_list`  | your DM conversations |
 | `buzz_dm_read`  | read a DM (by `to` person or `channel` id) |
-| `buzz_dm_open`  | open/find a 1:1 and return its channel id |
-| `buzz_dm_send`  | send a DM (opens the 1:1 first if needed) |
+| `buzz_dm_open`  | open/find a 1:1 or group DM (`to` = one person or up to 8) and return its channel id |
+| `buzz_dm_send`  | send a DM (opens the conversation first if needed) |
+| `buzz_dm_add`   | add a person to a DM you're in (kind 41011) |
+| `buzz_dm_hide`  | hide a DM from your list (kind 41012) |
 
 **Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
 `[time] name <id> 📎file: text`, where `<id>` is the message's short (8-char) event id and
@@ -331,6 +342,41 @@ source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` sheban
 in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)
 
 ## Changelog
+
+### v0.2.31
+- **New tools (Slack parity, 38 total).** `buzz_edit_message` (kind 40003, your own messages; reads
+  show the newest edit by the same author, marked `(edited)`), `buzz_thread_read`,
+  `buzz_channel_topic` (topic / purpose, kind 9002), `buzz_leave_channel` (9022),
+  `buzz_archive_channel` (9002 `archived`), `buzz_delete_channel` (9008, always `confirm: true`),
+  `buzz_profile` (by npub / hex / email / exact name), `buzz_unreact` (kind 5, one `e` = your reaction),
+  `buzz_reactions`, `buzz_dm_add` (41011), `buzz_dm_hide` (41012). Group DMs: `buzz_dm_open` /
+  `buzz_dm_send` take `to` as a string or an array of up to 8.
+  In wire ("post as me") mode, kinds 40003 / 9022 / 9008 / 5 / 41012 are refused locally as
+  *blocked on Ekam wire-sign allowlist* until Ekam adds them.
+- **Attachments.** Any file type, or a folder (its top-level regular files, ≤10; hidden files are skipped).
+  Paths are realpath'd, and secret locations (`~/.buzz`, `~/.ssh`, `~/.gnupg`, `~/.aws`, gcloud,
+  `*.key`, `*.pem`, `id_*`, `.env*`, `*.authtag`) are refused even through a symlink. The result shows the resolved path.
+- **Downloads.** `buzz_attachment_read` streams to a private 0700 dir, writing 0600 files opened with
+  `O_EXCL|O_NOFOLLOW`. It never overwrites and is size-capped (`BUZZ_DOWNLOAD_MAX_MB`, default 200).
+- **Untrusted output.** Every read starts with an "untrusted data" note. Message text is escaped
+  (newlines, control and bidi characters). Authors are shown as `name (pk8)`, with `⚠name-collision`
+  when two people share a name, and the newest kind:0 wins. Inbound events are
+  signature-verified (messages, edits, reactions, profiles): bad ones are dropped by default (`BUZZ_VERIFY_INBOUND=flag` keeps and flags them),
+  and timestamps more than 5 minutes in the future are flagged.
+- **Write safety.** A per-session throttle (`BUZZ_WRITE_PER_MIN`, default 10, 0 = off) plus duplicate
+  suppression for an identical message or reaction within 2 minutes. The @mention index uses the
+  v0.2.30 normalization, and an ambiguous @mention tags nobody (reported). In wire mode, the first
+  9001 / 9005 / 9002 of a session needs `confirm: true`.
+- **MCP hygiene.** Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint` /
+  `openWorldHint` / title), `additionalProperties: false`, and bounded `limit` / text arguments,
+  validated at call time. Client cancellation (`extra.signal`), hard timeouts
+  (`BUZZ_RELAYINFO_TIMEOUT_S`, `BUZZ_TRANSFER_TIMEOUT_S`) and progress notifications cover uploads and downloads.
+- **Key hygiene.** Key env vars are removed from `process.env` after boot, child processes get a
+  minimal env, and the local signer's key buffer is zeroed on exit. The browser opens without
+  `cmd.exe` on Windows, and https only.
+- **Repo.** `CODEOWNERS`, Dependabot (npm + actions), `SECURITY.md`, and a tag-triggered release
+  workflow (sha256 + `actions/attest-build-provenance`). `install.sh` now installs the latest release
+  tag by default and verifies sha256 before installing.
 
 ### v0.2.30
 - **Lookalike-proof names.** Invisible-character handling uses Unicode properties
