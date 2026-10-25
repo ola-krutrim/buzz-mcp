@@ -22,13 +22,20 @@ export const CASE_ONLY_IS_AMBIGUOUS = true;
 // fillers, U+17B4/17B5, U+180B–180F, ZWSP/ZWNJ/ZWJ U+200B–200D, U+2060–206F, variation selectors
 // U+FE00–FE0F & U+E0100–E01EF, BOM/ZWNBSP U+FEFF, tag characters U+E0000–E0FFF, …
 // U+00AD is DICP already; listed explicitly so the intent survives a property-table change.
-export const NAME_INVIS = /[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
+// v0.2.31 fix (buzz_security release review §3.4): ONE definition shared by names (NAME_INVIS) and
+// message content (safety.mjs escapeContent). It adds \p{Cf} (format controls, e.g. U+2061–2064
+// invisible operators, U+0600–0605, U+FFF9–FFFB) and spells out the tag block U+E0000–E007F (the
+// "ASCII smuggling" prompt-injection vector) for the same reason U+00AD is spelled out.
+export const INVISIBLE_CLASS = String.raw`\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD\u2061-\u2064\u{E0000}-\u{E007F}`;
+export const INVISIBLE = new RegExp(`[${INVISIBLE_CLASS}]`, "u");
+export const INVISIBLE_G = new RegExp(`[${INVISIBLE_CLASS}]`, "gu");
+export const NAME_INVIS = INVISIBLE;
 export const NAME_INVIS_G = new RegExp(NAME_INVIS.source, "gu");
 export const BIDI_CONTROL = /\p{Bidi_Control}/u;
 export const VARIATION_SELECTOR_G = /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
 // What a channel NAME may not contain: every Bidi_Control and every default-ignorable EXCEPT
 // variation selectors (those are stripped by canonicalizeChannelName so "Pulse ❤️" still works).
-export const CHANNEL_NAME_FORBIDDEN = /(?![\uFE00-\uFE0F\u{E0100}-\u{E01EF}])[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
+export const CHANNEL_NAME_FORBIDDEN = new RegExp(`(?![\\uFE00-\\uFE0F\\u{E0100}-\\u{E01EF}])[${INVISIBLE_CLASS}]`, "u");
 
 export const stripInvisible = (s) => String(s ?? "").replace(NAME_INVIS_G, "");
 export const stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_SELECTOR_G, "");
@@ -250,12 +257,15 @@ export function matchChannel(input, channels) {
     if (!prev || t < prev.tier) best.set(c.id, { tier: t, c });
   }
   const ranked = [...best.values()].sort((a, b) => a.tier - b.tier);
-  const shown = (r) => `${JSON.stringify(stripInvisible(r.c.name))} id ${r.c.id}${r.tier === 2 ? " (lookalike)" : ""}`;
+  // Every echoed string is relay/user-controlled: JSON-quote (escapes newlines/quotes) after
+  // removing invisibles, and cap, so the error can't forge lines or hide text.
+  const safe = (x, n = 64) => JSON.stringify(stripInvisible(String(x ?? "")).slice(0, n));
+  const shown = (r) => `${safe(r.c.name)} id ${safe(r.c.id, 80)}${r.tier === 2 ? " (lookalike)" : ""}`;
   if (ranked.length > 1)
-    throw new Error(`channel "${q}" is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) — pass the channel id instead`);
+    throw new Error(`channel ${safe(q)} is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) — pass the channel id instead`);
   if (ranked.length === 1) {
     if (ranked[0].tier === 0) return ranked[0].c;
-    throw new Error(`channel "${q}" is ambiguous / lookalike — the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
+    throw new Error(`channel ${safe(q)} is ambiguous / lookalike — the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
   }
   return null;
 }

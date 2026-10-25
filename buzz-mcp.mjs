@@ -5,13 +5,14 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR } from "./signer.mjs";
+import { IDENTITY_DIR } from "./loadkey_v2.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
 import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel } from "./names.mjs";
 import { verifyEvent } from "nostr-tools/pure";
 // v0.2.31 best-practice guards (each unit-tested in safety.test.mjs).
 import {
-  UNTRUSTED_NOTE, escapeContent, escapeName, buildProfileIndex, whoLabel, resolveAttachment,
+  UNTRUSTED_NOTE, escapeContent, escapeName, buildProfileIndex, whoLabel, resolveAttachment, openCheckedAttachment,
   createConfirmGate, privateDownloadDir, openExclusive, downloadLeaf, downloadCap,
   createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
   openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
@@ -136,7 +137,8 @@ if (PICKER_OWNER_TAG_MALFORMED)
   process.stderr.write(`[buzz-mcp] ⚠ BUZZ_PICKER_OWNER_TAG is set but is not a valid ["picker-owner",owner,conditions,sig] JSON array — the discovery attestation will be OMITTED from your kind:10100 card (same bash quote-strip cause; single-quote the value).\n`);
 // v0.2.31 (item 8): everything that needs a key/credential env var has now read it (signer from
 // BOOT_ENV, the two NIP-OA tags above, keyProvenance below from KEY_ENV_PIN) → scrub them.
-const KEY_ENV_PIN = (BOOT_ENV.BUZZ_PRIVATE_KEY || BOOT_ENV.BUZZ_IDENTITY_KEY || "").trim().toLowerCase();
+// boolean only (review nice-to-have): keep no second copy of the key string around for the session.
+const KEY_ENV_PIN = !!(BOOT_ENV.BUZZ_PRIVATE_KEY || BOOT_ENV.BUZZ_IDENTITY_KEY || "").trim();
 const SCRUBBED_ENV = scrubKeyEnv(process.env);
 // Zero the local key buffer on the way out (wire mode holds no key). Best effort.
 process.once("exit", () => { try { signer.wipe?.(); } catch {} });
@@ -525,14 +527,19 @@ const DOWNLOAD_CHUNK = 16 * MB; // relay caps a single 206 range at 16 MiB → l
 
 // Upload a local file → NIP-92 descriptor {url, sha256, size, mime, filename}. Streamed hash + PUT body.
 // v0.2.31 (item 6): whole-transfer timeout (BUZZ_TRANSFER_TIMEOUT_S), client cancel, progress.
-async function blossomUpload(filePath) {
-  let st; try { st = statSync(filePath); } catch { throw new Error(`attachment not found: ${filePath}`); }
-  if (!st.isFile()) throw new Error(`attachment is not a file: ${filePath}`);
-  const { mime } = mediaCapCheck(basename(filePath), st.size); // per-type cap; throws a distinguishable local refusal if over
-  const sha = await sha256File(filePath);
-  throwIfCancelled();
+// v0.2.31 fix (review §3.8): the bytes come from ONE fd opened O_NOFOLLOW and proven to be the
+// same dev:ino that resolveAttachment checked against the secret-path denylist (no check/use swap).
+async function blossomUpload(filePath, expectId) {
+  const { fd, size } = openCheckedAttachment(filePath, expectId);
+  const st = { size };
+  let src, mime, sha;
+  try {
+    ({ mime } = mediaCapCheck(basename(filePath), st.size)); // per-type cap; throws a distinguishable local refusal if over
+    sha = await new Promise((res, rej) => { const h = createHash("sha256"); const r = createReadStream(null, { fd, start: 0, autoClose: false }); r.on("error", rej); r.on("data", (c) => h.update(c)); r.on("end", () => res(h.digest("hex"))); });
+    throwIfCancelled();
+    src = createReadStream(null, { fd, start: 0, autoClose: true });
+  } catch (e) { try { closeSync(fd); } catch {} throw e; }
   let sent = 0, lastPct = -1;
-  const src = createReadStream(filePath);
   src.on("data", (c) => { sent += c.length; const pct = st.size ? Math.floor((sent * 20) / st.size) : 20; if (pct !== lastPct) { lastPct = pct; progress(sent, st.size, `uploading ${basename(filePath)}`); } });
   const res = await fetch(`${RELAY}/upload`, {
     method: "PUT",
@@ -725,7 +732,7 @@ async function resolveChannel(nameOrId) {
   const cs = await channels();
   let hit;
   try { hit = matchChannel(nameOrId, cs); } catch (e) { throw new ChannelAmbiguousError(e.message); }
-  if (!hit) throw new Error(`channel not found: ${nameOrId}. Available: ${cs.map((c) => c.name).join(", ")}`);
+  if (!hit) throw new Error(`channel not found: ${escapeName(nameOrId)}. Available: ${cs.map((c) => escapeName(c.name)).join(", ")}`);
   return hit;
 }
 
@@ -1007,12 +1014,13 @@ const CONFIRM = createConfirmGate();
 const gate = (kind, a, label) => CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: a && a.confirm, label });
 const wireBlocked = (kind, tool) => (signer.canSign(kind) ? null
   : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist — it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`);
-// Upload a file OR every regular file in a folder (item 1). Paths are realpath'd; secret locations
-// (~/.ssh, ~/.buzz, .env, *.pem, keychains …) are refused even through a symlink.
+// Upload a file OR every regular file in a folder (item 1). ANY file type / folder is allowed; only
+// secret locations are refused — checked on the typed path AND the realpath (symlinks followed), incl.
+// this shim's own key store (IDENTITY_DIR), wire-refresh tokens and ~/.config/buzz-cli (safety.mjs).
 async function uploadAttachments(input) {
-  const r = resolveAttachment(String(input));
+  const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR, IDENTITY_DIR, WIRE_REFRESH_DIR] });
   const ups = [];
-  for (const f of r.files) { throwIfCancelled(); ups.push(await blossomUpload(f)); }
+  for (const f of r.files) { throwIfCancelled(); ups.push(await blossomUpload(f, r.ids && r.ids[f])); }
   return { r, ups };
 }
 function attachedLabel(att) {
@@ -1064,7 +1072,7 @@ async function parityTool(name, a, { ok, fail }) {
     if (hit.pubkey !== PK) return fail(`buzz_edit_message: <${String(hit.id).slice(0, 8)}> isn't yours — you can only edit your own messages.`);
     if (hit.kind !== 9) return fail("buzz_edit_message: only chat messages (kind 9) can be edited.");
     await publish(40003, [["h", ch.id], ["e", hit.id]], text);
-    return ok(`edited your message <${String(hit.id).slice(0, 8)}> in #${ch.name}: ${text}`);
+    return ok(`edited your message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)}: ${text}`);
   }
 
   if (name === "buzz_thread_read") {
@@ -1079,7 +1087,7 @@ async function parityTool(name, a, { ok, fail }) {
     const scr = screen(all);
     const edits = await latestEdits(ch.id, scr.events);
     const rows = scr.events.sort((x, y) => x.created_at - y.created_at).map((e) => (e.id === rootId ? "▶ " : "  ↳ ") + renderMsg(e, { edits, flagOf: scr.flagOf }));
-    return ok(`thread <${rootId.slice(0, 8)}> in #${ch.name} (${rows.length} msgs${root ? "" : "; root not readable"}):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n${rows.join("\n") || "(empty)"}`);
+    return ok(`thread <${rootId.slice(0, 8)}> in #${escapeName(ch.name)} (${rows.length} msgs${root ? "" : "; root not readable"}):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n${rows.join("\n") || "(empty)"}`);
   }
 
   if (name === "buzz_channel_topic") {
@@ -1093,9 +1101,9 @@ async function parityTool(name, a, { ok, fail }) {
       tags.push([k, v]); changed.push(v ? `${k} set` : `${k} cleared`);
     }
     if (!changed.length) return fail("buzz_channel_topic: pass `topic` and/or `purpose` (empty string clears).");
-    { const gg = gate(9002, a, `set the ${changed.join(" + ")} on #${ch.name}`); if (gg) return fail(gg); }
+    { const gg = gate(9002, a, `set the ${changed.join(" + ")} on #${escapeName(ch.name)}`); if (gg) return fail(gg); }
     await publish(9002, tags);
-    return ok(`#${ch.name}: ${changed.join(", ")}. (Applied only if the relay confirms your owner/admin role.)`);
+    return ok(`#${escapeName(ch.name)}: ${changed.join(", ")}. (Applied only if the relay confirms your owner/admin role.)`);
   }
 
   if (name === "buzz_leave_channel") {
@@ -1103,26 +1111,26 @@ async function parityTool(name, a, { ok, fail }) {
     const wb = wireBlocked(9022, name); if (wb) return fail(wb);
     const ch = await resolveChannel(a.channel);
     await publish(9022, [["h", ch.id]]);
-    return ok(`left #${ch.name}. Rejoin an open channel with buzz_join_channel; a private one needs an owner/admin to re-add you.`);
+    return ok(`left #${escapeName(ch.name)}. Rejoin an open channel with buzz_join_channel; a private one needs an owner/admin to re-add you.`);
   }
 
   if (name === "buzz_archive_channel") {
     const g = guard("archiving a channel"); if (g) return g;
     const ch = await resolveChannel(a.channel);
     const archive = a.archived !== false;
-    if (archive && a.confirm !== true) return fail(`buzz_archive_channel: archiving #${ch.name} makes it read-only for everyone. Re-run with confirm: true to proceed.`);
-    { const gg = gate(9002, a, `${archive ? "archive" : "unarchive"} #${ch.name}`); if (gg) return fail(gg); }
+    if (archive && a.confirm !== true) return fail(`buzz_archive_channel: archiving #${escapeName(ch.name)} makes it read-only for everyone. Re-run with confirm: true to proceed.`);
+    { const gg = gate(9002, a, `${archive ? "archive" : "unarchive"} #${escapeName(ch.name)}`); if (gg) return fail(gg); }
     await publish(9002, [["h", ch.id], ["archived", archive ? "true" : "false"]]);
-    return ok(`${archive ? "archived" : "unarchived"} #${ch.name}. (Applied only if the relay confirms your owner/admin role.)`);
+    return ok(`${archive ? "archived" : "unarchived"} #${escapeName(ch.name)}. (Applied only if the relay confirms your owner/admin role.)`);
   }
 
   if (name === "buzz_delete_channel") {
     const g = guard("deleting a channel"); if (g) return g;
     const wb = wireBlocked(9008, name); if (wb) return fail(wb);
     const ch = await resolveChannel(a.channel);
-    if (a.confirm !== true) return fail(`buzz_delete_channel: deleting #${ch.name} [${ch.id}] is permanent for every member. Re-run with confirm: true to proceed.`);
+    if (a.confirm !== true) return fail(`buzz_delete_channel: deleting #${escapeName(ch.name)} [${ch.id}] is permanent for every member. Re-run with confirm: true to proceed.`);
     await publish(9008, [["h", ch.id]]);
-    return ok(`deleted #${ch.name} [${ch.id}]. (Allowed only if the relay confirms you own it.)`);
+    return ok(`deleted #${escapeName(ch.name)} [${ch.id}]. (Allowed only if the relay confirms you own it.)`);
   }
 
   if (name === "buzz_profile") {
@@ -1149,10 +1157,10 @@ async function parityTool(name, a, { ok, fail }) {
     const want = a.emoji != null && String(a.emoji).trim() ? String(a.emoji).trim() : null;
     const mine = (screen(await query([{ kinds: [7], authors: [PK], "#e": [target.id], limit: 50 }])).events)
       .filter((r) => r.kind === 7 && r.pubkey === PK && (r.tags || []).some((t) => t[0] === "e" && t[1] === target.id) && (!want || r.content === want));
-    if (!mine.length) return fail(`buzz_unreact: you have no ${want ? want + " " : ""}reaction on <${String(target.id).slice(0, 8)}> in #${ch.name}.`);
+    if (!mine.length) return fail(`buzz_unreact: you have no ${want ? want + " " : ""}reaction on <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}.`);
     // buzz-sdk build_remove_reaction: kind 5, exactly ONE e tag (the reaction id), empty content.
     for (const r of mine) await publish(5, [["e", r.id]]);
-    return ok(`removed ${mine.length} reaction${mine.length > 1 ? "s" : ""} (${[...new Set(mine.map((r) => r.content))].join(" ")}) from <${String(target.id).slice(0, 8)}> in #${ch.name}`);
+    return ok(`removed ${mine.length} reaction${mine.length > 1 ? "s" : ""} (${[...new Set(mine.map((r) => r.content))].join(" ")}) from <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}`);
   }
 
   if (name === "buzz_reactions") {
@@ -1174,7 +1182,7 @@ async function parityTool(name, a, { ok, fail }) {
       const g = groups.get(emo) || new Set(); g.add(r.pubkey); groups.set(emo, g);
     }
     const rows = [...groups].sort((x, y) => y[1].size - x[1].size).map(([emo, pks]) => `${emo} ×${pks.size}: ${[...pks].map(who).join(", ")}`);
-    return ok(`reactions on <${String(target.id).slice(0, 8)}> in #${ch.name}:\n${rows.join("\n") || "(none)"}`);
+    return ok(`reactions on <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}:\n${rows.join("\n") || "(none)"}`);
   }
 
   if (name === "buzz_dm_add") {
@@ -1184,6 +1192,11 @@ async function parityTool(name, a, { ok, fail }) {
     const pk = await resolveRecipient(a.user);
     if (dm.participants.includes(pk)) return ok(`already in that DM.`);
     if (dm.participants.length >= 9) return fail("buzz_dm_add: a group DM holds at most 9 people (you + 8).");
+    // v0.2.31 fix (review §3.8): adding someone exposes the DM's PRIOR history, so in wire / "post as
+    // me" mode it needs confirm:true — once per session, like the other membership changes (9001).
+    // The write throttle still applies to every call.
+    await profiles();   // so the confirm prompt names the person
+    { const gg = gate(41011, a, `adding ${who(pk)} to DM [${dm.id}]`); if (gg) return fail(gg); }
     await publish(41011, [["h", dm.id], ["p", pk]]);
     await profiles();
     return ok(`added ${who(pk)} to DM [${dm.id}]. ⚠️ they can see the conversation's prior history.`);
@@ -1251,7 +1264,7 @@ const TOOLS = [
   { name: "buzz_profile", description: "Look up a person's profile (kind 0) by npub / hex pubkey / email (wire mode) / exact display name. Read-only; profile fields are shown escaped as untrusted text.", inputSchema: { type: "object", properties: { user: { type: "string", description: "npub / hex pubkey / email / exact display name" } }, required: ["user"] } },
   { name: "buzz_unreact", description: "Remove YOUR reaction from a message (kind 5 deletion with one e tag = your reaction's id). Optional `emoji` removes only that one; otherwise all of yours on the message. Not available in wire / post-as-me mode yet (kind 5 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, event: EV, emoji: { type: "string", description: "only remove this emoji (default: all of yours on the message)" } }, required: ["channel", "event"] } },
   { name: "buzz_reactions", description: "List the reactions on a message, grouped by emoji, with who reacted. Read-only; reactions their author removed (kind 5) are left out.", inputSchema: { type: "object", properties: { channel: CH, event: EV }, required: ["channel", "event"] } },
-  { name: "buzz_dm_add", description: "Add a person to an existing DM conversation you're in (kind 41011; at most 9 people total). They can see its prior history.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id (from buzz_dm_list)" }, user: { type: "string", description: "npub / hex pubkey / email / exact display name" } }, required: ["channel", "user"] } },
+  { name: "buzz_dm_add", description: "Add a person to an existing DM conversation you're in (kind 41011; at most 9 people total). They can see its prior history, so in wire / post-as-me mode the first add of the session needs `confirm: true`.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id (from buzz_dm_list)" }, user: { type: "string", description: "npub / hex pubkey / email / exact display name" }, confirm: CONFIRM_PROP }, required: ["channel", "user"] } },
   { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode yet (kind 41012 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } },
 ];
 
@@ -1381,7 +1394,9 @@ async function callTool(req) {
 
     if (name === "buzz_channels") {
       const cs = await channels();
-      return ok(cs.length ? cs.map((c) => `#${c.name}  [${c.id}]  ${c.about}`).join("\n") : "(no channels)");
+      // v0.2.31 fix (review §3.4): channel names/descriptions are attacker-writable free text
+      // (a description is up to 500 chars incl. newlines) — escape both, one channel per line.
+      return ok(`${UNTRUSTED_NOTE}\n` + (cs.length ? cs.map((c) => `#${escapeName(c.name)}  [${escapeName(c.id)}]${c.about ? `  ${escapeContent(c.about, { cap: 500 })}` : ""}`).join("\n") : "(no channels)"));
     }
 
     if (name === "buzz_agents") {
@@ -1400,7 +1415,7 @@ async function callTool(req) {
       const scr = screen(await query([{ kinds: [9], "#h": [ch.id], limit: clampLimit(a.limit, 30, 200) }]));
       const edits = await latestEdits(ch.id, scr.events);
       const rows = scr.events.sort((x, y) => x.created_at - y.created_at).map((e) => renderMsg(e, { edits, flagOf: scr.flagOf }));
-      return ok(`#${ch.name} (${rows.length} msgs) — <id> = react target:\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(empty)"));
+      return ok(`#${escapeName(ch.name)} (${rows.length} msgs) — <id> = react target:\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(empty)"));
     }
 
     if (name === "buzz_search") {
@@ -1411,7 +1426,7 @@ async function callTool(req) {
       const chById = Object.fromEntries(cs.map((c) => [c.id, c.name]));
       const filt = { kinds: [9], search: q, limit: clampLimit(a.limit, 20, 100) };
       let scope = "";
-      if (a.channel) { const ch = await resolveChannel(a.channel); filt["#h"] = [ch.id]; scope = ` in #${ch.name}`; }
+      if (a.channel) { const ch = await resolveChannel(a.channel); filt["#h"] = [ch.id]; scope = ` in #${escapeName(ch.name)}`; }
       void names;
       const scr = screen(await query([filt]));
       const rows = scr.events.sort((x, y) => y.created_at - x.created_at).map((e) => {
@@ -1431,7 +1446,7 @@ async function callTool(req) {
       for (const e of evs || []) for (const tg of e.tags || []) if (tg[0] === "p" && tg[1] && !seen.has(tg[1])) seen.set(tg[1], tg[3] || "member");
       void names;
       const rows = [...seen].map(([pk, role]) => `${who(pk)}${role === "owner" ? " (owner)" : ""}`);
-      return ok(`#${ch.name} — ${rows.length} member(s):\n` + (rows.join("\n") || "(none)"));
+      return ok(`#${escapeName(ch.name)} — ${rows.length} member(s):\n` + (rows.join("\n") || "(none)"));
     }
 
     if (name === "buzz_post") {
@@ -1461,7 +1476,7 @@ async function callTool(req) {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
+      return ok(`posted to #${escapeName(ch.name)}${mentioned ? ` (mentioned ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_attachment_read") {
@@ -1477,12 +1492,12 @@ async function callTool(req) {
       else {
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
       }
-      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}… in #${ch.name} — use the <id> from buzz_read`);
+      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}… in #${escapeName(ch.name)} — use the <id> from buzz_read`);
       const atts = messageAttachments(hit);
-      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${ch.name} has no attachments.`);
+      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)} has no attachments.`);
       const idx = Number.isInteger(a.index) ? a.index : 0;
       const att = atts[idx];
       if (!att) throw new Error(`attachment index ${idx} out of range — message has ${atts.length} (0..${atts.length - 1})`);
@@ -1498,8 +1513,11 @@ async function callTool(req) {
       if (isText) {
         const full = readFileSync(dest, "utf8");
         const CAP = 200 * 1024;
+        // review §3.4 nice-to-have: fence the raw file text with a per-call random boundary the
+        // file can't predict, so it can't fake "end of file" and append instructions after it.
+        const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes(6).toString("hex")}>>>`;
         const body = full.length > CAP ? `${full.slice(0, CAP)}\n…[truncated ${full.length - CAP} chars — full file at ${dest}]` : full;
-        return ok(`📎 ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(size / 1024).toFixed(0)} KB) from #${ch.name} — saved at ${dest}\n${UNTRUSTED_NOTE.replace("message content", "file content")}\n\n${body}`);
+        return ok(`📎 ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(size / 1024).toFixed(0)} KB) from #${escapeName(ch.name)} — saved at ${dest}\n${UNTRUSTED_NOTE.replace("message content", "file content")}\n${fence}\n${body}\n${fence.replace("BEGIN", "END")}`);
       }
       return ok(`📎 saved ${escapeName(att.filename || shaExt)} → ${dest}\n   (${att.mime || "binary"}, ${(size / MB).toFixed(2)} MB, sha ${att.sha256.slice(0, 12)}…) — not text; open the file to view.`);
     }
@@ -1522,19 +1540,19 @@ async function callTool(req) {
       if (isFullId) {
         // full event id → channel-scoped exact lookup (works for any age; not a recency scan)
         hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
-        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — reactions must target a message in the channel you name`);
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${escapeName(ch.name)} — reactions must target a message in the channel you name`);
       } else {
         // short <id> prefix from buzz_read → scan THIS channel and match by prefix.
         // NEVER put a prefix in an `ids` filter — the relay rejects a non-64-hex id.
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
-        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${escapeName(ch.name)} — use the <id> shown by buzz_read`);
       }
       // Belt-and-braces: assert the resolved target carries h = this channel before signing.
       if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
-        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel reaction`);
+        throw new Error(`target message is not bound to #${escapeName(ch.name)} — refusing a cross-channel reaction`);
       targetId = hit.id;
       const author = hit.pubkey || "", tkind = hit.kind || 9;
       const emoji = (a.emoji && String(a.emoji).trim()) || "👍";
@@ -1545,7 +1563,7 @@ async function callTool(req) {
       await bridge("/events", ev);
       if (author) await profiles();
       const whoL = author ? who(author) : "";
-      return ok(`reacted ${emoji} to ${whoL ? `${whoL}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
+      return ok(`reacted ${emoji} to ${whoL ? `${whoL}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}`);
     }
 
     if (name === "buzz_reply") {
@@ -1596,7 +1614,7 @@ async function callTool(req) {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`replied in #${ch.name} to ${who(target.pubkey)}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
+      return ok(`replied in #${escapeName(ch.name)} to ${who(target.pubkey)}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_forward") {
@@ -1612,7 +1630,7 @@ async function callTool(req) {
       let destId, destLabel;
       try {
         const dch = await resolveChannel(a.to);
-        destId = dch.id; destLabel = `#${dch.name}`;
+        destId = dch.id; destLabel = `#${escapeName(dch.name)}`;
       } catch {
         const pk = await resolveRecipient(a.to);   // npub / hex / email / exact name → 64-hex, or throws
         const { channelId } = await openDm([pk]);
@@ -1645,20 +1663,20 @@ async function callTool(req) {
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
       await profiles();
-      return ok(`added ${who(pk)} to #${ch.name}${a.role ? ` as ${a.role}` : ""}. ⚠️ they can now see this channel's prior history.`);
+      return ok(`added ${who(pk)} to #${escapeName(ch.name)}${a.role ? ` as ${a.role}` : ""}. ⚠️ they can now see this channel's prior history.`);
     }
 
     if (name === "buzz_remove_member") {
       if (!IDENTITY_OK) return modRefuse("removing members");
       const ch = await resolveChannel(a.channel);
       const pk = await resolveRecipient(a.user);
-      { const g = gate(9001, a, `remove ${pk.slice(0, 8)} from #${ch.name}`); if (g) return fail(g); }
+      { const g = gate(9001, a, `remove ${pk.slice(0, 8)} from #${escapeName(ch.name)}`); if (g) return fail(g); }
       const tmpl = removeMemberTemplate({ channelId: ch.id, targetPubkey: pk });
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
       await profiles();
-      return ok(`removed ${who(pk)} from #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+      return ok(`removed ${who(pk)} from #${escapeName(ch.name)}. (Allowed only because the relay confirmed your role permits it.)`);
     }
 
     if (name === "buzz_create_channel") {
@@ -1725,7 +1743,7 @@ async function callTool(req) {
               : (meta.tags || []).some((t) => t[0] === "public") ? "open" : null;
           } catch { /* unknown → fail safe below */ }
           if (curVis !== "open" && a.confirm_make_public !== true)
-            return { content: [{ type: "text", text: `buzz_edit_channel: making #${ch.name} open would expose its entire history to anyone who can find and join it${curVis === null ? " (and I couldn't confirm its current visibility)" : ""}. If that's intended, re-run with confirm_make_public: true.` }], isError: true };
+            return { content: [{ type: "text", text: `buzz_edit_channel: making #${escapeName(ch.name)} open would expose its entire history to anyone who can find and join it${curVis === null ? " (and I couldn't confirm its current visibility)" : ""}. If that's intended, re-run with confirm_make_public: true.` }], isError: true };
         }
         tags.push(["visibility", v]); changed.push(`visibility → ${v}`);
       }
@@ -1743,7 +1761,7 @@ async function callTool(req) {
       }
       if (changed.length === 0)
         return { content: [{ type: "text", text: "buzz_edit_channel: pass at least one of `name`, `visibility`, `description`, `ttl` to change." }], isError: true };
-      { const g = gate(9002, a, `edit #${ch.name} (${changed.join(", ")})`); if (g) return fail(g); }
+      { const g = gate(9002, a, `edit #${escapeName(ch.name)} (${changed.join(", ")})`); if (g) return fail(g); }
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: 9002, tags, content: "" });
       await bridge("/events", ev);
@@ -1759,8 +1777,8 @@ async function callTool(req) {
       }
       const v = await verifyChannelEdit(ch.id, want);
       if (!v.ok)
-        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${ch.name}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${v.unreadable})` : `its kind:39000 metadata does NOT reflect it — ${v.mismatches.join("; ")}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
-      return ok(`edited #${ch.name}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
+        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${escapeName(ch.name)}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${v.unreadable})` : `its kind:39000 metadata does NOT reflect it — ${v.mismatches.join("; ")}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
+      return ok(`edited #${escapeName(ch.name)}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
     }
 
     if (name === "buzz_join_channel") {
@@ -1828,23 +1846,23 @@ async function callTool(req) {
       let hit = null;
       if (isFullId) {
         hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
-        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — delete must target a message in the channel you name`);
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${escapeName(ch.name)} — delete must target a message in the channel you name`);
       } else {
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
-        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${escapeName(ch.name)} — use the <id> shown by buzz_read`);
       }
       if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
-        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel delete`);
+        throw new Error(`target message is not bound to #${escapeName(ch.name)} — refusing a cross-channel delete`);
       targetId = hit.id;
-      { const g = gate(9005, a, `delete message <${targetId.slice(0, 8)}> in #${ch.name}`); if (g) return fail(g); }
+      { const g = gate(9005, a, `delete message <${targetId.slice(0, 8)}> in #${escapeName(ch.name)}`); if (g) return fail(g); }
       const tmpl = deleteMessageTemplate({ channelId: ch.id, targetId });  // re-asserts concrete h + e
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
-      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}. (Allowed only because the relay confirmed your role permits it.)`);
     }
 
     // ---- DM tools (v0.2.1) ----

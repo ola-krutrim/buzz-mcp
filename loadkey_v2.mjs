@@ -33,7 +33,7 @@ import { getPublicKey, generateSecretKey } from "nostr-tools/pure";
 import * as nip19 from "nostr-tools/nip19";
 
 const CFG_DIR = join(homedir(), ".config", "buzz-cli");
-const IDENTITY_DIR = join(CFG_DIR, "identities");
+export const IDENTITY_DIR = join(CFG_DIR, "identities");
 const hexToSk = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
 const skToHex = (sk) => Buffer.from(sk).toString("hex");
 

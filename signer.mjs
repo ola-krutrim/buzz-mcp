@@ -43,7 +43,7 @@ export const wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter
 // ── wire-refresh persistence (0600), mirroring loadkey_v2's service-refresh side-file.
 // The offline_access refresh is single-use/rotating; we persist the rotated one so the
 // next session doesn't replay a spent token (which would revoke the family → lockout).
-const WIRE_REFRESH_DIR = join(homedir(), ".config", "buzz-cli", "wire-refresh");
+export const WIRE_REFRESH_DIR = join(homedir(), ".config", "buzz-cli", "wire-refresh");
 const wireRefreshFile = (id) => join(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
 export function wireRefreshGet(id) {
   try { const f = wireRefreshFile(id); return existsSync(f) ? (readFileSync(f, "utf8").trim() || null) : null; } catch { return null; }

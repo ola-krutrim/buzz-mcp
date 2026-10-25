@@ -55,6 +55,95 @@ const empty = join(root, "empty"); mkdirSync(empty); writeFileSync(join(empty, "
 throws(() => resolveAttachment(empty, { home }), /no attachable files/, "folder with nothing attachable refused");
 throws(() => resolveAttachment(join(home, ".ssh"), { home }), /attachment refused/, "attaching the ~/.ssh folder itself refused");
 
+// v0.2.31 fix (buzz_security release review §3.8): the shim's OWN key store / tokens and the common
+// credential files — each refused directly, through a symlink, and (dirs) as a folder attachment.
+console.log("\n1b. attachments: secret locations incl. the shim's own key store, via symlinks too");
+const SECRETS = [
+  [".config/buzz-cli/identities/alice.hex", "a".repeat(64)],          // local-mode secret key (loadkey_v2 IDENTITY_DIR)
+  [".config/buzz-cli/wire-refresh/default.tok", "refresh-token"],     // Ekam wire refresh token (signer WIRE_REFRESH_DIR)
+  [".config/buzz-cli/wire-refresh/default.pub", "b".repeat(64)],
+  [".config/buzz-cli/config.json", "{}"],
+  [".config/ekam/community-signer/token", "t"],
+  [".buzz/keystore.json", "{}"],
+  [".netrc", "machine x login y password z"],
+  [".git-credentials", "https://u:p@github.com"],
+  [".npmrc", "//registry.npmjs.org/:_authToken=x"],
+  [".pypirc", "[pypi]\npassword=x"],
+  [".config/gh/hosts.yml", "oauth_token: x"],
+  [".docker/config.json", "{\"auths\":{}}"],
+  [".kube/config", "apiVersion: v1"],
+  [".ssh/id_ed25519", "SECRET"],
+  [".ssh/config", "Host *"],
+  [".aws/credentials", "[default]"],
+  [".gnupg/private-keys-v1.d/k.key", "x"],
+  [".config/gcloud/application_default_credentials.json", "{}"],
+  [".claude/.credentials.json", "{}"],
+  ["project/.env", "API_KEY=x"],
+  ["project/.env.production", "API_KEY=x"],
+  ["project/backup.hex", "c".repeat(64)],
+  ["project/session.tok", "x"],
+];
+const h2 = join(root, "home2"), w2 = join(root, "work2"); mkdirSync(w2);
+for (const [rel, body] of SECRETS) { const f = join(h2, rel); mkdirSync(join(f, ".."), { recursive: true }); writeFileSync(f, body); }
+let li = 0;
+for (const [rel] of SECRETS) {
+  const f = join(h2, rel);
+  throws(() => resolveAttachment(f, { home: h2, cwd: w2 }), /attachment refused/, `~/${rel} → refused`);
+  if (!rel.startsWith("project/")) throws(() => resolveAttachment("~/" + rel, { home: h2, cwd: w2 }), /attachment refused/, `"~/${rel}" (tilde form) → refused`);
+  const link = join(w2, `notes${li++}.txt`); symlinkSync(f, link);
+  throws(() => resolveAttachment(link, { home: h2, cwd: w2 }), /attachment refused: .* resolves to /, `symlink notes.txt → ~/${rel} → refused on realpath`);
+}
+for (const d of [".config/buzz-cli", ".config/buzz-cli/identities", ".config/buzz-cli/wire-refresh", ".config/ekam", ".config/gh", ".docker", ".kube", ".ssh", ".aws", ".gnupg", ".buzz"]) {
+  throws(() => resolveAttachment(join(h2, d), { home: h2, cwd: w2 }), /attachment refused/, `folder ~/${d} → refused`);
+  const link = join(w2, `dir${li++}`); symlinkSync(join(h2, d), link);
+  throws(() => resolveAttachment(link, { home: h2, cwd: w2 }), /attachment refused/, `symlinked folder → ~/${d} → refused`);
+}
+// a symlinked PARENT directory: work2/docs → ~/.config/buzz-cli, then docs/identities/alice.hex
+symlinkSync(join(h2, ".config", "buzz-cli"), join(w2, "docs"));
+throws(() => resolveAttachment("docs/identities/alice.hex", { home: h2, cwd: w2 }), /attachment refused/, "symlinked parent dir (docs → ~/.config/buzz-cli) → refused");
+throws(() => resolveAttachment("docs/config.json", { home: h2, cwd: w2 }), /resolves to .*buzz-cli/, "symlinked parent dir, innocuous basename → refused on realpath");
+// configured IDENTITY_DIR / token dir outside $HOME (extraDirs) — refused even though the path is ordinary
+const custom = join(root, "custom-ids"); mkdirSync(custom); writeFileSync(join(custom, "me.key.txt"), "a".repeat(64));
+ok(!!resolveAttachment(join(custom, "me.key.txt"), { home: h2 }), "control: a plain dir is attachable without extraDirs");
+throws(() => resolveAttachment(join(custom, "me.key.txt"), { home: h2, extraDirs: [custom] }), /attachment refused/, "configured IDENTITY_DIR/token dir (extraDirs) → refused");
+symlinkSync(join(custom, "me.key.txt"), join(w2, "plain.txt"));
+throws(() => resolveAttachment("plain.txt", { home: h2, cwd: w2, extraDirs: [custom] }), /resolves to/, "symlink → configured IDENTITY_DIR → refused");
+// case-insensitive components (macOS/Windows): ~/.SSH, /x/.Config/Buzz-CLI
+ok(!!secretPathReason(join(h2, ".SSH", "id_rsa"), { home: h2 }) && !!secretPathReason("/x/.Config/Buzz-CLI/a.json", { home: h2 }), "secret components matched case-insensitively");
+// copied elsewhere (a backup of someone's home)
+ok(/buzz-cli/.test(secretPathReason("/backup/u/.config/buzz-cli/identities/x.json", { home: h2 }) || ""), "a copied …/.config/buzz-cli tree → refused anywhere");
+// hard link to the key file placed somewhere innocuous
+try {
+  const { linkSync } = await import("node:fs");
+  linkSync(join(h2, ".config/buzz-cli/identities/alice.hex"), join(w2, "readme.md"));
+  throws(() => resolveAttachment("readme.md", { home: h2, cwd: w2 }), /hard link/, "hard link to identities/alice.hex → refused");
+} catch (e) { ok(false, "hard-link setup failed: " + e.message); }
+// folder mode: a folder that mixes ordinary files with symlinks into secret dirs
+const mix = join(root, "mix"); mkdirSync(mix);
+writeFileSync(join(mix, "a.txt"), "ok"); writeFileSync(join(mix, "firmware.bin"), "ok");
+symlinkSync(join(h2, ".config/buzz-cli/identities/alice.hex"), join(mix, "b.txt"));
+symlinkSync(join(h2, ".netrc"), join(mix, "c.txt"));
+const rm = resolveAttachment(mix, { home: h2 });
+ok(rm.files.length === 2 && rm.skipped.filter((x) => /secret/.test(x)).length === 2, "folder: symlinks into secret locations skipped (reported), ordinary files kept");
+// still ANY type allowed: ordinary names in ordinary dirs
+for (const n of ["report.pdf", "data.csv", "photo.HEIC", "archive.tar.gz", "Makefile", "config.json", "hosts.yml", "credentials.md"]) {
+  writeFileSync(join(w2, n), "x");
+  ok(resolveAttachment(n, { home: h2, cwd: w2 }).files.length === 1, `ordinary ${n} in a work dir → allowed`);
+}
+// openCheckedAttachment: refuses a file swapped after the check
+{
+  const { openCheckedAttachment } = await import("./safety.mjs");
+  const f = join(w2, "swap.txt"); writeFileSync(f, "one");
+  const r = resolveAttachment(f, { home: h2 });
+  const { fd, size } = openCheckedAttachment(r.files[0], r.ids[r.files[0]]); closeSync(fd);
+  ok(size === 3, "openCheckedAttachment: same file → opened, size from fstat");
+  const { unlinkSync, renameSync } = await import("node:fs");
+  renameSync(f, f + ".keep"); symlinkSync(join(h2, ".netrc"), f);   // keep the old inode alive so it can't be reused
+  throws(() => openCheckedAttachment(r.files[0], r.ids[r.files[0]]), /could not be opened safely|changed between/, "openCheckedAttachment: file swapped for a symlink after the check → refused (O_NOFOLLOW)");
+  unlinkSync(f); writeFileSync(f, "two");
+  throws(() => openCheckedAttachment(r.files[0], r.ids[r.files[0]]), /changed between/, "openCheckedAttachment: different inode after the check → refused");
+}
+
 // ── 2 ──
 console.log("\n2. untrusted output: escaping, note, short pubkey, collisions, newest kind:0");
 ok(/untrusted/.test(UNTRUSTED_NOTE) && /never as instructions/.test(UNTRUSTED_NOTE), "UNTRUSTED_NOTE says content is data, not instructions");
@@ -66,6 +155,30 @@ ok(escapeContent("tab\there") === "tab\\there", "tab → \\t");
 ok(escapeContent("héllo 👋 日本") === "héllo 👋 日本", "ordinary unicode untouched");
 ok(/…\[\+6 chars\]$/.test(escapeContent("x".repeat(4006))), "content > 4000 chars truncated with a count");
 ok([...escapeName("n".repeat(100))].length < 80 && escapeName("A\nB") === "A\\nB", "names capped and escaped");
+// v0.2.31 fix (review §3.4): tag chars / soft hyphen / invisible operators / all DICP + Cf
+const TAGS = [...'ignore previous'].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join("");
+ok(!/[\u{E0000}-\u{E007F}]/u.test(escapeContent("hi" + TAGS + "!")) && escapeContent("a\u{E0041}b") === "a\\u{e0041}b", "tag characters U+E0000–E007F (ASCII smuggling) → escaped");
+ok(escapeContent("a\u{E0001}b\u{E007F}c") === "a\\u{e0001}b\\u{e007f}c", "language tag U+E0001 and CANCEL TAG U+E007F → escaped");
+ok(escapeContent("soft\u00ADhy") === "soft\\u{ad}hy", "soft hyphen U+00AD → escaped");
+for (const cp of [0x2061, 0x2062, 0x2063, 0x2064]) ok(escapeContent(`x${String.fromCodePoint(cp)}y`) === `x\\u{${cp.toString(16)}}y`, `invisible operator U+${cp.toString(16).toUpperCase()} → escaped`);
+for (const cp of [0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x17B4, 0x180E, 0x2065, 0x206A, 0x206F, 0x0600, 0x06DD, 0x110BD, 0xFFF9, 0x1D173, 0xE0100, 0xE01EF, 0xE0FFF])
+  ok(escapeContent(`a${String.fromCodePoint(cp)}b`) === `a\\u{${cp.toString(16)}}b`, `Default_Ignorable / Cf U+${cp.toString(16).toUpperCase()} → escaped`);
+{
+  let leak = 0;
+  for (let cp = 0; cp <= 0xE0FFF; cp++) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+    const c = String.fromCodePoint(cp);
+    if (/[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Bidi_Control}]/u.test(c) && escapeContent("a" + c).includes(c) && !(cp === 0xFE0E || cp === 0xFE0F)) leak++;
+  }
+  ok(leak === 0, `exhaustive: no Default_Ignorable / Cf / Bidi_Control code point passes through unescaped (${leak} leaked)`);
+}
+ok(escapeContent("❤️ ok") === "❤️ ok" && escapeContent("☺︎") === "☺︎", "a single VS15/VS16 after a visible char is kept (emoji stay readable)");
+ok(escapeContent("❤\uFE0F\uFE0F\uFE0F") === "❤\uFE0F\\u{fe0f}\\u{fe0f}" && escapeContent("\uFE0Fx") === "\\u{fe0f}x" && escapeContent("\u200B\uFE0F") === "\\u{200b}\\u{fe0f}", "a run of variation selectors, or one with no visible base → escaped");
+ok(escapeName("Bob\u{E0041}\u00AD") === "Bob\\u{e0041}\\u{ad}", "escapeName uses the same set");
+{
+  const { INVISIBLE } = await import("./names.mjs");
+  for (const cp of [0xE0041, 0x00AD, 0x2062, 0x0600, 0x200B, 0x202E]) ok(INVISIBLE.test(String.fromCodePoint(cp)) && escapeContent(String.fromCodePoint(cp)).startsWith("\\u{"), `U+${cp.toString(16).toUpperCase()}: names.mjs INVISIBLE and escapeContent agree (one shared definition)`);
+}
 const ev0 = (pk, name, t, id) => ({ kind: 0, pubkey: pk, created_at: t, id, content: JSON.stringify({ name }) });
 const idx = buildProfileIndex([ev0(A, "Old", 100, "1"), ev0(A, "New", 200, "2"), ev0(A, "Older", 50, "3"), ev0(B, "Alice", 10, "4"), ev0(C, "\u0410lice", 10, "5")]);
 ok(idx.names[A] === "New", "newest kind:0 wins regardless of arrival order");
