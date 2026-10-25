@@ -1503,7 +1503,9 @@ console.log("\ncase 34: resolveRecipient → name search (both fields, NFKC+fold
     { name: "single skeleton-only hit (Cyrillic twin) for the Latin name → refused", profiles: DIR.cyrOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
     { name: "fullwidth NFKC collision → refused", profiles: DIR.fullwidthOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
     { name: "ligature 'ﬁnance-bot' NFKC collision with 'finance-bot' → refused", profiles: DIR.ligOnly, to: "finance-bot", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
-    { name: "case-only difference → refused (CASE_ONLY_IS_AMBIGUOUS default true)", profiles: DIR.anirban, to: "anirban das", wantRefused: true, wantErr: /letter case/ },
+    { name: "case-only difference → resolves (CASE_ONLY_IS_AMBIGUOUS default false, v0.2.32-pre)", profiles: DIR.anirban, to: "anirban das", wantPk: ANI },
+    { name: "case-only + Cyrillic lookalike → still refused", profiles: DIR.anirban.slice(0, 1).map((p) => ({ ...p, display_name: "" })), to: "\u0430nirban das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "case-only vs two people (dupe) → still ambiguous, refused", profiles: DIR.dupe, to: "sam roy", wantRefused: true, wantErr: /ambiguous/ },
     { name: "invisible LRM inside the typed name vs real → lookalike, refused", profiles: DIR.anirban, to: "Anirban\u200E Das", wantRefused: true, wantErr: /lookalike/ },
     // ---- v0.2.30 (B): only name/display_name ever match; exact first ----
     { name: "(B) bio/nip05-only search hit → NOT resolved", profiles: DIR.bioOnly, to: "Anirban Das", wantRefused: true, wantErr: /can't resolve recipient/ },

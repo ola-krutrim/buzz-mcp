@@ -11,10 +11,12 @@
 // Everything here is synchronous and side-effect free so names.test.mjs can unit-test it.
 import { CONFUSABLES } from "./confusables.mjs";
 
-// Case-only mismatch policy. A single hit whose name differs from the input ONLY by case
-// ("anirban das" vs "Anirban Das") is, by default, treated like any other non-exact hit:
-// ambiguous / lookalike → refused, use an npub. Flip to false to accept a case-only match.
-export const CASE_ONLY_IS_AMBIGUOUS = true;
+// Case-only mismatch policy. v0.2.32-pre (Navendu's call): a single hit whose name differs from
+// the input ONLY by letter case ("anirban das" vs "Anirban Das") RESOLVES. Everything else stays
+// fail-closed: a lookalike / confusable (NFKC / TR39 skeleton) hit, a name with hidden bidi /
+// invisible characters, or two or more matching people (e.g. "Sam" and "SAM") → refused, use an
+// npub. Set back to true to treat case-only hits as ambiguous again.
+export const CASE_ONLY_IS_AMBIGUOUS = false;
 
 // ---- invisible / direction-manipulating characters ----
 // Bidi_Control: ALM U+061C, LRM U+200E, RLM U+200F, U+202A–202E, U+2066–2069.
@@ -115,7 +117,7 @@ export function assertPTags(tags) {
  * Only `name` / `display_name` are ever matched; a candidate a search engine returned because of
  * its bio / about / nip05 / any other field never resolves. Candidates are ranked:
  *   tier 0  exact: rawKey(field) === rawKey(query)            (NFC+trim; + lowercase if case-only allowed)
- *   tier 1  case-only: same NFC+trim ignoring case            (only when CASE_ONLY_IS_AMBIGUOUS)
+ *   tier 1  case-only: same NFC+trim ignoring case            (only when CASE_ONLY_IS_AMBIGUOUS; default false → case-only is tier 0)
  *   tier 2  lookalike: nameKey / nameKeyCased equal           (NFKC/case-fold/TR39 skeleton collision)
  * Returns { pubkey } on exactly one distinct pubkey at tier 0. Throws:
  *   >1 distinct matching pubkeys (any tier)  → ambiguous
