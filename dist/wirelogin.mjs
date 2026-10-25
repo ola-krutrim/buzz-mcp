@@ -18,11 +18,33 @@ var CONFUSABLES = new Map(DATA.split(",").map((e) => {
 }));
 
 // names.mjs
-var NAME_INVIS = /[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
+var INVISIBLE_CLASS = String.raw`\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD\u2061-\u2064\u{E0000}-\u{E007F}`;
+var INVISIBLE = new RegExp(`[${INVISIBLE_CLASS}]`, "u");
+var INVISIBLE_G = new RegExp(`[${INVISIBLE_CLASS}]`, "gu");
+var NAME_INVIS = INVISIBLE;
 var NAME_INVIS_G = new RegExp(NAME_INVIS.source, "gu");
+var CHANNEL_NAME_FORBIDDEN = new RegExp(`(?![\\uFE00-\\uFE0F\\u{E0100}-\\u{E01EF}])[${INVISIBLE_CLASS}]`, "u");
 
 // safety.mjs
-var SECRET_HOME_DIRS = [".buzz", ".ssh", ".gnupg", ".aws", join(".config", "gcloud")];
+var SECRET_HOME_DIRS = [
+  ".buzz",
+  ".ssh",
+  ".gnupg",
+  ".aws",
+  ".docker",
+  ".kube",
+  ".azure",
+  ".password-store",
+  join(".config", "buzz-cli"),
+  // identities/*.hex (local secret key), wire-refresh/*.tok (Ekam refresh tokens)
+  join(".config", "ekam"),
+  join(".config", "gcloud"),
+  join(".config", "gh")
+  // hosts.yml (GitHub token)
+];
+var CONTENT_ESCAPE_SRC = `[\\u0000-\\u001f\\u007f\\u0085\\u2028\\u2029${INVISIBLE_CLASS}]`;
+var CONTENT_ESCAPE_G = new RegExp(CONTENT_ESCAPE_SRC, "gu");
+var CONTENT_ESCAPE_1 = new RegExp(CONTENT_ESCAPE_SRC, "u");
 var DOWNLOAD_MAX_BYTES_DEFAULT = 200 * 1024 * 1024;
 var CHILD_ENV_KEEP = ["PATH", "HOME", "USERPROFILE", "SystemRoot", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "BROWSER"];
 function minimalChildEnv(env = process.env) {
