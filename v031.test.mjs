@@ -322,6 +322,22 @@ console.log("\ncase E2: wire dm_add confirm-once + buzz_channels escaping + dupl
   ok(!res[5].isError && r.published.some((e) => e.kind === 9 && e.tags.some((x) => x[0] === "h" && x[1] === "dupB")), "the channel id still selects one of them");
 }
 
+// ---- case E3 (v0.2.32-pre): today's Ekam refuses 40003/9022 → the tool shows Ekam's refusal clearly ----
+console.log("\ncase E3: wire mode — Ekam without 40003/9022 → clear kind_not_allowed error");
+{
+  const EKAM_NOW = [22242, 9, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021];
+  const W = world(); const r = await mockRelay(W.seed, { wireSk: SK_ME, ekamAllowed: EKAM_NOW });
+  const { res } = await session(wireEnv(r.port), [
+    { name: "buzz_edit_message", args: { channel: "general", event: W.mine.id, text: "x" } },
+    { name: "buzz_leave_channel", args: { channel: "general" } },
+  ], { perCallMs: 6000 });
+  r.close();
+  for (const [i, k] of [[0, 40003], [1, 9022]])
+    ok(res[i].isError && new RegExp(`Ekam \\(your signing service\\) doesn't sign kind ${k} yet; it currently allows \\{7, 9, `).test(res[i].text || "")
+       && /agent's own key/.test(res[i].text || "") && r.wireSigned.includes(k) && !r.published.some((e) => e.kind === k),
+       `kind ${k}: reached Ekam, refused, tool shows the refused kind + Ekam's allowed set, nothing published`);
+}
+
 // ---- case F: write throttle + duplicate suppression ----
 console.log("\ncase F: write throttle + dup suppression");
 {
