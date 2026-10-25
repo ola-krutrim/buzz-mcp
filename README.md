@@ -362,6 +362,8 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   matches (exact, or differing only in case). Two channels sharing a name (`general` / `General`) or a
   lookalike-only match are refused with the channel ids to pick from — never the first match.
   `buzz_join_channel` discovery uses the same rule.
-- `@modelcontextprotocol/sdk` → 1.32.1 (clears the SDK advisory); new `names.test.mjs`,
+- `@modelcontextprotocol/sdk` → 1.32.1 (clears the SDK advisory); `npm audit fix` bumps the
+  transitive zod 4.5.4 → 4.6.7 and fast-uri 3.1.7 → 3.1.9 (both bundled into dist), plus
+  proxy-addr, body-parser, hono and ip-address (dev-only, not bundled): `npm audit` 6 → 0; new `names.test.mjs`,
   `loadkey.test.mjs`; `bridge.test.mjs` capture cases now FAIL instead of skip when nothing was
   captured; CI workflow with SHA-pinned actions and a reproducible-dist check (`dist/SHA256SUMS`).
