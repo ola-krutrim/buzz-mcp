@@ -36,15 +36,19 @@ function match(f, e) {
   if (f.until && e.created_at > f.until) return false;
   return true;
 }
-async function mockRelay(seed, { wireSk, eventsError } = {}) {
+async function mockRelay(seed, { wireSk, eventsError, ekamAllowed } = {}) {
   const store = [...seed];
   const published = [];
+  const wireSigned = [];
   const srv = createServer((rq, rs) => {
     let body = ""; rq.on("data", (c) => (body += c));
     rq.on("end", () => {
       const reply = (obj, code = 200) => { rs.writeHead(code, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
       if (rq.url === "/v1/me/wire-sign" && wireSk) {
         const { event } = JSON.parse(body);
+        wireSigned.push(event.kind);
+        if (ekamAllowed && !ekamAllowed.includes(event.kind))
+          return reply({ error: "kind_not_allowed", error_description: `kind ${event.kind} is not signable; allowed kinds: ${ekamAllowed.join(", ")}` }, 400);
         const ev = finalizeEvent({ ...event, created_at: now() }, hex(wireSk));
         return reply({ event: ev, pubkey: ev.pubkey });
       }
@@ -70,7 +74,7 @@ async function mockRelay(seed, { wireSk, eventsError } = {}) {
     });
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  return { port: srv.address().port, published, store, close: () => srv.close() };
+  return { port: srv.address().port, published, wireSigned, store, close: () => srv.close() };
 }
 
 // ---- one shim session, several sequential calls; resolves each reply by id ----
@@ -268,8 +272,12 @@ console.log("\ncase E: wire mode — blocked kinds + confirm-once gate");
     { name: "buzz_delete", args: { channel: "general", event: W.mine.id } },
   ], { perCallMs: 6000 });
   r.close();
-  for (const [i, k] of [[0, 40003], [1, 9022], [2, 9008], [3, 5], [4, 41012]])
-    ok(res[i].isError && /blocked on Ekam wire-sign allowlist/.test(res[i].text || "") && !r.published.some((e) => e.kind === k), `kind ${k} refused in wire mode, nothing sent`);
+  // v0.2.32-pre: 40003 / 9022 now go to Ekam's wire-sign (the mock Ekam signs them) and reach the relay.
+  ok(!res[0].isError && r.wireSigned.includes(40003) && r.published.some((e) => e.kind === 40003), "kind 40003 (edit) reaches Ekam's wire-sign in wire mode and is published");
+  ok(!res[1].isError && r.wireSigned.includes(9022) && r.published.some((e) => e.kind === 9022), "kind 9022 (leave) reaches Ekam's wire-sign in wire mode and is published");
+  for (const [i, k] of [[2, 9008], [3, 5], [4, 41012]])
+    ok(res[i].isError && /blocked on Ekam wire-sign allowlist/.test(res[i].text || "") && /deliberately/.test(res[i].text || "") && /agent/.test(res[i].text || "")
+       && !r.published.some((e) => e.kind === k) && !r.wireSigned.includes(k), `kind ${k} refused locally in wire mode (Ekam refuses it by design), nothing sent to Ekam or the relay`);
   ok(res[5].isError && /confirm: true/.test(res[5].text || ""), "first 9002 in a wire session needs confirm:true");
   ok(!res[6].isError && !res[7].isError && r.published.filter((e) => e.kind === 9002).length === 2, "after one confirm, later 9002s in the same session go through");
   ok(res[8].isError && /confirm: true/.test(res[8].text || ""), "9005 has its own first-time confirm");

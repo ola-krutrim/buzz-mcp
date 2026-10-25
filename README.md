@@ -123,10 +123,15 @@ each message (kind 9). **Kill-switch:** revoke the token family or suspend the h
 Ekam and the shim can neither mint nor sign — immediately. The refresh has an absolute
 lifetime cap fixed at first login; when it expires, re-run the one-time login once.
 
-Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242}` — messages,
-NIP-98 auth, DM open / add-member, NIP-25 reactions (kind 7), and Blossom media auth (kind
-24242, for attachment upload/download). Command kinds outside that set (e.g. 41012 DM-hide,
-admin / moderation) are refused by the gate.
+Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005,
+9007, 9002, 9021, 40003, 9022}` — messages, NIP-98 auth, DM open / add-member, NIP-25 reactions
+(kind 7), Blossom media auth (kind 24242, for attachment upload/download), NIP-29 moderation
+(9000 / 9001 / 9005) and channel lifecycle (9007 / 9002 / 9021), message edit (40003) and channel
+leave (9022). 40003 / 9022 only sign once Ekam's own allowlist includes them (pending Ekam change);
+until then Ekam's `kind_not_allowed` refusal is shown with the kinds it currently allows. Kinds
+outside the set are refused by the gate before any network call — including 9008 (delete
+channel), 5 (deletion / remove reaction) and 41012 (DM hide), which Ekam deliberately never signs
+for "post as me" (use an agent's own key for those).
 
 ## Tools (17)
 
@@ -343,6 +348,19 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 
 ## Changelog
 
+### v0.2.32-pre
+- **"Post as me" edit and leave.** Kinds 40003 (`buzz_edit_message`) and 9022 (`buzz_leave_channel`)
+  join the wire-sign allowlist, so in wire mode they now go to Ekam's `POST /v1/me/wire-sign`. They
+  only succeed once Ekam ships the matching allowlist change (pending, security-reviewed Ekam PR).
+  9008 / 5 / 41012 stay refused locally — Ekam refuses them by design — with a message saying so.
+- **Clear Ekam refusals.** A `400 kind_not_allowed` from wire-sign becomes "Ekam (your signing
+  service) doesn't sign kind N yet; it currently allows {…}. Ask the Ekam owner to add it, or use an
+  agent's own key." The allowed set is parsed defensively from Ekam's `error_description`; no
+  version pinning.
+- **Case-only names resolve.** `CASE_ONLY_IS_AMBIGUOUS` is now `false`: a single match that differs
+  only in letter case (e.g. `navendu` → `Navendu`) resolves. Lookalike / confusable matches, hidden
+  bidi / invisible characters and multiple matches (e.g. `Sam` and `SAM`) are still refused.
+
 ### v0.2.31
 - **New tools (Slack parity, 38 total).** `buzz_edit_message` (kind 40003, your own messages; reads
   show the newest edit by the same author, marked `(edited)`), `buzz_thread_read`,
@@ -352,7 +370,7 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   `buzz_reactions`, `buzz_dm_add` (41011), `buzz_dm_hide` (41012). Group DMs: `buzz_dm_open` /
   `buzz_dm_send` take `to` as a string or an array of up to 8.
   In wire ("post as me") mode, kinds 40003 / 9022 / 9008 / 5 / 41012 are refused locally as
-  *blocked on Ekam wire-sign allowlist* until Ekam adds them.
+  *blocked on Ekam wire-sign allowlist* until Ekam adds them. (v0.2.32-pre: 40003 / 9022 now go to Ekam.)
 - **Attachments.** Any file type, or a folder (its top-level regular files, ≤10; hidden files are skipped).
   A **denylist** (not an allowlist — any other file or folder is allowed) refuses known secret
   locations, checked on both the typed path and the realpath, case-insensitively, so a symlink,

@@ -154,7 +154,8 @@ export function makeWireTokenProvider(env, fetchFn) {
   };
 }
 
-// wire-sign kind allowlist — MIRRORS ekam's server allowlist {22242, 9, 27235}
+// wire-sign kind allowlist — MIRRORS ekam's server allowlist (HUMAN_SIGN_ALLOWED_KINDS) plus
+// 40003/9022, which Ekam is adding (see below). Originally {22242, 9, 27235}
 // (requirement A, buzz-main 03:50). The server is the authority; this is a fast
 // client-side guard so the shim never makes a wire-sign call the server would
 // refuse — e.g. the startup kind:0/10100 profile publish is skipped in wire mode.
@@ -173,7 +174,17 @@ export function makeWireTokenProvider(env, fetchFn) {
 //           validate_admin_event authorizes each against the SIGNER's OWN channel role (a wire-signed
 //           create/edit only works where the human is already owner/admin; 9021 is open-channel
 //           self-join, private refused) — so mirroring these does not widen authority.
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021]);
+//   40003 = edit one of your own messages, 9022 = leave a channel (v0.2.32-pre, approved by
+//           Navendu). NOTE: the shim allows them, but Ekam only signs them once its own
+//           HUMAN_SIGN_ALLOWED_KINDS gains them (pending security-reviewed Ekam PR). Until then
+//           Ekam answers 400 kind_not_allowed, which wireSign() turns into a clear error naming
+//           the refused kind and Ekam's current allowed set — no version pinning here.
+//   NOT here, on purpose: 9008 (delete channel), 5 (deletion — unreact), 41012 (DM hide). Ekam
+//           refuses them deliberately (pinned by Ekam tests), so the shim refuses them locally
+//           before any network call; they only work with an agent's own key (agent mode).
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021, 40003, 9022]);
+// Kinds Ekam refuses to wire-sign BY DESIGN (not "not yet"): the shim names them as such.
+export const EKAM_REFUSED_BY_DESIGN = new Map([[9008, "delete channel"], [5, "deletion / remove reaction"], [41012, "hide a DM"]]);
 
 // NIP-29 governed moderation (kinds 9000 add-member / 9001 remove-member / 9005 delete-message),
 // live server-side via Ekam v206 (allowlist {…,9000,9001,9005}). Ekam stays content-agnostic; the

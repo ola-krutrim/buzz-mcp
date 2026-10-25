@@ -3,7 +3,7 @@
 // dependency). Integration against the LIVE endpoint is deferred until ekam ships
 // 27235 (requirement C) and confirms the contract (requirement D).
 
-import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet } from "./signer.mjs";
+import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet, EKAM_REFUSED_BY_DESIGN } from "./signer.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 let pass = 0, fail = 0;
@@ -227,6 +227,25 @@ console.log("user status (NIP-38 kind 30315) — v0.2.13: agent-mode only, NOT i
 ok(!WIRE_ALLOWLIST.has(30315), "kind 30315 is NOT in the wire-sign allowlist (Ekam doesn't sign it for post-as-me yet)");
 ok(wsigner.canSign(30315) === false, "wire signer canSign(30315) === false → buzz_status_set/clear must refuse in wire mode");
 ok(lsigner.canSign(30315) === true, "local signer canSign(30315) === true → status works in agent mode");
+
+console.log("v0.2.32-pre — edit (40003) / leave (9022) wire-signable; 9008/5/41012 refused by design:");
+ok(WIRE_ALLOWLIST.has(40003) && WIRE_ALLOWLIST.has(9022), "kinds 40003 (edit) and 9022 (leave) are in the wire-sign allowlist");
+ok(wsigner.canSign(40003) && wsigner.canSign(9022), "wire signer canSign(40003/9022) → the tools reach Ekam");
+for (const k of [9008, 5, 41012]) {
+  ok(!WIRE_ALLOWLIST.has(k) && wsigner.canSign(k) === false, `kind ${k} is NOT wire-signable (Ekam refuses it on purpose)`);
+  ok(EKAM_REFUSED_BY_DESIGN.has(k), `kind ${k} is listed in EKAM_REFUSED_BY_DESIGN`);
+  captured = null;
+  try { await wsigner.sign({ kind: k, tags: [["h", "c"]], content: "" }); ok(false, `kind ${k} should be refused client-side`); }
+  catch (e) { ok(/wire mode refuses kind/.test(e.message) && captured === null, `kind ${k} refused before any wire-sign call`); }
+}
+{
+  captured = null;
+  const ed = await wsigner.sign({ kind: 40003, tags: [["h", "c"], ["e", "e".repeat(64)]], content: "fixed" });
+  ok(captured && captured.tmpl.kind === 40003 && ed.kind === 40003 && verifyEvent(ed), "kind 40003 is sent to /v1/me/wire-sign and comes back signed");
+  captured = null;
+  const lv = await wsigner.sign({ kind: 9022, tags: [["h", "c"]], content: "" });
+  ok(captured && captured.tmpl.kind === 9022 && lv.kind === 9022, "kind 9022 is sent to /v1/me/wire-sign and comes back signed");
+}
 
 console.log("blossom media auth (kind 24242) — fail-closed shim constraints (codex_kavach gate):");
 {
