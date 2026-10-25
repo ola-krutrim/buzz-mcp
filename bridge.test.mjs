@@ -1765,5 +1765,94 @@ console.log("\ncase 39 (E): a malformed/uppercase profile pubkey never becomes a
   }
 }
 
+// ---- Case 40 (v0.2.30 fix): @mention resolution is fail-closed (buzz_security review §3.1) ---------
+// Regression: two kind:0 profiles both named "buzz_security" — the OLD key 7731945f… listed first.
+// The old first-wins index tagged the old key; now nobody is tagged and the post reports why.
+console.log("\ncase 40: @mention of a duplicated name tags nobody (old key never tagged); exact single name tags");
+{
+  const OLD = "7731945f" + "0".repeat(56), REAL = "28ff3202" + "1".repeat(56), PULSE = "d".repeat(64);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const run = async (profilesList, msg) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let f = []; try { f = JSON.parse(body); } catch {}
+          const kinds = new Set(f.flatMap((x) => x.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+          if (kinds.has(0)) return reply(profilesList.map(([pk, n], i) => ({ id: `p${i}`, pubkey: pk, kind: 0, created_at: 1 + i, tags: [], content: JSON.stringify({ name: n }) })));
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_post", { channel: "testchan", text: msg }, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9);
+    return { text, ps: ev ? (ev.tags || []).filter((t) => t[0] === "p").map((t) => t[1]) : null };
+  };
+  let r = await run([[OLD, "buzz_security"], [REAL, "buzz_security"], [PULSE, "Pulse"]], "@buzz_security review please @pulse");
+  if (!r.ps) missing("no kind:9 captured for the duplicate-name mention post");
+  else {
+    console.log(`  p-tags: ${JSON.stringify(r.ps.map((p) => p.slice(0, 8)))}`);
+    ok(!r.ps.includes(OLD) && !r.ps.includes(REAL), "duplicate 'buzz_security' (old key first) → NEITHER key tagged");
+    ok(r.ps.length === 1 && r.ps[0] === PULSE, "the unambiguous @pulse is still tagged");
+    ok(/NOT tagged \(fail-closed\)/.test(r.text || "") && /buzz_security/.test(r.text || ""), "the post result reports the refused @buzz_security mention");
+  }
+  r = await run([[REAL, "buzz_security"]], "@buzz_security hello");
+  if (!r.ps) missing("no kind:9 captured for the single-name mention post");
+  else ok(r.ps.length === 1 && r.ps[0] === REAL, "a single exact 'buzz_security' profile → tagged");
+  r = await run([[OLD, "buzz_s\u0435curity"]], "@buzz_security hello");
+  if (!r.ps) missing("no kind:9 captured for the lookalike mention post");
+  else ok(r.ps.length === 0 && /lookalike/.test(r.text || ""), "a lookalike-only profile → not tagged, reported");
+}
+
+// ---- Case 41 (v0.2.30 fix): duplicate channel names are refused, never first-match ----------------
+console.log("\ncase 41: two channels named 'general'/'General' → buzz_post refused with both ids; nothing signed");
+{
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const posted = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+      if (rq.url === "/query") {
+        let f = []; try { f = JSON.parse(body); } catch {}
+        const kinds = new Set(f.flatMap((x) => x.kinds || []));
+        if (kinds.has(39002)) return reply(["gen-aaaa", "gen-bbbb"].map((d, i) => ({ id: `m${i}`, pubkey: PK, kind: 39002, created_at: now, tags: [["d", d], ["p", PK]], content: "" })));
+        if (kinds.has(39000)) return reply([["gen-aaaa", "general"], ["gen-bbbb", "General"]].map(([d, n], i) => ({ id: `c${i}`, pubkey: PK, kind: 39000, created_at: now, tags: [["d", d], ["name", n]], content: "" })));
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const text = await probeTool({
+    BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_post", { channel: "general", text: "hello" }, { waitMs: 7000, callDelay: 1500 });
+  relay.close();
+  if (text === null) missing("no buzz_post reply for the duplicate-channel case");
+  else {
+    ok(/ambiguous/.test(text) && /gen-aaaa/.test(text) && /gen-bbbb/.test(text), "refused as ambiguous, listing both channel ids");
+    ok(!posted.some((e) => e && e.kind === 9), "nothing was signed or sent");
+  }
+}
+
 console.log(`\nbridge.test.mjs: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail ? 1 : 0);

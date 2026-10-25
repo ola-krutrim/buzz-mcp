@@ -7,13 +7,13 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 import * as nip19 from "nostr-tools/nip19";
 import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
-import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags } from "./names.mjs";
+import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel } from "./names.mjs";
 import { verifyEvent } from "nostr-tools/pure";
 // v0.2.31 best-practice guards (each unit-tested in safety.test.mjs).
 import {
   UNTRUSTED_NOTE, escapeContent, escapeName, buildProfileIndex, whoLabel, resolveAttachment,
   createConfirmGate, privateDownloadDir, openExclusive, downloadLeaf, downloadCap,
-  createWriteGuard, writeLimitFromEnv, mentionTargets, scrubKeyEnv, minimalChildEnv,
+  createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
   openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
 } from "./safety.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -717,9 +717,14 @@ async function latestEdits(chId, events) {
   }
   return m;
 }
+// (v0.2.30 fix, buzz_security review §3.1) Fail-closed channel lookup: exact id, else matchChannel
+// (exact → case-only → lookalike; two channels sharing a name — "general"/"General" — or a single
+// lookalike-only hit are REFUSED with the ids to pick from, never resolved to whichever came first).
+class ChannelAmbiguousError extends Error {}
 async function resolveChannel(nameOrId) {
   const cs = await channels();
-  const hit = cs.find((c) => c.id === nameOrId) || cs.find((c) => c.name.toLowerCase() === String(nameOrId).toLowerCase());
+  let hit;
+  try { hit = matchChannel(nameOrId, cs); } catch (e) { throw new ChannelAmbiguousError(e.message); }
   if (!hit) throw new Error(`channel not found: ${nameOrId}. Available: ${cs.map((c) => c.name).join(", ")}`);
   return hit;
 }
@@ -939,19 +944,26 @@ async function resolveEventInChannel(chId, chName, rawEvent) {
     throw new Error(`target message is not bound to #${chName} — refusing a cross-channel operation`);
   return hit;
 }
-// @-mention → p-tag pubkeys. Same multi-key index buzz_post uses so @Pulse resolves even when the
-// display name carries an icon/space ("Pulse 💓") or punctuation ("bharatrouter·falcon").
-// v0.2.31 (item 7): keys use the v0.2.30 normalization (NFKC + case-fold + TR39 skeleton), and a key
-// two different people share is POISONED — an ambiguous @mention tags nobody (reported in .ambiguous)
-// instead of silently pinging whoever's profile happened to be indexed first.
-function mentionPtags(text, names) {
-  const r = mentionTargets(text, names);   // isPubkeyHex-gated inside: a malformed pubkey is never a target
-  const out = r.pubkeys.filter(isPubkeyHex);
-  out.ambiguous = r.ambiguous;
-  return out;
+// @-mention → p-tag pubkeys (v0.2.30 fix, buzz_security review §3.1). The old index was a
+// lowercase FIRST-WINS map over the 200-newest kind:0 window, so "@buzz_security" tagged whichever
+// of two same-named keys came first (the retired 7731945f…). Mentions now go through the same
+// fail-closed matchProfiles tiers as recipient names (names.mjs resolveMentions): candidates are the
+// 200-newest window PLUS a server-side profile search per token (so a real profile outside the window
+// is still seen and collides with an impostor), archived (NIP-IA) identities never resolve, and an
+// ambiguous / lookalike-only token tags NOBODY and is reported back. "Pulse 💓" → @pulse and
+// "bharatrouter·falcon" → @bharatrouterfalcon still work (derived aliases, see mentionAliases).
+async function mentionPtags(text) {
+  const toks = mentionTokens(text);
+  if (!toks.length) return { pubkeys: [], refused: [] };
+  const lists = [];
+  try { lists.push(((await query([{ kinds: [0], limit: 200 }])) || []).filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean)); } catch { /* search below */ }
+  for (const t of toks.slice(0, MENTION_MAX_TOKENS)) lists.push(await searchProfiles(t));
+  const archived = await archivedPubkeys();
+  return resolveMentions(text, mergeProfiles(...lists), { archived });
 }
-const ambiguousNote = (tags) => (tags && tags.ambiguous && tags.ambiguous.length
-  ? `\n⚠ not tagged (ambiguous — several people match): ${tags.ambiguous.map((t) => "@" + escapeName(t)).join(", ")}. Use their npub to tag them.` : "");
+const mentionNote = (r) => (r && r.refused && r.refused.length)
+  ? ` — NOT tagged (fail-closed): ${r.refused.map((x) => `@${escapeName(x.token)}: ${escapeContent(x.reason, { cap: 300 })}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.`
+  : "";
 
 // ---- channel name/about client-side limits (v0.2.27, per buzz_security's 0.2.26 GO notes) ----
 // The relay caps neither a channel name nor its description — the only server check is
@@ -995,7 +1007,6 @@ const CONFIRM = createConfirmGate();
 const gate = (kind, a, label) => CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: a && a.confirm, label });
 const wireBlocked = (kind, tool) => (signer.canSign(kind) ? null
   : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist — it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`);
-const ptagsOf = (text, names) => mentionPtags(text, names);
 // Upload a file OR every regular file in a folder (item 1). Paths are realpath'd; secret locations
 // (~/.ssh, ~/.buzz, .env, *.pem, keychains …) are refused even through a symlink.
 async function uploadAttachments(input) {
@@ -1433,12 +1444,12 @@ async function callTool(req) {
       if (bodyText === null)
         return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const ch = await resolveChannel(a.channel);
-      const names = await profiles();
-      // @-mentions → p-tags via the shared multi-key index (mentionPtags: "Pulse 💓" → @pulse,
-      // "bharatrouter·falcon" → @bharatrouterfalcon). (E) only strict 64-lowercase-hex pubkeys.
+      // @-mentions → p-tags, fail-closed (mentionPtags: exact first, ambiguous/lookalike/archived
+      // tags nobody and is reported). (E) only strict 64-lowercase-hex pubkeys.
       const tags = [["h", ch.id]];
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation → "Agent managed by <owner>"
-      for (const pk of mentionPtags(bodyText, names)) tags.push(["p", pk]);
+      const mres = await mentionPtags(bodyText);
+      for (const pk of mres.pubkeys) tags.push(["p", pk]);
       // Optional attachment: upload the local file (Blossom) → attach a NIP-92 imeta tag
       // whose url/x match exactly what was uploaded (hash-bound). Content echoes the url too,
       // matching how Buzz clients render attachments.
@@ -1450,7 +1461,7 @@ async function callTool(req) {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${ambiguousNote(ptagsOf(bodyText, names))}`);
+      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_attachment_read") {
@@ -1573,7 +1584,8 @@ async function callTool(req) {
       // p-tags: the author being replied to (NIP-10) + any @-mentions in the body (buzz_post idiom).
       const ptags = new Set();
       if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());
-      for (const pk of mentionPtags(bodyText, names)) ptags.add(pk);
+      const mres = await mentionPtags(bodyText);
+      for (const pk of mres.pubkeys) ptags.add(pk);
       for (const pk of ptags) tags.push(["p", pk]);
       // Optional attachment: upload the local file (Blossom) → NIP-92 imeta tag, url echoed in content.
       let attached = null, content = bodyText;
@@ -1584,7 +1596,7 @@ async function callTool(req) {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`replied in #${ch.name} to ${who(target.pubkey)}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${ambiguousNote(ptagsOf(bodyText, names))}`);
+      return ok(`replied in #${ch.name} to ${who(target.pubkey)}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_forward") {
@@ -1774,7 +1786,8 @@ async function callTool(req) {
           }
         } catch { /* unknown → relay remains the gate */ }
       } else {
-        try { const hit = await resolveChannel(q); chId = hit.id; chName = hit.name; } catch { /* not a member yet — discover below */ }
+        try { const hit = await resolveChannel(q); chId = hit.id; chName = hit.name; }
+        catch (e) { if (e instanceof ChannelAmbiguousError) throw e; /* not a member yet — discover below */ }
         if (!chId) {
           // resolveChannel is member-first and can't see an OPEN channel you're not in yet. Discover
           // by name among the workspace's kind:39000 metadata. Only an OPEN match is self-joinable;
@@ -1783,11 +1796,14 @@ async function callTool(req) {
           const named = (metas || []).map((e) => {
             const t = Object.fromEntries((e.tags || []).map((x) => [x[0], x[1]]));
             const isPrivate = (e.tags || []).some((x) => x[0] === "private");
-            return { id: t.d, name: t.name || "", open: !isPrivate };
-          }).filter((c) => c.id && c.name.toLowerCase() === q.toLowerCase());
-          const open = named.find((c) => c.open);
-          if (open) { chId = open.id; chName = open.name; }
-          else if (named.length > 0) return privateRefusal(named[0].name || q);
+            return { id: t.d, name: t.name || "", open: !isPrivate, at: e.created_at || 0 };
+          }).filter((c) => c.id).sort((x, y) => y.at - x.at)
+            .filter((c, i, arr) => arr.findIndex((o) => o.id === c.id) === i);   // newest 39000 per channel id
+          // Same fail-closed matcher: two channels sharing the name (open or private) → refused.
+          let hit = null;
+          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${e.message}` }], isError: true }; }
+          if (hit && hit.open) { chId = hit.id; chName = hit.name; }
+          else if (hit) return privateRefusal(hit.name || q);
         }
       }
       if (knownPrivate) return privateRefusal(chName);

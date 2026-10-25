@@ -398,6 +398,18 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   (private / name / ttl / description) — or an unreadable read-back — as an error.
 - **p-tag guard.** Every signed event's `p` tags must be 64 lowercase hex; mention p-tags from
   malformed profile pubkeys are dropped (and deduped).
-- `@modelcontextprotocol/sdk` → 1.32.1 (clears the SDK advisory); new `names.test.mjs`,
+- **@mentions fail closed** (fix after buzz_security's release review). `@name` is resolved with
+  the same exact → case → lookalike tiers as a recipient name, over the 200-newest profiles **plus**
+  a server-side profile search for each token. Two keys sharing a name (e.g. an old and a new
+  `buzz_security`), a lookalike-only match, or an archived identity → **nobody is tagged**, and the
+  post/reply result says which `@token` was not tagged and why. Typed `@tokens` match case-insensitively;
+  `Pulse 💓` → `@pulse` and `bharatrouter·falcon` → `@bharatrouterfalcon` still work.
+- **Channel names fail closed.** A channel given by name resolves only when exactly one channel
+  matches (exact, or differing only in case). Two channels sharing a name (`general` / `General`) or a
+  lookalike-only match are refused with the channel ids to pick from — never the first match.
+  `buzz_join_channel` discovery uses the same rule.
+- `@modelcontextprotocol/sdk` → 1.32.1 (clears the SDK advisory); `npm audit fix` bumps the
+  transitive zod 4.5.4 → 4.6.7 and fast-uri 3.1.7 → 3.1.9 (both bundled into dist), plus
+  proxy-addr, body-parser, hono and ip-address (dev-only, not bundled): `npm audit` 6 → 0; new `names.test.mjs`,
   `loadkey.test.mjs`; `bridge.test.mjs` capture cases now FAIL instead of skip when nothing was
   captured; CI workflow with SHA-pinned actions and a reproducible-dist check (`dist/SHA256SUMS`).
