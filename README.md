@@ -137,7 +137,7 @@ agent in local mode).
 |---|---|
 | `buzz_whoami`   | show this session's Buzz identity (name, npub, pubkey, mode) |
 | `buzz_setname`  | set this session's display name on the fleet |
-| `buzz_channels` | list channels you're a member of |
+| `buzz_channels` | list channels you're a member of (names and descriptions escaped, untrusted-data note) |
 | `buzz_create_channel` | create a channel (NIP-29 kind 9007) — you become its owner; `visibility` **private (default)**/open, `type` stream/forum |
 | `buzz_edit_channel` | edit a channel's metadata (NIP-29 kind 9002) — rename / visibility / description / ttl; patch-style, owner/admin only; private→open needs `confirm_make_public` |
 | `buzz_join_channel` | join an open channel yourself (NIP-29 kind 9021) — idempotent; private needs an invite |
@@ -145,7 +145,7 @@ agent in local mode).
 | `buzz_read`     | read recent messages in a channel |
 | `buzz_search`   | full-text search recent messages across your channels (NIP-50; optional `channel` to scope) |
 | `buzz_channel_members` | list a channel's members (display name + owner/member role) |
-| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file or folder path, secret paths refused) |
+| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file or folder path, known secret locations refused — see v0.2.31 changelog) |
 | `buzz_edit_message` | edit one of your own messages (kind 40003) |
 | `buzz_thread_read` | read a whole thread (root + replies) from any message in it |
 | `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
@@ -164,7 +164,7 @@ agent in local mode).
 | `buzz_dm_read`  | read a DM (by `to` person or `channel` id) |
 | `buzz_dm_open`  | open/find a 1:1 or group DM (`to` = one person or up to 8) and return its channel id |
 | `buzz_dm_send`  | send a DM (opens the conversation first if needed) |
-| `buzz_dm_add`   | add a person to a DM you're in (kind 41011) |
+| `buzz_dm_add`   | add a person to a DM you're in (kind 41011; they see prior history — wire mode asks `confirm: true` once per session) |
 | `buzz_dm_hide`  | hide a DM from your list (kind 41012) |
 
 **Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
@@ -354,19 +354,34 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   In wire ("post as me") mode, kinds 40003 / 9022 / 9008 / 5 / 41012 are refused locally as
   *blocked on Ekam wire-sign allowlist* until Ekam adds them.
 - **Attachments.** Any file type, or a folder (its top-level regular files, ≤10; hidden files are skipped).
-  Paths are realpath'd, and secret locations (`~/.buzz`, `~/.ssh`, `~/.gnupg`, `~/.aws`, gcloud,
-  `*.key`, `*.pem`, `id_*`, `.env*`, `*.authtag`) are refused even through a symlink. The result shows the resolved path.
+  A **denylist** (not an allowlist — any other file or folder is allowed) refuses known secret
+  locations, checked on both the typed path and the realpath, case-insensitively, so a symlink,
+  a symlinked parent folder or a hard link to a secret is refused too:
+  the shim's own key store and wire tokens (`~/.config/buzz-cli/**` incl. `identities/*.hex` and
+  `wire-refresh/*.tok`, plus the identity / token dirs the shim actually uses, resolved at runtime),
+  `~/.buzz`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.kube`, `~/.azure`, `~/.password-store`,
+  `~/.config/{gcloud,gh,ekam}`, and anywhere: `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`,
+  `.credentials.json`, `kubeconfig`, `id_*`, `.env*`, `*.key`, `*.pem`, `*.hex`, `*.tok`, `*.authtag`.
+  The upload re-opens the checked file with `O_NOFOLLOW` and re-checks its device/inode, so a swap
+  after the check is refused. This is a best-effort denylist: a secret stored under an ordinary
+  name elsewhere is **not** detected. The result shows the resolved path.
 - **Downloads.** `buzz_attachment_read` streams to a private 0700 dir, writing 0600 files opened with
   `O_EXCL|O_NOFOLLOW`. It never overwrites and is size-capped (`BUZZ_DOWNLOAD_MAX_MB`, default 200).
-- **Untrusted output.** Every read starts with an "untrusted data" note. Message text is escaped
-  (newlines, control and bidi characters). Authors are shown as `name (pk8)`, with `⚠name-collision`
+- **Untrusted output.** Every tool that returns relay text (`buzz_read`, `buzz_dm_read`,
+  `buzz_thread_read`, `buzz_search`, `buzz_profile`, `buzz_attachment_read`, `buzz_channels`) starts
+  with an "untrusted data" note. Message text, names and channel descriptions are escaped: newlines,
+  C0/DEL, and every invisible character — `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}`,
+  `\p{Cf}`, U+00AD, U+2061–2064 and the tag characters U+E0000–E007F — become visible `\u{..}`
+  escapes (one shared definition with `names.mjs`; a single emoji variation selector is kept). Authors are shown as `name (pk8)`, with `⚠name-collision`
   when two people share a name, and the newest kind:0 wins. Inbound events are
   signature-verified (messages, edits, reactions, profiles): bad ones are dropped by default (`BUZZ_VERIFY_INBOUND=flag` keeps and flags them),
   and timestamps more than 5 minutes in the future are flagged.
 - **Write safety.** A per-session throttle (`BUZZ_WRITE_PER_MIN`, default 10, 0 = off) plus duplicate
-  suppression for an identical message or reaction within 2 minutes. The @mention index uses the
-  v0.2.30 normalization, and an ambiguous @mention tags nobody (reported). In wire mode, the first
-  9001 / 9005 / 9002 of a session needs `confirm: true`.
+  suppression for an identical message or reaction within 2 minutes. @mentions use the
+  v0.2.30 fail-closed resolution: a name that two people share, or that only matches as a lookalike,
+  tags nobody and is reported. Channel names are resolved the same way (duplicates are refused with
+  the ids to pick from). In wire mode, the first 9001 / 9005 / 9002 / 41011 (DM add) of a session
+  needs `confirm: true`.
 - **MCP hygiene.** Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint` /
   `openWorldHint` / title), `additionalProperties: false`, and bounded `limit` / text arguments,
   validated at call time. Client cancellation (`extra.signal`), hard timeouts
