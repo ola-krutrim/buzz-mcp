@@ -171,3 +171,91 @@ export function archivedFromEvents(events, selfPk, verify) {
   for (const t of latest.tags) if (t[0] === "p" && isPubkeyHex(t[1])) set.add(t[1]);
   return { set, eventId: latest.id };
 }
+
+// ---- @mentions (v0.2.30 fix, buzz_security review §3.1) ----
+// A mention token can't carry spaces or most punctuation, so each profile name is also offered under
+// two derived aliases: the name with every non-letter/digit removed ("bharatrouter·falcon" →
+// "bharatrouterfalcon"; "Pulse 💓" → "Pulse") and its first letter/digit run ("Pulse"). The token is
+// then resolved by the SAME fail-closed matchProfiles tiers as a recipient name: exact first; >1
+// distinct pubkey at any tier (incl. lookalikes) → refused; a single lookalike-only hit → refused;
+// archived identities never resolve. Mentions are matched case-insensitively (a typed @token carries
+// no case intent: "@pulse" ↔ "Pulse"); case is still part of the confusable check.
+export const MENTION_TOKEN_G = /@([\p{L}\p{N}_\-]+)/gu;
+export const MENTION_MAX_TOKENS = 20;
+export function mentionAliases(n) {
+  const s = String(n ?? "").normalize("NFC").trim();
+  if (!s) return [];
+  const words = stripInvisible(s).match(/[\p{L}\p{N}]+/gu) || [];
+  return [...new Set([s, words.join(""), words[0] || ""].filter(Boolean))];
+}
+export function mentionTokens(text) {
+  const out = [];
+  for (const m of String(text ?? "").matchAll(MENTION_TOKEN_G)) {
+    const tok = m[1].replace(/[-_]+$/, "");
+    if (tok && !out.includes(tok)) out.push(tok);
+  }
+  return out;
+}
+/** Resolve one @token against candidate profiles [{pubkey, name, display_name}] → { pubkey } | { pubkey:null, reason }. */
+export function matchMention(token, profiles, { archived = new Set() } = {}) {
+  const expanded = [];
+  for (const p of profiles || []) {
+    if (!p || !isPubkeyHex(p.pubkey)) continue;
+    for (const f of [p.name, p.display_name]) for (const al of mentionAliases(f)) expanded.push({ pubkey: p.pubkey, name: al });
+  }
+  try {
+    const r = matchProfiles(token, expanded, { caseOnlyIsAmbiguous: false, archived });
+    if (r.pubkey) return { pubkey: r.pubkey };
+    return { pubkey: null, reason: r.archived ? "matches only an archived identity (NIP-IA)" : null };
+  } catch (e) {
+    return { pubkey: null, reason: String(e && e.message || e).replace(/ — use an npub$/, "").replace(/ - use an npub/, "") };
+  }
+}
+/** All @mentions in `text` → { pubkeys (deduped, 64-lowercase-hex), refused: [{ token, reason }] }. */
+export function resolveMentions(text, profiles, { archived = new Set(), maxTokens = MENTION_MAX_TOKENS } = {}) {
+  const pubkeys = [], refused = [];
+  const toks = mentionTokens(text);
+  for (const tok of toks.slice(0, maxTokens)) {
+    const r = matchMention(tok, profiles, { archived });
+    if (r.pubkey) { if (!pubkeys.includes(r.pubkey)) pubkeys.push(r.pubkey); }
+    else if (r.reason) refused.push({ token: tok, reason: r.reason });
+  }
+  for (const tok of toks.slice(maxTokens)) refused.push({ token: tok, reason: `more than ${maxTokens} distinct @mentions in one message` });
+  return { pubkeys, refused };
+}
+
+// ---- channel names (v0.2.30 fix, buzz_security review §3.1) ----
+// Resolve a channel argument against [{id, name}] — FAIL CLOSED. An exact id wins. Otherwise names
+// are compared exactly (NFC+trim), then ignoring case, then as lookalikes (nameKey / nameKeyCased).
+// More than one DISTINCT channel id at any tier → refused with the ids to pick from; a single
+// lookalike-only hit → refused. A single exact or case-only hit resolves (channel names were always
+// case-insensitive here). Returns the channel object or null when nothing matched.
+export function matchChannel(input, channels) {
+  const q = String(input ?? "").trim();
+  if (!q) return null;
+  const list = (channels || []).filter((c) => c && c.id);
+  const byId = list.find((c) => c.id === q);
+  if (byId) return byId;
+  const want = nameKey(q), wantCased = nameKeyCased(q), wantCase = rawKey(q, { caseOnlyIsAmbiguous: false });
+  if (!want) return null;
+  const best = new Map();   // id → { tier, c }
+  for (const c of list) {
+    const f = String(c.name ?? "");
+    if (!f.trim()) continue;
+    let t = null;
+    if (rawKey(f, { caseOnlyIsAmbiguous: false }) === wantCase) t = 0;
+    else if (nameKey(f) === want || nameKeyCased(f) === wantCased) t = 2;
+    if (t === null) continue;
+    const prev = best.get(c.id);
+    if (!prev || t < prev.tier) best.set(c.id, { tier: t, c });
+  }
+  const ranked = [...best.values()].sort((a, b) => a.tier - b.tier);
+  const shown = (r) => `${JSON.stringify(stripInvisible(r.c.name))} id ${r.c.id}${r.tier === 2 ? " (lookalike)" : ""}`;
+  if (ranked.length > 1)
+    throw new Error(`channel "${q}" is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) — pass the channel id instead`);
+  if (ranked.length === 1) {
+    if (ranked[0].tier === 0) return ranked[0].c;
+    throw new Error(`channel "${q}" is ambiguous / lookalike — the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
+  }
+  return null;
+}

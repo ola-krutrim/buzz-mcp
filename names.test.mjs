@@ -4,7 +4,7 @@
 import {
   CASE_ONLY_IS_AMBIGUOUS, NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, stripInvisible, stripVariationSelectors,
   foldName, skeleton, nameKey, confusableNames, matchProfiles, looksLikeEmail, emailError,
-  archivedFromEvents, isPubkeyHex, assertPTags,
+  archivedFromEvents, isPubkeyHex, assertPTags, mentionAliases, mentionTokens, matchMention, resolveMentions, matchChannel,
 } from "./names.mjs";
 import { CONFUSABLES, CONFUSABLES_UNICODE_VERSION, CONFUSABLES_SOURCE_SHA256 } from "./confusables.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -104,6 +104,59 @@ throws(() => assertPTags([["h", "x"], ["p", "AB".repeat(32)]]), /refusing to sig
 throws(() => assertPTags([["p", "npub1xyz"]]), /not 64 lowercase hex/, "npub in a p-tag → refused");
 let threw = false; try { assertPTags([["p", A], ["e", "x"], ["h", "y"]]); assertPTags(undefined); } catch { threw = true; }
 ok(!threw, "valid p-tags / no tags → allowed");
+
+console.log("\n@mentions (v0.2.30 fix: fail-closed, same tiers as recipient names)");
+{
+  const OLD = "7731945f" + "0".repeat(56), REAL = "28ff3202" + "1".repeat(56), P = "d".repeat(64), F = "e".repeat(64), Z = "f".repeat(64);
+  // REGRESSION (buzz_security review §3.1): two profiles named buzz_security, the OLD key listed first.
+  let r = resolveMentions("ping @buzz_security please", [{ pubkey: OLD, name: "buzz_security" }, { pubkey: REAL, name: "buzz_security" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 1 && /ambiguous/.test(r.refused[0].reason), "two same-named profiles (old key first) → nobody tagged, reported ambiguous");
+  ok(!r.pubkeys.includes(OLD), "the retired 7731945f… key is NEVER tagged for @buzz_security");
+  r = resolveMentions("@Buzz_Security", [{ pubkey: OLD, name: "buzz_security" }, { pubkey: REAL, display_name: "Buzz_Security" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 1, "case variants on two keys → ambiguous, nobody tagged");
+  r = resolveMentions("@buzz_security", [{ pubkey: REAL, name: "buzz_security" }]);
+  ok(r.pubkeys.length === 1 && r.pubkeys[0] === REAL && !r.refused.length, "single exact profile → tagged");
+  r = resolveMentions("@buzz_security", [{ pubkey: OLD, name: "buzz_s\u0435curity" }]);
+  ok(r.pubkeys.length === 0 && /lookalike/.test(r.refused[0].reason), "single LOOKALIKE-only profile (Cyrillic е) → refused, not tagged");
+  r = resolveMentions("@buzz_security", [{ pubkey: REAL, name: "buzz_security" }, { pubkey: OLD, name: "buzz_s\u0435curity" }]);
+  ok(r.pubkeys.length === 0 && /ambiguous/.test(r.refused[0].reason), "exact + lookalike on another key → ambiguous, nobody tagged");
+  r = resolveMentions("@paypal", [{ pubkey: OLD, name: "p\u0430ypal" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 1, "TR39 skeleton lookalike (Cyrillic а in paypal) → refused");
+  r = resolveMentions("@buzz_security", [{ pubkey: OLD, name: "buzz_security" }, { pubkey: REAL, name: "buzz_security" }], { archived: new Set([OLD]) });
+  ok(r.pubkeys.length === 1 && r.pubkeys[0] === REAL, "archived (NIP-IA) old key excluded → only the live key is tagged");
+  r = resolveMentions("@buzz_security", [{ pubkey: OLD, name: "buzz_security" }], { archived: new Set([OLD]) });
+  ok(r.pubkeys.length === 0 && /archived/.test(r.refused[0].reason), "only an archived identity matches → nobody tagged, reported");
+  r = resolveMentions("@pulse @bharatrouterfalcon @pulse", [{ pubkey: P, display_name: "Pulse \u{1F493}" }, { pubkey: F, name: "bharatrouter\u00B7falcon" }]);
+  ok(r.pubkeys.length === 2 && r.pubkeys[0] === P && r.pubkeys[1] === F && !r.refused.length, "derived aliases still work: 'Pulse 💓' → @pulse, 'bharatrouter·falcon' → @bharatrouterfalcon (deduped)");
+  r = resolveMentions("@pulse", [{ pubkey: P, name: "Pulse" }, { pubkey: Z, display_name: "Pulse \u{1F493}" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 1, "an alias collision across two keys → ambiguous, nobody tagged");
+  r = resolveMentions("@nobody here", [{ pubkey: P, name: "Pulse" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 0, "an unknown @token is simply not a mention (no refusal noise)");
+  r = resolveMentions("@pulse", [{ pubkey: "AB".repeat(32), name: "Pulse" }, { pubkey: "ab".repeat(20), name: "Pulse" }]);
+  ok(r.pubkeys.length === 0, "malformed / uppercase pubkeys are never mention targets");
+  r = resolveMentions("@Pulse", [{ pubkey: P, name: "Pulse", about: "x" }, { pubkey: Z, name: "Other", about: "Pulse", nip05: "pulse@x" }]);
+  ok(r.pubkeys.length === 1 && r.pubkeys[0] === P, "only name/display_name match (about / nip05 never do)");
+  ok(mentionTokens("hi @a-b_ @c, mail x@y.z @a-b").join(",") === "a-b,c,y", "mentionTokens: trailing -/_ trimmed, deduped");
+  ok(mentionAliases("Pulse \u{1F493}").join("|") === "Pulse \u{1F493}|Pulse", "mentionAliases('Pulse 💓')");
+  const many = Array.from({ length: 25 }, (_, i) => `@u${i}`).join(" ");
+  r = resolveMentions(many, [{ pubkey: P, name: "u24" }]);
+  ok(r.pubkeys.length === 0 && r.refused.length === 5 && /more than 20/.test(r.refused[0].reason), "more than 20 distinct @mentions → the extra ones are refused, not resolved");
+  ok(matchMention("pulse", [{ pubkey: P, name: "Pulse" }]).pubkey === P, "matchMention: case-only is accepted for a typed @token");
+}
+
+console.log("\nchannel names (v0.2.30 fix: fail-closed matchChannel)");
+{
+  const cs = [{ id: "c-gen-1", name: "general" }, { id: "c-gen-2", name: "General" }, { id: "c-eng", name: "eng" }, { id: "c-ops", name: "ops" }, { id: "c-ops", name: "ops" }];
+  let msg = ""; try { matchChannel("general", cs); } catch (e) { msg = e.message; }
+  ok(/ambiguous/.test(msg) && /c-gen-1/.test(msg) && /c-gen-2/.test(msg), "two channels 'general'/'General' → refused, listing both ids");
+  ok(matchChannel("c-gen-2", cs).id === "c-gen-2", "an exact channel id always resolves");
+  ok(matchChannel("ENG", cs).id === "c-eng", "a single case-only name still resolves (unchanged behaviour)");
+  ok(matchChannel("ops", cs).id === "c-ops", "the same channel id listed twice is not a duplicate");
+  ok(matchChannel("missing", cs) === null, "no match → null (caller reports 'not found')");
+  throws(() => matchChannel("\u0435ng", cs), /lookalike/, "a single lookalike-only hit (Cyrillic е) → refused");
+  throws(() => matchChannel("eng", [...cs, { id: "c-eng2", name: "\u0435ng" }]), /ambiguous.*c-eng2/, "exact + lookalike channel → ambiguous, ids listed");
+  throws(() => matchChannel("e\u200Bng", [{ id: "c-eng", name: "eng" }, { id: "x", name: "e\u200Bng" }]), /ambiguous/, "zero-width variant → ambiguous");
+}
 
 console.log(`\nnames.test.mjs: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
