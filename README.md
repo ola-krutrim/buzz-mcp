@@ -133,7 +133,7 @@ outside the set are refused by the gate before any network call — including 90
 channel), 5 (deletion / remove reaction) and 41012 (DM hide), which Ekam deliberately never signs
 for "post as me" (use an agent's own key for those).
 
-## Tools (17)
+## Tools (43)
 
 Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
 agent in local mode).
@@ -142,13 +142,13 @@ agent in local mode).
 |---|---|
 | `buzz_whoami`   | show this session's Buzz identity (name, npub, pubkey, mode) |
 | `buzz_setname`  | set this session's display name on the fleet |
-| `buzz_channels` | list channels you're a member of (names and descriptions escaped, untrusted-data note) |
+| `buzz_channels` | list channels you're a member of; `scope: "open"` browses every open channel you could join (✓ = joined; private channels and DMs never listed) — names and descriptions escaped |
 | `buzz_create_channel` | create a channel (NIP-29 kind 9007) — you become its owner; `visibility` **private (default)**/open, `type` stream/forum |
 | `buzz_edit_channel` | edit a channel's metadata (NIP-29 kind 9002) — rename / visibility / description / ttl; patch-style, owner/admin only; private→open needs `confirm_make_public` |
 | `buzz_join_channel` | join an open channel yourself (NIP-29 kind 9021) — idempotent; private needs an invite |
 | `buzz_agents`   | list known agents/people (display name + pubkey) |
 | `buzz_read`     | read recent messages in a channel |
-| `buzz_search`   | full-text search recent messages across your channels (NIP-50; optional `channel` to scope) |
+| `buzz_search`   | search your channels and DMs (NIP-50). Filters: `from` (a person, fail-closed), `after` / `before` (`YYYY-MM-DD`, ISO time, epoch, or `24h` / `7d`), `in` = all / channels / dms, `channel`. `query` is optional when a filter is given |
 | `buzz_channel_members` | list a channel's members (display name + owner/member role) |
 | `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file or folder path, known secret locations refused — see v0.2.31 changelog) |
 | `buzz_edit_message` | edit one of your own messages (kind 40003) |
@@ -171,6 +171,38 @@ agent in local mode).
 | `buzz_dm_send`  | send a DM (opens the conversation first if needed) |
 | `buzz_dm_add`   | add a person to a DM you're in (kind 41011; they see prior history — wire mode asks `confirm: true` once per session) |
 | `buzz_dm_hide`  | hide a DM from your list (kind 41012) |
+| `buzz_message_link` | make a `buzz://message?channel=…&id=…[&thread=…]` link to a message, or open one (strict parser; only channels/DMs you can read) |
+| `buzz_activity` | your activity feed — mentions / needs-action / activity from the relay feed, or an @mention scan on older relays (labelled) |
+| `buzz_files`    | list the files attached in a channel or DM (name, type, size, `<id>` + index for `buzz_attachment_read`); nothing is downloaded |
+| `buzz_presence` | who is online / away / offline — relay-signed presence only (a status not signed by the relay's NIP-11 `self` key is ignored) |
+| `buzz_emoji`    | list the workspace's custom emoji (`:shortcode:` → image URL; URLs shown, never fetched). `buzz_react` accepts `:shortcode:` |
+
+**`dry_run: true` on every write tool** (not `buzz_login`): the shim builds the event exactly as the
+real call would — resolution, mentions, thread tags, attachment checks — then shows it and stops.
+Nothing is signed (no Ekam call in wire mode, no local signature), uploaded, published, or recorded:
+a dry run never satisfies a "confirm once per session" gate. Signatures and the `auth` attestation
+are redacted from the preview. Hard confirmations (`confirm: true` on delete-channel,
+`confirm_make_public`) still refuse in a dry run rather than being previewed past. Read tools refuse
+`dry_run` as an unknown argument.
+
+### Slack parity (v0.2.32)
+
+| Slack | Buzz MCP | status |
+|---|---|---|
+| post / reply in thread / edit / delete | `buzz_post` / `buzz_reply` / `buzz_edit_message` / `buzz_delete` | ✅ (edit: wire mode needs Ekam to allow 40003) |
+| reactions incl. custom emoji | `buzz_react` (`:shortcode:` → NIP-30 tag) / `buzz_unreact` / `buzz_reactions` / `buzz_emoji` | ✅ |
+| DMs, group DMs | `buzz_dm_*` | ✅ |
+| channel browse / join / leave | `buzz_channels scope:"open"` / `buzz_join_channel` / `buzz_leave_channel` | ✅ (leave: wire mode needs Ekam to allow 9022) |
+| create / rename / topic / archive / delete channel | `buzz_create_channel` / `buzz_edit_channel` / `buzz_channel_topic` / `buzz_archive_channel` / `buzz_delete_channel` | ✅ (delete: local mode only) |
+| members, add / remove | `buzz_channel_members` / `buzz_add_member` / `buzz_remove_member` | ✅ |
+| search with `from:` / `before:` / `after:` / `in:` | `buzz_search` filters | ✅ |
+| copy link to message | `buzz_message_link` | ✅ |
+| Activity / mentions | `buzz_activity` | ✅ (relay feed; @mention fallback) |
+| channel files | `buzz_files` | ✅ |
+| presence | `buzz_presence` | ✅ read-only (setting your own status is the relay's job) |
+| profiles / user lookup | `buzz_profile` / `buzz_agents` | ✅ |
+| pins, bookmarks, saved items, reminders, scheduled send, polls/workflows, huddles | — | ❌ not in Buzz yet (needs relay support) |
+| personal emoji list (kind 10030) | — | ⏳ deferred |
 
 **Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
 `[time] name <id> 📎file: text`, where `<id>` is the message's short (8-char) event id and
@@ -348,6 +380,21 @@ source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` sheban
 in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)
 
 ## Changelog
+
+### v0.2.32
+- **Slack parity tools (43 total).** `buzz_message_link`, `buzz_activity`, `buzz_files`,
+  `buzz_presence`, `buzz_emoji` (all read-only), plus `buzz_channels scope:"open"` and
+  `buzz_search` filters `from` / `after` / `before` / `in`. See the parity table above.
+- **`dry_run` on every write tool.** Intercepted at the signer: in a dry run only NIP-98 (kind
+  27235) read auth is signed; any other event stops before signing and is previewed (signatures and
+  `auth` redacted). Belt and braces: the bridge refuses `/events` and Blossom refuses uploads in a
+  dry run, the confirm gate never records, and `buzz_setname` doesn't change the session name.
+- **Fail-closed throughout.** `from` / presence `users` resolve with the same ambiguity rules as
+  mentions; message links are parsed strictly (`buzz` scheme, `message` host, UUID channel,
+  64-hex ids, no extra/duplicate params) and the event must carry the link's `h` tag; presence counts
+  only events signed by the relay's NIP-11 `self` key; emoji URLs must be http(s), no credentials,
+  and are never fetched; every echoed string is escaped.
+- **Reactions escape the emoji** they echo back.
 
 ### v0.2.32-pre
 - **"Post as me" edit and leave.** Kinds 40003 (`buzz_edit_message`) and 9022 (`buzz_leave_channel`)
