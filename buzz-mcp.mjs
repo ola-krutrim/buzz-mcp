@@ -8,7 +8,7 @@ import * as nip19 from "nostr-tools/nip19";
 import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR } from "./signer.mjs";
 import { IDENTITY_DIR } from "./loadkey_v2.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
-import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel } from "./names.mjs";
+import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
 import { verifyEvent } from "nostr-tools/pure";
 // v0.2.31 best-practice guards (each unit-tested in safety.test.mjs).
 import {
@@ -729,11 +729,13 @@ async function latestEdits(chId, events) {
 // (exact → case-only → lookalike; two channels sharing a name — "general"/"General" — or a single
 // lookalike-only hit are REFUSED with the ids to pick from, never resolved to whichever came first).
 class ChannelAmbiguousError extends Error {}
+const CHANNELS_LISTED_MAX = 50;
 async function resolveChannel(nameOrId) {
   const cs = await channels();
   let hit;
   try { hit = matchChannel(nameOrId, cs); } catch (e) { throw new ChannelAmbiguousError(e.message); }
-  if (!hit) throw new Error(`channel not found: ${escapeName(nameOrId)}. Available: ${cs.map((c) => escapeName(c.name)).join(", ")}`);
+  // (v0.2.30 re-check nit) the typed input and every listed name are quoted + escaped + capped.
+  if (!hit) throw new Error(`channel not found: ${quoteLabel(nameOrId)}. Available: ${cs.slice(0, CHANNELS_LISTED_MAX).map((c) => quoteLabel(c.name)).join(", ")}${cs.length > CHANNELS_LISTED_MAX ? ` …and ${cs.length - CHANNELS_LISTED_MAX} more (buzz_channels lists all)` : ""}`);
   return hit;
 }
 
@@ -770,10 +772,14 @@ const profileFromEvent = (e) => {
     return { pubkey: e.pubkey, created_at: e.created_at || 0, name: typeof c.name === "string" ? c.name : "", display_name: typeof c.display_name === "string" ? c.display_name : "", nip05: c.nip05 || "" };
   } catch { return null; }
 };
+// (v0.2.30 re-check nit, buzz_security REVIEW §7.8) FAIL CLOSED: a search that could not run is an
+// ERROR, never an empty result — "no results" would let a partial candidate set look unambiguous
+// (and read as "nobody by that name"). /profiles/search 404/405 still falls back to NIP-50.
+class ProfileSearchError extends Error {}
 async function searchProfiles(term, limit = 50) {
   const q = String(term || "").trim();
   if (!q) return [];
-  let evs = null;
+  let evs = null, apiErr = null;
   if (Date.now() >= PROFILE_SEARCH_UNSUPPORTED_UNTIL && [...q].length <= 100) {
     try {
       const r = await bridge("/profiles/search", { query: q, limit: Math.min(limit, 100) });
@@ -781,10 +787,15 @@ async function searchProfiles(term, limit = 50) {
       else PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
     } catch (e) {
       if (/HTTP 40[45]\b/.test(String(e && e.message))) PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
+      else apiErr = e;
     }
   }
   if (evs === null) {
-    try { evs = await query([{ kinds: [0], search: q, limit }]) || []; } catch { evs = []; }
+    try { evs = await query([{ kinds: [0], search: q, limit }]) || []; }
+    catch (e) {
+      const why = [apiErr && `/profiles/search: ${apiErr.message}`, `NIP-50 search: ${e && e.message || e}`].filter(Boolean).map((m) => quoteLabel(m, 160)).join("; ");
+      throw new ProfileSearchError(`profile search for ${quoteLabel(q)} failed (${why}) — the directory could not be searched, so the name can't be resolved safely; try again, or use an npub`);
+    }
   }
   return evs.filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean);
 }
@@ -827,7 +838,7 @@ async function resolveRecipientByName(s) {
   const archived = await archivedPubkeys();
   const r = matchProfiles(s, mergeProfiles(...lists), { caseOnlyIsAmbiguous: CASE_ONLY_IS_AMBIGUOUS, archived });
   if (r.pubkey) return r.pubkey;
-  if (r.archived) throw new Error(`"${s}" matches only an archived identity on this relay (NIP-IA) — use an npub if you really mean it`);
+  if (r.archived) throw new Error(`${quoteLabel(s)} matches only an archived identity on this relay (NIP-IA) — use an npub if you really mean it`);
   return null;
 }
 // Resolve a recipient token → pubkey hex. npub / hex are exact. An email resolves ONLY via Ekam's
@@ -848,7 +859,7 @@ async function resolveRecipient(to) {
   }
   const pk = await resolveRecipientByName(s);
   if (pk) return pk;
-  throw new Error(`can't resolve recipient "${to}" — pass an npub, hex pubkey, email, or exact display name`);
+  throw new Error(`can't resolve recipient ${quoteLabel(to)} — pass an npub, hex pubkey, email, or exact display name`);
 }
 // email→pubkey via Ekam's directory resolver (ekam #324): GET /v1/directory/resolve?email=,
 // bearer the wire:sign token (same WHO-gate, no new credential). Returns the CANONICAL live
@@ -965,9 +976,18 @@ async function mentionPtags(text) {
   if (!toks.length) return { pubkeys: [], refused: [] };
   const lists = [];
   try { lists.push(((await query([{ kinds: [0], limit: 200 }])) || []).filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean)); } catch { /* search below */ }
-  for (const t of toks.slice(0, MENTION_MAX_TOKENS)) lists.push(await searchProfiles(t));
+  // A token whose search FAILED is never resolved from the partial (200-newest) list — that list
+  // can't prove the name is unique — it is reported "NOT tagged" with the search error instead.
+  const searched = toks.slice(0, MENTION_MAX_TOKENS), failed = [];
+  for (const t of searched) {
+    try { lists.push(await searchProfiles(t)); }
+    catch (e) { failed.push({ token: t, reason: String(e && e.message || e).replace(/; try again, or use an npub$/, "") }); }
+  }
   const archived = await archivedPubkeys();
-  return resolveMentions(text, mergeProfiles(...lists), { archived });
+  const okToks = searched.filter((t) => !failed.some((f) => f.token === t));
+  const r = resolveMentions(okToks.map((t) => "@" + t).join(" "), mergeProfiles(...lists), { archived });
+  const over = toks.slice(MENTION_MAX_TOKENS).map((token) => ({ token, reason: `more than ${MENTION_MAX_TOKENS} distinct @mentions in one message` }));
+  return { pubkeys: r.pubkeys, refused: [...failed, ...r.refused, ...over] };
 }
 const mentionNote = (r) => (r && r.refused && r.refused.length)
   ? ` — NOT tagged (fail-closed): ${r.refused.map((x) => `@${escapeName(x.token)}: ${escapeContent(x.reason, { cap: 300 })}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.`
