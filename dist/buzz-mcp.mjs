@@ -19831,6 +19831,12 @@ var VARIATION_SELECTOR_G = /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
 var CHANNEL_NAME_FORBIDDEN = /(?![\uFE00-\uFE0F\u{E0100}-\u{E01EF}])[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
 var stripInvisible = (s) => String(s ?? "").replace(NAME_INVIS_G, "");
 var stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_SELECTOR_G, "");
+var LABEL_ESCAPE_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD]/gu;
+function quoteLabel(s, cap = 64) {
+  const cps = [...String(s ?? "")];
+  const body = cps.slice(0, cap).join("").replace(/[\\"]/g, (c) => "\\" + c).replace(LABEL_ESCAPE_G, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+  return `"${body}"${cps.length > cap ? `\u2026[+${cps.length - cap} chars]` : ""}`;
+}
 var caseFold = (s) => s.toUpperCase().toLowerCase().replace(/\u03C2/g, "\u03C3");
 function foldName(s) {
   let t = stripInvisible(s).normalize("NFKC");
@@ -19900,22 +19906,22 @@ function matchProfiles(query2, profiles2, { caseOnlyIsAmbiguous = CASE_ONLY_IS_A
     if (!prev || tier < prev.tier) best.set(p.pubkey, { tier, label });
   }
   const ranked = [...best.entries()].map(([pubkey, v]) => ({ pubkey, ...v })).sort((a, b) => a.tier - b.tier);
-  const shown = (r) => `${JSON.stringify(r.label)} ${r.pubkey.slice(0, 8)}\u2026${r.tier === 0 ? "" : r.tier === 1 ? " (case differs)" : " (lookalike)"}`;
+  const shown = (r) => `${quoteLabel(r.label)} ${r.pubkey.slice(0, 8)}\u2026${r.tier === 0 ? "" : r.tier === 1 ? " (case differs)" : " (lookalike)"}`;
   if (ranked.length > 1)
-    throw new Error(`"${q}" is ambiguous (${ranked.length} people match: ${ranked.slice(0, 5).map(shown).join(", ")}) \u2014 use an npub`);
+    throw new Error(`${quoteLabel(q)} is ambiguous (${ranked.length} people match: ${ranked.slice(0, 5).map(shown).join(", ")}) \u2014 use an npub`);
   if (ranked.length === 1) {
     const r = ranked[0];
     if (r.tier === 0) return { pubkey: r.pubkey, archived: archivedHits, otherFieldOnly, ranked };
     if (r.tier === 1)
-      throw new Error(`"${q}" is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, differs in letter case)`);
-    throw new Error(`"${q}" is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, is not the same text)`);
+      throw new Error(`${quoteLabel(q)} is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, differs in letter case)`);
+    throw new Error(`${quoteLabel(q)} is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, is not the same text)`);
   }
   return { pubkey: null, archived: archivedHits, otherFieldOnly, ranked };
 }
 var looksLikeEmail = (s) => String(s ?? "").normalize("NFKC").includes("@");
 function emailError(s) {
   const e = String(s ?? "");
-  if (NAME_INVIS.test(e)) return `email "${stripInvisible(e)}" contains invisible or bidirectional characters \u2014 refused`;
+  if (NAME_INVIS.test(e)) return `email ${quoteLabel(e)} contains invisible or bidirectional characters \u2014 refused`;
   if (/[^\x21-\x7e]/.test(e)) return `email contains non-ASCII or whitespace characters (possible homoglyph) \u2014 refused; type it in plain ASCII or use an npub`;
   if (e.normalize("NFKC") !== e) return `email changes under NFKC normalization \u2014 refused`;
   if (!/^[^@]+@[^@]+$/.test(e)) return `"${e}" is not a single-@ email address`;
@@ -19999,12 +20005,12 @@ function matchChannel(input, channels2) {
     if (!prev || t < prev.tier) best.set(c.id, { tier: t, c });
   }
   const ranked = [...best.values()].sort((a, b) => a.tier - b.tier);
-  const shown = (r) => `${JSON.stringify(stripInvisible(r.c.name))} id ${r.c.id}${r.tier === 2 ? " (lookalike)" : ""}`;
+  const shown = (r) => `${quoteLabel(r.c.name)} id ${quoteLabel(r.c.id, 80)}${r.tier === 2 ? " (lookalike)" : ""}`;
   if (ranked.length > 1)
-    throw new Error(`channel "${q}" is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) \u2014 pass the channel id instead`);
+    throw new Error(`channel ${quoteLabel(q)} is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) \u2014 pass the channel id instead`);
   if (ranked.length === 1) {
     if (ranked[0].tier === 0) return ranked[0].c;
-    throw new Error(`channel "${q}" is ambiguous / lookalike \u2014 the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
+    throw new Error(`channel ${quoteLabel(q)} is ambiguous / lookalike \u2014 the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
   }
   return null;
 }
@@ -20642,6 +20648,7 @@ async function profiles() {
 }
 var ChannelAmbiguousError = class extends Error {
 };
+var CHANNELS_LISTED_MAX = 50;
 async function resolveChannel(nameOrId) {
   const cs = await channels();
   let hit;
@@ -20650,7 +20657,7 @@ async function resolveChannel(nameOrId) {
   } catch (e) {
     throw new ChannelAmbiguousError(e.message);
   }
-  if (!hit) throw new Error(`channel not found: ${nameOrId}. Available: ${cs.map((c) => c.name).join(", ")}`);
+  if (!hit) throw new Error(`channel not found: ${quoteLabel(nameOrId)}. Available: ${cs.slice(0, CHANNELS_LISTED_MAX).map((c) => quoteLabel(c.name)).join(", ")}${cs.length > CHANNELS_LISTED_MAX ? ` \u2026and ${cs.length - CHANNELS_LISTED_MAX} more (buzz_channels lists all)` : ""}`);
   return hit;
 }
 async function dmChannels() {
@@ -20674,10 +20681,12 @@ var profileFromEvent = (e) => {
     return null;
   }
 };
+var ProfileSearchError = class extends Error {
+};
 async function searchProfiles(term, limit = 50) {
   const q = String(term || "").trim();
   if (!q) return [];
-  let evs = null;
+  let evs = null, apiErr = null;
   if (Date.now() >= PROFILE_SEARCH_UNSUPPORTED_UNTIL && [...q].length <= 100) {
     try {
       const r = await bridge("/profiles/search", { query: q, limit: Math.min(limit, 100) });
@@ -20685,13 +20694,15 @@ async function searchProfiles(term, limit = 50) {
       else PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
     } catch (e) {
       if (/HTTP 40[45]\b/.test(String(e && e.message))) PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
+      else apiErr = e;
     }
   }
   if (evs === null) {
     try {
       evs = await query([{ kinds: [0], search: q, limit }]) || [];
-    } catch {
-      evs = [];
+    } catch (e) {
+      const why = [apiErr && `/profiles/search: ${apiErr.message}`, `NIP-50 search: ${e && e.message || e}`].filter(Boolean).map((m) => quoteLabel(m, 160)).join("; ");
+      throw new ProfileSearchError(`profile search for ${quoteLabel(q)} failed (${why}) \u2014 the directory could not be searched, so the name can't be resolved safely; try again, or use an npub`);
     }
   }
   return evs.filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean);
@@ -20729,7 +20740,7 @@ async function resolveRecipientByName(s) {
   const archived = await archivedPubkeys();
   const r = matchProfiles(s, mergeProfiles(...lists), { caseOnlyIsAmbiguous: CASE_ONLY_IS_AMBIGUOUS, archived });
   if (r.pubkey) return r.pubkey;
-  if (r.archived) throw new Error(`"${s}" matches only an archived identity on this relay (NIP-IA) \u2014 use an npub if you really mean it`);
+  if (r.archived) throw new Error(`${quoteLabel(s)} matches only an archived identity on this relay (NIP-IA) \u2014 use an npub if you really mean it`);
   return null;
 }
 async function resolveRecipient(to) {
@@ -20748,7 +20759,7 @@ async function resolveRecipient(to) {
   }
   const pk = await resolveRecipientByName(s);
   if (pk) return pk;
-  throw new Error(`can't resolve recipient "${to}" \u2014 pass an npub, hex pubkey, email, or exact display name`);
+  throw new Error(`can't resolve recipient ${quoteLabel(to)} \u2014 pass an npub, hex pubkey, email, or exact display name`);
 }
 async function resolveEmail(email2) {
   const bad = emailError(email2);
@@ -20868,9 +20879,19 @@ async function mentionPtags(text) {
     lists.push((await query([{ kinds: [0], limit: 200 }]) || []).filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean));
   } catch {
   }
-  for (const t of toks.slice(0, MENTION_MAX_TOKENS)) lists.push(await searchProfiles(t));
+  const searched = toks.slice(0, MENTION_MAX_TOKENS), failed = [];
+  for (const t of searched) {
+    try {
+      lists.push(await searchProfiles(t));
+    } catch (e) {
+      failed.push({ token: t, reason: String(e && e.message || e).replace(/; try again, or use an npub$/, "") });
+    }
+  }
   const archived = await archivedPubkeys();
-  return resolveMentions(text, mergeProfiles(...lists), { archived });
+  const okToks = searched.filter((t) => !failed.some((f) => f.token === t));
+  const r = resolveMentions(okToks.map((t) => "@" + t).join(" "), mergeProfiles(...lists), { archived });
+  const over = toks.slice(MENTION_MAX_TOKENS).map((token) => ({ token, reason: `more than ${MENTION_MAX_TOKENS} distinct @mentions in one message` }));
+  return { pubkeys: r.pubkeys, refused: [...failed, ...r.refused, ...over] };
 }
 var mentionNote = (r) => r && r.refused && r.refused.length ? ` \u2014 NOT tagged (fail-closed): ${r.refused.map((x) => `@${x.token}: ${x.reason}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.` : "";
 var CHANNEL_NAME_MAX = 80;
