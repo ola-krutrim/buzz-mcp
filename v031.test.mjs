@@ -149,7 +149,7 @@ console.log("\ncase A: tools/list — annotations + additionalProperties:false +
   r.close();
   const tools = (res[0] && res[0].tools) || [];
   const by = Object.fromEntries(tools.map((t) => [t.name, t]));
-  ok(tools.length === 38, `tools/list returned ${tools.length} tools`);
+  ok(tools.length === 43, `tools/list returned ${tools.length} tools`);
   ok(tools.every((t) => t.annotations && typeof t.annotations.readOnlyHint === "boolean" && typeof t.annotations.destructiveHint === "boolean" && typeof t.annotations.idempotentHint === "boolean" && t.annotations.openWorldHint === true && t.annotations.title), "every tool carries title/readOnly/destructive/idempotent/openWorld annotations");
   ok(tools.every((t) => t.inputSchema.additionalProperties === false), "every inputSchema has additionalProperties:false");
   for (const n of ["buzz_edit_message", "buzz_thread_read", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_profile", "buzz_unreact", "buzz_reactions", "buzz_dm_add", "buzz_dm_hide"])
