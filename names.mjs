@@ -32,6 +32,18 @@ export const CHANNEL_NAME_FORBIDDEN = /(?![\uFE00-\uFE0F\u{E0100}-\u{E01EF}])[\p
 
 export const stripInvisible = (s) => String(s ?? "").replace(NAME_INVIS_G, "");
 export const stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_SELECTOR_G, "");
+// v0.2.30 re-check nit (buzz_security REVIEW §7.6/§7.8): every label echoed in an error (a profile
+// name, a channel name or id, the typed query) is relay/user-controlled. quoteLabel JSON-style
+// quotes it, turns every control (C0, DEL, C1 U+0080–009F), U+2028/2029 and every bidi / invisible /
+// format character into a visible \u{..} escape, escapes backslash and quote, and caps it — so an
+// impostor profile name can't hide tag-character text, flip the line with RLO, or forge a new line.
+const LABEL_ESCAPE_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD]/gu;
+export function quoteLabel(s, cap = 64) {
+  const cps = [...String(s ?? "")];
+  const body = cps.slice(0, cap).join("").replace(/[\\"]/g, (c) => "\\" + c)
+    .replace(LABEL_ESCAPE_G, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+  return `"${body}"${cps.length > cap ? `…[+${cps.length - cap} chars]` : ""}`;
+}
 
 // Simple full case fold. JS has no String#casefold; upper→lower folds ß→ss, ﬁ→fi (after NFKC),
 // Kelvin K→k etc. Final sigma is normalized explicitly because toLowerCase applies the
@@ -128,15 +140,15 @@ export function matchProfiles(query, profiles, { caseOnlyIsAmbiguous = CASE_ONLY
     if (!prev || tier < prev.tier) best.set(p.pubkey, { tier, label });
   }
   const ranked = [...best.entries()].map(([pubkey, v]) => ({ pubkey, ...v })).sort((a, b) => a.tier - b.tier);
-  const shown = (r) => `${JSON.stringify(r.label)} ${r.pubkey.slice(0, 8)}…${r.tier === 0 ? "" : r.tier === 1 ? " (case differs)" : " (lookalike)"}`;
+  const shown = (r) => `${quoteLabel(r.label)} ${r.pubkey.slice(0, 8)}…${r.tier === 0 ? "" : r.tier === 1 ? " (case differs)" : " (lookalike)"}`;
   if (ranked.length > 1)
-    throw new Error(`"${q}" is ambiguous (${ranked.length} people match: ${ranked.slice(0, 5).map(shown).join(", ")}) — use an npub`);
+    throw new Error(`${quoteLabel(q)} is ambiguous (${ranked.length} people match: ${ranked.slice(0, 5).map(shown).join(", ")}) — use an npub`);
   if (ranked.length === 1) {
     const r = ranked[0];
     if (r.tier === 0) return { pubkey: r.pubkey, archived: archivedHits, otherFieldOnly, ranked };
     if (r.tier === 1)
-      throw new Error(`"${q}" is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, differs in letter case)`);
-    throw new Error(`"${q}" is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, is not the same text)`);
+      throw new Error(`${quoteLabel(q)} is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, differs in letter case)`);
+    throw new Error(`${quoteLabel(q)} is ambiguous / lookalike - use an npub (the only match, ${shown(r)}, is not the same text)`);
   }
   return { pubkey: null, archived: archivedHits, otherFieldOnly, ranked };
 }
@@ -146,7 +158,7 @@ export const looksLikeEmail = (s) => String(s ?? "").normalize("NFKC").includes(
 /** null if `s` is a plain printable-ASCII email token; otherwise why it is refused. */
 export function emailError(s) {
   const e = String(s ?? "");
-  if (NAME_INVIS.test(e)) return `email "${stripInvisible(e)}" contains invisible or bidirectional characters — refused`;
+  if (NAME_INVIS.test(e)) return `email ${quoteLabel(e)} contains invisible or bidirectional characters — refused`;
   if (/[^\x21-\x7e]/.test(e)) return `email contains non-ASCII or whitespace characters (possible homoglyph) — refused; type it in plain ASCII or use an npub`;
   if (e.normalize("NFKC") !== e) return `email changes under NFKC normalization — refused`;
   if (!/^[^@]+@[^@]+$/.test(e)) return `"${e}" is not a single-@ email address`;
@@ -250,12 +262,12 @@ export function matchChannel(input, channels) {
     if (!prev || t < prev.tier) best.set(c.id, { tier: t, c });
   }
   const ranked = [...best.values()].sort((a, b) => a.tier - b.tier);
-  const shown = (r) => `${JSON.stringify(stripInvisible(r.c.name))} id ${r.c.id}${r.tier === 2 ? " (lookalike)" : ""}`;
+  const shown = (r) => `${quoteLabel(r.c.name)} id ${quoteLabel(r.c.id, 80)}${r.tier === 2 ? " (lookalike)" : ""}`;
   if (ranked.length > 1)
-    throw new Error(`channel "${q}" is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) — pass the channel id instead`);
+    throw new Error(`channel ${quoteLabel(q)} is ambiguous (${ranked.length} channels match: ${ranked.slice(0, 8).map(shown).join(", ")}) — pass the channel id instead`);
   if (ranked.length === 1) {
     if (ranked[0].tier === 0) return ranked[0].c;
-    throw new Error(`channel "${q}" is ambiguous / lookalike — the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
+    throw new Error(`channel ${quoteLabel(q)} is ambiguous / lookalike — the only match, ${shown(ranked[0])}, is not the same text; pass the channel id if you really mean it`);
   }
   return null;
 }

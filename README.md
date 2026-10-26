@@ -362,6 +362,13 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   matches (exact, or differing only in case). Two channels sharing a name (`general` / `General`) or a
   lookalike-only match are refused with the channel ids to pick from — never the first match.
   `buzz_join_channel` discovery uses the same rule.
+- **Escaped labels; profile search fails closed** (buzz_security re-check). Every profile or
+  channel name, channel id and typed query echoed in an error (ambiguous / lookalike / not found,
+  including the `Available:` channel list, capped at 50 with "…and N more") is quoted with C0/C1,
+  bidi, zero-width, tag and other invisible characters shown as `\u{..}` escapes and capped at 64
+  code points. If `/profiles/search` fails (anything but 404/405) **and** the NIP-50 fallback also
+  fails, the name is not resolved from the partial 200-newest list: DM recipients get "profile
+  search for "x" failed … use an npub", and that `@mention` is not tagged (the post says why).
 - `@modelcontextprotocol/sdk` → 1.32.1 (clears the SDK advisory); `npm audit fix` bumps the
   transitive zod 4.5.4 → 4.6.7 and fast-uri 3.1.7 → 3.1.9 (both bundled into dist), plus
   proxy-addr, body-parser, hono and ip-address (dev-only, not bundled): `npm audit` 6 → 0; new `names.test.mjs`,

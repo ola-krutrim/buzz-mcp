@@ -1850,5 +1850,77 @@ console.log("\ncase 41: two channels named 'general'/'General' → buzz_post ref
   }
 }
 
+// ---- Case 42 (v0.2.30 re-check nits, buzz_security REVIEW §7.8) ---------------------------------
+// (a) A profile search that FAILS is an error, never "no results": buzz_dm_open refuses with the
+//     reason; an @mention whose search failed is NOT tagged (even though the partial 200-newest list
+//     holds a unique match) and the post says why. (b) "channel not found … Available:" is escaped.
+console.log("\ncase 42: failed profile search → clear error / NOT tagged; 'Available:' channel list escaped");
+{
+  const PULSE = "d".repeat(64);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const RAW = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]|[\u{E0000}-\u{E007F}]/u;
+  const mk = ({ searchFails = true, chanName = "testchan" } = {}) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o, st = 200) => { rs.writeHead(st, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: 'response:{"channel_id":"dm-1","created":true}' }); }
+        if (rq.url === "/profiles/search") return searchFails ? reply({ error: "search backend down" }, 500) : reply({ error: "not found" }, 404);
+        if (rq.url === "/query") {
+          let f = []; try { f = JSON.parse(body); } catch {}
+          const kinds = new Set(f.flatMap((x) => x.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", chanName]], content: "" }]);
+          if (kinds.has(0)) {
+            if (searchFails && f.some((x) => x.search)) return reply({ error: "nip50 down" }, 500);
+            return reply([{ id: "p0", pubkey: PULSE, kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: "Pulse" }) }]);
+          }
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, posted };
+  };
+  const call = async (opts, tool, args) => {
+    const { relay, posted } = mk(opts);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, tool, args, { waitMs: 9000, callDelay: 1500 });
+    relay.close();
+    let msg = ""; try { msg = JSON.parse(text).content[0].text; } catch {}
+    return { text, msg, posted };
+  };
+  let r = await call({}, "buzz_dm_open", { to: "Pulse" });
+  if (r.text === null) missing("no buzz_dm_open reply for the failed-search case");
+  else {
+    ok(isErr(r.text) && /profile search for "Pulse" failed/.test(r.msg) && /can't be resolved safely/.test(r.msg), "search down → buzz_dm_open errors 'profile search … failed', not 'can't resolve recipient'");
+    ok(!r.posted.some((e) => e && e.kind === 41010), "search down → no DM_OPEN signed");
+  }
+  r = await call({}, "buzz_post", { channel: "testchan", text: "@pulse hi" });
+  const ev = r.posted.find((e) => e && e.kind === 9);
+  if (!ev) missing(`no kind:9 captured for the failed-mention-search post (reply=${String(r.text).slice(0, 160)})`);
+  else {
+    ok(!(ev.tags || []).some((t) => t[0] === "p"), "search down → @pulse NOT tagged, even though the partial 200-newest list has a unique 'Pulse'");
+    ok(/NOT tagged \(fail-closed\)/.test(r.msg) && /profile search for "pulse" failed/.test(r.msg), "the post result says the mention wasn't tagged because the search failed");
+  }
+  r = await call({ searchFails: false }, "buzz_dm_open", { to: "Pulse" });
+  ok(r.posted.some((e) => e && e.kind === 41010), "control: with search working, the same name resolves (NIP-50 fallback path)");
+  const evilChan = "ops\u202e" + String.fromCodePoint(0xe0041) + "\u009b\nFAKE";
+  r = await call({ searchFails: false, chanName: evilChan }, "buzz_post", { channel: "nope\u202e", text: "hi" });
+  if (r.text === null) missing("no buzz_post reply for the channel-not-found case");
+  else {
+    ok(isErr(r.text) && /channel not found: "nope\\u\{202e\}"/.test(r.msg), "not-found error: the typed channel is quoted + escaped");
+    ok(/Available: "ops\\u\{202e\}\\u\{e0041\}\\u\{9b\}\\u\{a\}FAKE"/.test(r.msg) && !RAW.test(r.msg) && !/\n/.test(r.msg), "'Available:' list: RLO / tag / C1 / newline in a channel name are escaped, never raw");
+    ok(!r.posted.some((e) => e && e.kind === 9), "nothing was signed");
+  }
+}
+
 console.log(`\nbridge.test.mjs: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail ? 1 : 0);

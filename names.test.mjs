@@ -4,7 +4,7 @@
 import {
   CASE_ONLY_IS_AMBIGUOUS, NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, stripInvisible, stripVariationSelectors,
   foldName, skeleton, nameKey, confusableNames, matchProfiles, looksLikeEmail, emailError,
-  archivedFromEvents, isPubkeyHex, assertPTags, mentionAliases, mentionTokens, matchMention, resolveMentions, matchChannel,
+  archivedFromEvents, isPubkeyHex, assertPTags, mentionAliases, mentionTokens, matchMention, resolveMentions, matchChannel, quoteLabel,
 } from "./names.mjs";
 import { CONFUSABLES, CONFUSABLES_UNICODE_VERSION, CONFUSABLES_SOURCE_SHA256 } from "./confusables.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -156,6 +156,30 @@ console.log("\nchannel names (v0.2.30 fix: fail-closed matchChannel)");
   throws(() => matchChannel("\u0435ng", cs), /lookalike/, "a single lookalike-only hit (Cyrillic е) → refused");
   throws(() => matchChannel("eng", [...cs, { id: "c-eng2", name: "\u0435ng" }]), /ambiguous.*c-eng2/, "exact + lookalike channel → ambiguous, ids listed");
   throws(() => matchChannel("e\u200Bng", [{ id: "c-eng", name: "eng" }, { id: "x", name: "e\u200Bng" }]), /ambiguous/, "zero-width variant → ambiguous");
+}
+
+console.log("\nquoteLabel: labels echoed in errors are quoted, escaped and capped (v0.2.30 re-check nit)");
+{
+  const RAW = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\u00ad\ufeff]|[\u{E0000}-\u{E007F}]/u;
+  ok(quoteLabel("Anirban Das") === '"Anirban Das"', "plain name → just quoted");
+  ok(quoteLabel('a"b\\c') === '"a\\"b\\\\c"', "quote and backslash are escaped (no forged closing quote / escape)");
+  for (const [c, n] of [[0x202e, "RLO"], [0x2066, "LRI"], [0x200b, "ZWSP"], [0xe0041, "TAG A"], [0xe007f, "CANCEL TAG"], [0x0a, "LF"], [0x0d, "CR"], [0x1b, "ESC"], [0x7f, "DEL"], [0x0085, "NEL"], [0x009b, "C1 CSI"], [0x0080, "U+0080"], [0x009f, "U+009F"], [0x2028, "LS"], [0x00ad, "SHY"], [0x0600, "U+0600 (Cf)"], [0xfeff, "BOM"]]) {
+    const q = quoteLabel("x" + cp(c) + "y");
+    ok(!RAW.test(q) && q.includes(`\\u{${c.toString(16)}}`) && !q.includes(cp(c)), `${n} U+${c.toString(16).toUpperCase()} → visible \\u{${c.toString(16)}} escape, never raw`);
+  }
+  const long = quoteLabel("z".repeat(100));
+  ok(long.startsWith('"' + "z".repeat(64) + '"') && /…\[\+36 chars\]$/.test(long), "capped at 64 code points with a visible remainder count");
+  ok(quoteLabel("\u{1F493}".repeat(70)).includes("…[+6 chars]"), "cap counts code points, never splits a surrogate pair");
+  // matchProfiles errors carry attacker-chosen profile names → escaped (repro from REVIEW §7.6).
+  const evil = "x\u202e" + cp(0xe0041, 0xe0042);
+  let m = ""; try { matchProfiles("x", [{ pubkey: B, name: evil }, { pubkey: C, name: "x" }]); } catch (e) { m = e.message; }
+  ok(/ambiguous/.test(m) && !RAW.test(m) && m.includes("\\u{202e}") && m.includes("\\u{e0041}"), "ambiguous-name error: RLO / tag chars in a profile name are escaped, not raw");
+  m = ""; try { matchProfiles("Anirban Das", [{ pubkey: B, name: "\u0410nirban Das\u202e" + cp(0xe0049, 0xe0047) }]); } catch (e) { m = e.message; }
+  ok(/lookalike/.test(m) && !RAW.test(m) && m.includes("\\u{e0049}"), "single-lookalike error: the impostor's hidden tag text is escaped");
+  m = ""; try { matchProfiles("Sam\u202e", [{ pubkey: A, name: "Sam" }, { pubkey: B, name: "sam" }]); } catch (e) { m = e.message; }
+  ok(!RAW.test(m) && m.includes("\\u{202e}"), "the echoed query is escaped too");
+  m = ""; try { matchChannel("gen", [{ id: "c1\u009b\u202e", name: "gen\u202e" }, { id: "c2", name: "Gen" }]); } catch (e) { m = e.message; }
+  ok(/ambiguous/.test(m) && !RAW.test(m) && m.includes("\\u{9b}") && m.includes("\\u{202e}"), "ambiguous-channel error: names and ids escaped (C1 included)");
 }
 
 console.log(`\nnames.test.mjs: ${pass} passed, ${fail} failed`);
