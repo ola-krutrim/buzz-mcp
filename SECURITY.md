@@ -14,8 +14,11 @@ Only the latest release tag is supported. `install.sh` installs the latest relea
   in-memory secret key buffer is zeroed on exit. Wire ("post as me") mode holds no key at all and can
   only sign the kinds on Ekam's wire-sign allowlist.
 - **Attachments.** Any file type or a folder (top-level regular files, ≤10) may be attached. Paths are
-  resolved with realpath, and secret locations are refused even via a symlink: `~/.buzz`, `~/.ssh`,
-  `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `*.key`, `*.pem`, `id_*`, `.env*`, `*.authtag`.
+  resolved with realpath, and secret locations are refused even via a symlink or hard link: `~/.buzz`,
+  `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/{buzz-cli,gcloud,gh,ekam}`, keyrings / keychains /
+  Windows credential stores, shell and REPL history files, `*.key`, `*.pem`, `id_*`, `.env*`,
+  `*.authtag` (full list in the README). `/proc`, `/sys` and `/dev` are never attachable (typed
+  path, realpath or any symlink hop).
   The resolved path is always shown in the tool result.
 - **Downloads.** Written to a private dir (0700) as 0600 files opened `O_CREAT|O_EXCL|O_NOFOLLOW`,
   streamed, size-capped (`BUZZ_DOWNLOAD_MAX_MB`, default 200), never overwriting.

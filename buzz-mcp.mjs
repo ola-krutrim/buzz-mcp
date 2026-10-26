@@ -17,6 +17,7 @@ import {
   createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
   openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
 } from "./safety.mjs";
+const ERROR_TEXT_CAP = 1500; // v0.2.31 re-check: catch-all error text cap (code points)
 import { AsyncLocalStorage } from "node:async_hooks";
 // buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
 // import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
@@ -1777,7 +1778,7 @@ async function callTool(req) {
       }
       const v = await verifyChannelEdit(ch.id, want);
       if (!v.ok)
-        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${escapeName(ch.name)}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${v.unreadable})` : `its kind:39000 metadata does NOT reflect it — ${v.mismatches.join("; ")}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
+        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${escapeName(ch.name)}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${escapeContent(v.unreadable, { cap: 300 })})` : `its kind:39000 metadata does NOT reflect it — ${escapeContent(v.mismatches.join("; "), { cap: 600 })}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
       return ok(`edited #${escapeName(ch.name)}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
     }
 
@@ -1819,7 +1820,7 @@ async function callTool(req) {
             .filter((c, i, arr) => arr.findIndex((o) => o.id === c.id) === i);   // newest 39000 per channel id
           // Same fail-closed matcher: two channels sharing the name (open or private) → refused.
           let hit = null;
-          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${e.message}` }], isError: true }; }
+          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${escapeContent(e.message, { cap: ERROR_TEXT_CAP })}` }], isError: true }; }
           if (hit && hit.open) { chId = hit.id; chName = hit.name; }
           else if (hit) return privateRefusal(hit.name || q);
         }
@@ -2004,7 +2005,7 @@ async function callTool(req) {
       if (pendingLogin && pendingLogin.status === "error") {
         const msg = pendingLogin.error || "unknown error";
         pendingLogin = null;   // clear so the next call can retry cleanly
-        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${msg}\nRun buzz_login again to retry.` }], isError: true };
+        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${escapeContent(msg, { cap: 500 })}\nRun buzz_login again to retry.` }], isError: true };
       }
       // auto-abandon: a pending flow that ran past its TTL (the timer below should have flipped it,
       // but observe it here too in case the timer never ran). Clear so this call's fall-through can
@@ -2262,7 +2263,11 @@ async function callTool(req) {
 
     return ok(`unknown tool: ${name}`);
   } catch (e) {
-    return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
+    // v0.2.31 re-check (must-fix): an error message can carry relay-controlled text (profile
+    // names, channel names, relay error bodies), so the catch-all escapes it like message content
+    // (one line, no raw C0/C1/bidi/invisible characters) and caps it. Labels names.mjs already
+    // quoted show their backslashes doubled here ("\\u{202e}") — harmless, and never raw.
+    return { content: [{ type: "text", text: `error: ${escapeContent(e && e.message != null ? e.message : e, { cap: ERROR_TEXT_CAP })}` }], isError: true };
   }
 }
 

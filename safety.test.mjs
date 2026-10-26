@@ -310,5 +310,104 @@ const tampered2 = { ...good }; verifyEvent(tampered2); tampered2.content = "edit
 ok(screenInbound([tampered2], verifyEvent, { mode: "drop", nowS: 1000 }).dropped === 1, "verifies on a fresh clone — nostr-tools' cached verify flag can't be reused by a mutated object");
 ok(inboundMode({}) === "drop" && inboundMode({ BUZZ_VERIFY_INBOUND: "flag" }) === "flag" && inboundMode({ BUZZ_VERIFY_INBOUND: "off" }) === "drop", "default drop; only the explicit 'flag' relaxes (no 'off')");
 
+// ── v0.2.31 re-check (buzz_security) ──
+console.log("\n1c. attachments: /proc, /sys, /dev refused — typed, realpath and every symlink hop");
+{
+  const { openSync, closeSync: cl, linkSync, unlinkSync: ul } = await import("node:fs");
+  const r3 = mkdtempSync(join(tmpdir(), "buzz-pseudo-")), h3 = join(r3, "home"), w3 = join(r3, "work");
+  mkdirSync(h3); mkdirSync(w3); writeFileSync(join(w3, "notes.txt"), "hi");
+  const o = { home: h3, cwd: w3 };
+  if (process.platform !== "win32") {
+    for (const p of ["/proc/self/environ", `/proc/${process.pid}/environ`, `/proc/${process.ppid}/environ`, "/proc/self/cmdline", "/proc/self/mem", "/proc/self", "/proc", "/sys/kernel", "/sys", "/dev/null", "/dev/stdin", "/dev", "//proc//self/environ", "/PROC/self/environ"])
+      ok(/kernel pseudo-filesystem/.test(secretPathReason(p, { home: h3 }) || ""), `secretPathReason(${p}) → refused`);
+    ok(secretPathReason("/devices/x.txt", { home: h3 }) === null && secretPathReason("/home/u/proc/notes.txt", { home: h3 }) === null && secretPathReason("/srv/sys/a.log", { home: h3 }) === null, "control: /devices/…, …/proc/…, …/sys/… elsewhere → allowed");
+  }
+  if (existsSync("/proc/self/environ")) {
+    throws(() => resolveAttachment("/proc/self/environ", o), /attachment refused: \/proc\/self\/environ — .*pseudo-filesystem/, "typed /proc/self/environ → refused");
+    throws(() => resolveAttachment(`/proc/${process.pid}/environ`, o), /attachment refused/, "typed /proc/<pid>/environ → refused");
+    throws(() => resolveAttachment(`/proc/${process.ppid}/environ`, o), /attachment refused/, "typed /proc/<ppid>/environ (the parent's env) → refused");
+    throws(() => resolveAttachment("/proc/self", o), /attachment refused/, "folder /proc/self → refused");
+    const fd = openSync(join(w3, "notes.txt"), "r");
+    throws(() => resolveAttachment(`/proc/self/fd/${fd}`, o), /attachment refused: \/proc\/self\/fd\//, "typed /proc/self/fd/N (an open ordinary file) → refused");
+    symlinkSync(`/proc/self/fd/${fd}`, join(w3, "viafd.txt"));
+    throws(() => resolveAttachment("viafd.txt", o), /attachment refused: .*symlink through \/proc\/self\/fd\//, "symlink → /proc/self/fd/N → refused even though realpath is an ordinary file");
+    cl(fd);
+    symlinkSync("/proc/self/environ", join(w3, "env.txt"));
+    throws(() => resolveAttachment("env.txt", o), /attachment refused: .*(resolves to \/proc\/|symlink through \/proc)/, "symlink → /proc/self/environ → refused");
+    symlinkSync(join(w3, "env.txt"), join(w3, "env2.txt"));
+    throws(() => resolveAttachment("env2.txt", o), /attachment refused/, "2-hop symlink chain → /proc/self/environ → refused");
+    symlinkSync(join("/proc/self/cwd", "package.json"), join(w3, "cwdlink.txt"));
+    throws(() => resolveAttachment("cwdlink.txt", o), /attachment refused: .*symlink through \/proc\/self\/cwd/, "symlink detouring through /proc/self/cwd → refused");
+    symlinkSync("/proc/self", join(w3, "procdir"));
+    throws(() => resolveAttachment("procdir", o), /attachment refused/, "symlinked folder → /proc/self → refused");
+    throws(() => resolveAttachment("procdir/environ", o), /attachment refused/, "symlinked parent dir → /proc/self, then /environ → refused");
+  }
+  if (existsSync("/dev/null")) {
+    throws(() => resolveAttachment("/dev/null", o), /attachment refused/, "typed /dev/null → refused");
+    symlinkSync("/dev/null", join(w3, "null.txt"));
+    throws(() => resolveAttachment("null.txt", o), /attachment refused/, "symlink → /dev/null → refused");
+  }
+  if (existsSync("/sys/kernel")) {
+    symlinkSync("/sys/kernel", join(w3, "sysdir"));
+    throws(() => resolveAttachment("sysdir", o), /attachment refused/, "symlinked folder → /sys/kernel → refused");
+  }
+  // folder mode: entries that are symlinks into /proc and /dev are skipped and reported
+  const mix3 = join(w3, "mix"); mkdirSync(mix3); writeFileSync(join(mix3, "a.txt"), "ok");
+  if (existsSync("/proc/self/environ")) symlinkSync("/proc/self/environ", join(mix3, "b.txt"));
+  if (existsSync("/dev/null")) symlinkSync("/dev/null", join(mix3, "c.txt"));
+  const rm3 = resolveAttachment(mix3, o);
+  ok(rm3.files.length === 1 && rm3.files[0].endsWith("a.txt") && rm3.skipped.every((x) => /secret: .*pseudo-filesystem/.test(x)), "folder: entries symlinked into /proc, /dev skipped (reported), ordinary file kept");
+  symlinkSync(join(w3, "notes.txt"), join(w3, "ok-link.txt"));
+  ok(resolveAttachment("ok-link.txt", o).files.length === 1, "control: an ordinary symlink to an ordinary file → allowed");
+  for (const p of ["\\\\.\\PhysicalDrive0", "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\x", "//./pipe/x"])
+    ok(/device-namespace/.test(secretPathReason(p, { home: "C:\\Users\\u", platform: "win32" }) || ""), `win32 device path ${p} → refused`);
+  ok(secretPathReason("\\\\?\\C:\\work\\a.txt", { home: "C:\\Users\\u", platform: "win32" }) === null, "control: win32 \\\\?\\C:\\… long path → allowed");
+
+  console.log("\n1d. hard links to secrets at ANY depth");
+  const deep = [".config/gcloud/legacy_credentials/me@example.com/adc.json", ".config/gcloud/legacy_credentials/a/b/c/d/e/f/g/h/deep.json", ".ssh/x/y/z/w/key-backup", ".config/buzz-cli/identities/old/2025/alice.hex"];
+  let n = 0;
+  for (const rel of deep) {
+    const f = join(h3, rel); mkdirSync(join(f, ".."), { recursive: true }); writeFileSync(f, "SECRET");
+    const l = join(w3, `report${n++}.pdf`); linkSync(f, l);
+    throws(() => resolveAttachment(l, o), /hard link to a file in a secret/, `hard link to ~/${rel} (depth ${rel.split("/").length - 1}) → refused`);
+  }
+  const hm = join(w3, "hmix"); mkdirSync(hm); writeFileSync(join(hm, "a.txt"), "ok"); linkSync(join(h3, deep[0]), join(hm, "b.txt"));
+  const rh = resolveAttachment(hm, o);
+  ok(rh.files.length === 1 && rh.skipped.some((x) => /b\.txt \(secret: a hard link/.test(x)), "folder: a deep hard link inside is skipped (reported)");
+  writeFileSync(join(w3, "orig.txt"), "x"); linkSync(join(w3, "orig.txt"), join(w3, "copy.txt"));
+  ok(resolveAttachment("copy.txt", o).files.length === 1, "control: a hard link between two ordinary files → allowed");
+  throws(() => resolveAttachment("copy.txt", { ...o, walkMax: 2 }), /could not be fully checked/, "walk cap hit + nlink > 1 → refused (fail closed)");
+  ok(resolveAttachment("notes.txt", { ...o, walkMax: 2 }).files.length === 1, "walk cap hit but nlink == 1 → allowed (no walk needed)");
+  // symlinked dirs inside a secret dir are not followed (no loop)
+  symlinkSync(join(h3, ".ssh"), join(h3, ".ssh", "x", "loop"));
+  ok(resolveAttachment("copy.txt", o).files.length === 1, "a symlink loop inside ~/.ssh doesn't hang or break the walk");
+
+  console.log("\n1e. shell history and keyrings");
+  const SEC2 = [".bash_history", ".zsh_history", ".sh_history", ".python_history", ".node_repl_history", ".psql_history", ".mysql_history", ".histfile",
+    ".local/share/fish/fish_history", ".zsh_sessions/ABC.history", ".local/share/keyrings/login.keyring", ".local/share/keyrings/user.keystore",
+    ".local/share/kwalletd/kdewallet.kwl", ".kde/share/apps/kwallet/kdewallet.kwl", "Library/Keychains/login.keychain-db", ".pki/nssdb/key4.db",
+    "AppData/Roaming/Microsoft/Credentials/ABCD", "AppData/Local/Microsoft/Credentials/EF01", "AppData/Roaming/Microsoft/Protect/S-1-5/xyz",
+    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt"];
+  for (const rel of SEC2) {
+    const f = join(h3, rel); mkdirSync(join(f, ".."), { recursive: true }); writeFileSync(f, "x");
+    throws(() => resolveAttachment(f, o), /attachment refused/, `~/${rel} → refused`);
+    const l = join(w3, `h${n++}.txt`); symlinkSync(f, l);
+    throws(() => resolveAttachment(l, o), /attachment refused/, `symlink → ~/${rel} → refused`);
+  }
+  ok(!!secretPathReason("/backup/u/.local/share/keyrings/x", { home: h3 }) && !!secretPathReason("/mnt/old/Library/Keychains/k.db", { home: h3 }), "copied keyring dirs → refused anywhere");
+  for (const nm of ["history.md", "bash_history_notes.txt", "keys.txt", "Library.pdf", "share.txt"]) { writeFileSync(join(w3, nm), "x"); ok(resolveAttachment(nm, o).files.length === 1, `control: ${nm} → allowed`); }
+}
+
+console.log("\n2c. escapeContent: every C1 control U+0080–U+009F is escaped (NEL included)");
+{
+  let all = true;
+  for (let c = 0x80; c <= 0x9f; c++) { const e = escapeContent("a" + String.fromCharCode(c) + "b"); if (e !== `a\\u{${c.toString(16)}}b`) { all = false; console.log("    raw/odd: U+" + c.toString(16) + " → " + JSON.stringify(e)); } }
+  ok(all, "U+0080..U+009F → \\u{80}..\\u{9f}");
+  ok(escapeContent("x\u0085y") === "x\\u{85}y", "U+0085 NEL → \\u{85}");
+  ok(escapeContent("\u009b31mRED") === "\\u{9b}31mRED", "C1 CSI (U+009B) can't start an ANSI sequence");
+  ok(escapeContent("café ñ ÿ\u00a0") === "café ñ ÿ\u00a0", "Latin-1 letters and NBSP (U+00A0+) are untouched");
+  ok(escapeName("\u0080".repeat(70)).startsWith("\\u{80}") && !/[\u0080-\u009f]/.test(escapeName("\u0080".repeat(70))), "escapeName: C1 escaped, capped");
+}
+
 console.log(`\nsafety.test.mjs: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

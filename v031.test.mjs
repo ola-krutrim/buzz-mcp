@@ -36,7 +36,7 @@ function match(f, e) {
   if (f.until && e.created_at > f.until) return false;
   return true;
 }
-async function mockRelay(seed, { wireSk } = {}) {
+async function mockRelay(seed, { wireSk, eventsError } = {}) {
   const store = [...seed];
   const published = [];
   const srv = createServer((rq, rs) => {
@@ -49,6 +49,7 @@ async function mockRelay(seed, { wireSk } = {}) {
         return reply({ event: ev, pubkey: ev.pubkey });
       }
       if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "deadbeef" });
+      if (rq.url === "/events" && eventsError) return reply({ error: eventsError }, 500);
       if (rq.url === "/events") {
         let ev = null; try { ev = JSON.parse(body); } catch {}
         if (ev) { published.push(ev); store.push(ev); }
@@ -407,6 +408,51 @@ console.log("\ncase H: key env vars are scrubbed from the process env after boot
   r.close();
   ok(res[0] && !res[0].isError && res[0].text.includes(PK_ME.slice(0, 16)), "whoami still reports the identity after the scrub (key pinned at boot)");
   ok(!res[0].text.includes(SK_ME), "the secret key never appears in tool output");
+}
+
+// ---- case I (v0.2.31 re-check, buzz_security): /proc never attachable; error text escaped + capped ----
+console.log("\ncase I: /proc/self/environ refused; the catch-all error text is escaped and capped");
+{
+  const RAW = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b\ufeff]|[\u{E0000}-\u{E007F}]/u;
+  const evil = "bob\u202e" + String.fromCodePoint(0xe0041, 0xe0042) + "\u200b";
+  const SK_E = "d4".repeat(32), SK_F = "e5".repeat(32);
+  const pe = sign(SK_E, 0, [], JSON.stringify({ name: evil }), now() - 500);
+  const pf = sign(SK_F, 0, [], JSON.stringify({ name: "bob" }), now() - 500);
+  const W = world({ seedExtra: [pe, pf] }); const r = await mockRelay(W.seed);
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "v031-i-")));
+  const calls = [];
+  if (process.platform === "linux") {
+    symlinkSync("/proc/self/environ", join(work, "env.txt"));
+    calls.push({ name: "buzz_post", args: { channel: "general", text: "p0", attachment: "/proc/self/environ" } });
+    calls.push({ name: "buzz_post", args: { channel: "general", text: "p1", attachment: join(work, "env.txt") } });
+  }
+  calls.push({ name: "buzz_dm_open", args: { to: "bob" } });
+  const { res } = await session(agentEnv(r.port, { BUZZ_WRITE_PER_MIN: "100" }), calls, { perCallMs: 5000 });
+  r.close();
+  let i = 0;
+  if (process.platform === "linux") {
+    ok(res[0].isError && /attachment refused: \/proc\/self\/environ — .*pseudo-filesystem/.test(res[0].text || ""), "buzz_post attachment /proc/self/environ → refused");
+    ok(res[1].isError && /attachment refused/.test(res[1].text || ""), "buzz_post attachment symlink → /proc/self/environ → refused");
+    ok(!r.published.some((e) => e.kind === 9) && !res.some((x) => (x.text || "").includes(SK_ME)), "nothing posted; the key never appears");
+    i = 2;
+  }
+  const t = res[i].text || "";
+  console.log("  dm_open: " + t.slice(0, 220));
+  ok(res[i].isError && /ambiguous/.test(t), "ambiguous recipient (evil lookalike name) → error");
+  ok(!RAW.test(t) && !/\n/.test(t), "the error text has no raw bidi / tag / ZW / C0 / C1 character or newline");
+  ok(/u\{202e\}/.test(t) && /u\{e0041\}/.test(t), "the hostile characters are shown as visible \\u{..} escapes");
+  rmSync(work, { recursive: true, force: true });
+}
+{
+  const W = world(); const big = "relay says \u202eNIAGA YRT\u009b31m\nFAKE-ROW " + "x".repeat(5000);
+  const r = await mockRelay(W.seed, { eventsError: big });
+  const { res } = await session(agentEnv(r.port), [{ name: "buzz_post", args: { channel: "general", text: "hello" } }], { perCallMs: 6000 });
+  r.close();
+  const t = res[0].text || "";
+  console.log("  relay error: " + t.slice(0, 200));
+  ok(res[0].isError && /HTTP 500/.test(t), "relay HTTP 500 surfaces as an error");
+  ok(!/[\u202e\u009b\n]/.test(t) && /u\{202e\}/.test(t) && /u\{9b\}/.test(t), "a hostile relay error body is escaped (no raw RLO / CSI / newline)");
+  ok([...t].length < 2000, `the error text is capped (${[...t].length} code points)`);
 }
 
 console.log(`\nv031: ${pass} passed, ${fail} failed`);

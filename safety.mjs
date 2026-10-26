@@ -9,9 +9,9 @@
 //   9  safe URL-open command (https only; no cmd.exe on Windows)
 //  11  limit clamps + strict argument validation
 //  12  inbound event verification + future created_at flag
-import { realpathSync, statSync, lstatSync, fstatSync, closeSync, readdirSync, mkdirSync, chmodSync, openSync, constants as FS } from "node:fs";
+import { realpathSync, statSync, lstatSync, fstatSync, closeSync, readdirSync, readlinkSync, mkdirSync, chmodSync, openSync, constants as FS } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, basename, sep, resolve as resolvePath } from "node:path";
+import { join, basename, dirname, sep, resolve as resolvePath } from "node:path";
 import { createHash } from "node:crypto";
 import { foldName, nameKey, INVISIBLE_CLASS } from "./names.mjs";
 
@@ -32,11 +32,22 @@ export const SECRET_HOME_DIRS = [
   join(".config", "ekam"),
   join(".config", "gcloud"),
   join(".config", "gh"),                // hosts.yml (GitHub token)
+  // v0.2.31 re-check: OS / desktop keyrings and credential stores.
+  join(".local", "share", "keyrings"),  // GNOME Keyring
+  join(".local", "share", "kwalletd"),  // KWallet (KF5+)
+  join(".kde", "share", "apps", "kwallet"), join(".kde4", "share", "apps", "kwallet"),
+  join("Library", "Keychains"),         // macOS login keychain
+  ".pki",                               // NSS cert/key DB (Chrome/Firefox on Linux)
+  join("AppData", "Roaming", "Microsoft", "Credentials"), join("AppData", "Local", "Microsoft", "Credentials"),
+  join("AppData", "Roaming", "Microsoft", "Protect"),     // Windows Credential Manager / DPAPI master keys
 ];
 // Directory components refused ANYWHERE (a copied /backup/.ssh, another user's home, a fake $HOME):
 const SECRET_COMPONENTS = new Set([".buzz", ".ssh", ".gnupg", ".aws", ".docker", ".kube", ".azure", ".password-store"]);
 // Two-component sequences refused anywhere (…/.config/<x>/…):
 const SECRET_CONFIG_SUBDIRS = new Set(["buzz-cli", "ekam", "gcloud", "gh"]);
+// Keyring directories refused anywhere, as lower-cased component sequences (…/share/keyrings/…).
+const SECRET_SEQS = [["share", "keyrings"], ["share", "kwalletd"], ["apps", "kwallet"], ["library", "keychains"], [".pki"], [".zsh_sessions"],
+  ["microsoft", "credentials"], ["microsoft", "protect"]];
 // Basenames refused anywhere.
 export const SECRET_BASENAME = [
   /\.key$/i, /\.pem$/i, /^id_/i, /^\.env/i, /\.authtag$/i,
@@ -44,6 +55,10 @@ export const SECRET_BASENAME = [
   /^[._]netrc$/i, /^\.git-credentials$/i, /^\.npmrc$/i, /^\.pypirc$/i, /^\.pgpass$/i,
   /^\.credentials\.json$/i,             // Claude Code (CLAUDE_CONFIG_DIR) OAuth credentials
   /^\.?kubeconfig$/i,
+  // v0.2.31 re-check: shell / REPL history (pasted tokens, `export KEY=…`) and keychain files.
+  /^\.(bash|zsh|sh|ksh|mksh|tcsh|python|node_repl|psql|mysql|sqlite|rediscli|irb|pry|scala|lua)_?history$/i,
+  /^\.histfile$/i, /^fish_history$/i, /^ConsoleHost_history\.txt$/i,   // PowerShell PSReadLine
+  /\.keychain(-db)?$/i, /\.kwl$/i, /\.keyring$/i,
 ];
 export const ATTACH_DIR_MAX_FILES = 10;
 
@@ -61,8 +76,49 @@ function secretDirs(home, extraDirs = []) {
   return [...out];
 }
 
+// v0.2.31 re-check (must-fix): kernel pseudo-filesystems. /proc/<pid>/environ holds this very
+// process's key env (read before the scrub), /proc/self/fd/N reaches already-open key files, /sys
+// and /dev are devices — none is ever an attachment. POSIX only; on Windows, device / GLOBALROOT
+// namespace paths (\\.\, \\?\GLOBALROOT) are refused for the same reason.
+const PSEUDO_FS = /^\/+(proc|sys|dev)(\/|$)/i;
+const WIN_DEVICE = /^[\\/]{2}[.?][\\/](?!unc[\\/]|[a-z]:[\\/])/i;
+function pseudoFsReason(p, platform = process.platform) {
+  const s = String(p);
+  if (platform !== "win32") { const m = PSEUDO_FS.exec(s.replace(/\/+/g, "/")); if (m) return `it is under /${m[1].toLowerCase()} (a kernel pseudo-filesystem: process env, open fds, devices)`; }
+  else if (WIN_DEVICE.test(s)) return "it is a Windows device-namespace path";
+  return null;
+}
+// Every path a symlink chain passes through (each hop's target, absolute), so a link whose chain
+// detours through /proc/self/cwd/… or /proc/<pid>/root/… is refused even when realpath lands on an
+// ordinary file. ≤ 40 hops (the kernel's own limit); POSIX only (Windows uses realpath alone).
+function symlinkHops(p, max = 40) {
+  const hops = [];
+  if (process.platform === "win32") return hops;
+  let rest = String(p).split("/").filter(Boolean), cur = "/", n = 0;
+  while (rest.length) {
+    const c = rest.shift();
+    if (c === ".") continue;
+    if (c === "..") { cur = dirname(cur); continue; }
+    const next = join(cur, c);
+    let st; try { st = lstatSync(next); } catch { cur = next; continue; }
+    if (!st.isSymbolicLink()) { cur = next; continue; }
+    if (++n > max) { hops.push(next); break; }
+    let t; try { t = readlinkSync(next); } catch { cur = next; continue; }
+    const abs = resolvePath(cur, t);
+    hops.push(abs);
+    rest = abs.split("/").filter(Boolean).concat(rest); cur = "/";
+  }
+  return hops;
+}
+function chainReason(p, opt) {
+  for (const h of symlinkHops(p)) { const r = secretPathReason(h, opt); if (r) return { hop: h, reason: r }; }
+  return null;
+}
+
 // Returns a refusal reason for a path, or null when it is not a secret location.
-export function secretPathReason(p, { home = homedir(), extraDirs = [] } = {}) {
+export function secretPathReason(p, { home = homedir(), extraDirs = [], platform = process.platform } = {}) {
+  const pseudo = pseudoFsReason(p, platform);
+  if (pseudo) return pseudo;
   for (const dir of secretDirs(home, extraDirs)) if (under(p, dir)) {
     const rel = dir.startsWith(home + sep) ? "~/" + dir.slice(home.length + 1).split(sep).join("/") : dir;
     return `it is inside ${rel} (a secret/key/credential directory)`;
@@ -72,6 +128,9 @@ export function secretPathReason(p, { home = homedir(), extraDirs = [] } = {}) {
   for (const comp of dirs) if (SECRET_COMPONENTS.has(comp)) return `it is inside a "${comp}" directory (secret/key material)`;
   for (let i = 0; i < parts.length - 1; i++) if (lc(parts[i]) === ".config" && SECRET_CONFIG_SUBDIRS.has(lc(parts[i + 1])))
     return `it is inside a ".config/${lc(parts[i + 1])}" directory (keys/tokens/credentials)`;
+  const lparts = parts.map(lc);
+  for (const seq of SECRET_SEQS) for (let i = 0; i + seq.length <= lparts.length; i++)
+    if (seq.every((x, j) => lparts[i + j] === x)) return `it is inside a keyring / credential store ("${seq.join("/")}")`;
   const b = basename(String(p));
   if (SECRET_COMPONENTS.has(lc(b)) || (parts.length > 1 && lc(parts[parts.length - 2]) === ".config" && SECRET_CONFIG_SUBDIRS.has(lc(b))))
     return `it is a secret/key directory ("${b}")`;
@@ -79,27 +138,37 @@ export function secretPathReason(p, { home = homedir(), extraDirs = [] } = {}) {
   return null;
 }
 
-// dev:ino of every regular file in the secret directories (two levels deep) — so a HARD LINK to the
-// key/token placed somewhere innocuous is still refused. Best-effort: unreadable dirs are skipped.
-function secretInodes(home, extraDirs) {
+// dev:ino of every regular file in the secret directories, at ANY depth (v0.2.31 re-check: the
+// old two-level walk missed e.g. ~/.config/gcloud/legacy_credentials/<acct>/adc.json) — so a HARD
+// LINK to a key/token placed somewhere innocuous is still refused. Symlinked directories are not
+// followed (no loops); the walk is capped at SECRET_WALK_MAX entries. It runs lazily, only when a
+// candidate file has nlink > 1 (a file with one link can't be a hard link to anything), and if the
+// walk was incomplete (cap hit, or an unreadable sub-directory) such a file is refused.
+export const SECRET_WALK_MAX = 100_000;
+function secretInodes(home, extraDirs, max = SECRET_WALK_MAX) {
   const seen = new Set();
-  const walk = (d, depth) => {
-    let ents; try { ents = readdirSync(d, { withFileTypes: true }); } catch { return; }
+  let entries = 0, complete = true;
+  const stack = secretDirs(home, extraDirs).map((d) => [d, true]);
+  while (stack.length) {
+    const [d, top] = stack.pop();
+    let ents;
+    try { ents = readdirSync(d, { withFileTypes: true }); }
+    catch (e) { if (!(top && e && (e.code === "ENOENT" || e.code === "ENOTDIR"))) complete = false; continue; }
     for (const e of ents) {
+      if (++entries > max) return { seen, complete: false };
       const f = join(d, e.name);
-      if (e.isDirectory()) { if (depth < 2) walk(f, depth + 1); continue; }
+      if (e.isDirectory()) { stack.push([f, false]); continue; }
       if (!e.isFile()) continue;
-      try { const st = lstatSync(f); seen.add(`${st.dev}:${st.ino}`); } catch { /* skip */ }
+      try { const st = lstatSync(f); seen.add(`${st.dev}:${st.ino}`); } catch { complete = false; }
     }
-  };
-  for (const d of secretDirs(home, extraDirs)) walk(d, 1);
-  return seen;
+  }
+  return { seen, complete };
 }
 
 // Resolve an attachment argument → { typed, real, isDir, files: [realpaths], ids: {real → "dev:ino"} }.
 // Throws a legible refusal. Files of ANY type are allowed; a folder attaches its top-level regular
 // files (≤ ATTACH_DIR_MAX_FILES, hidden and secret entries skipped and reported).
-export function resolveAttachment(input, { home = homedir(), cwd = process.cwd(), extraDirs = [] } = {}) {
+export function resolveAttachment(input, { home = homedir(), cwd = process.cwd(), extraDirs = [], walkMax = SECRET_WALK_MAX } = {}) {
   if (!String(input || "").trim()) throw new Error("attachment path is empty");
   const typed = resolvePath(cwd, expandHome(String(input || "").trim(), home));
   const opt = { home, extraDirs };
@@ -109,11 +178,21 @@ export function resolveAttachment(input, { home = homedir(), cwd = process.cwd()
   try { real = realpathSync.native(typed); } catch { try { real = realpathSync(typed); } catch { throw new Error(`attachment not found: ${typed}`); } }
   const reason = secretPathReason(real, opt);
   if (reason) throw new Error(`attachment refused: ${typed} resolves to ${real} — ${reason}`);
-  const inodes = secretInodes(home, extraDirs);
+  const via = chainReason(typed, opt);
+  if (via) throw new Error(`attachment refused: ${typed} is a symlink through ${via.hop} — ${via.reason}`);
+  let inodes = null;
+  const linkReason = (s) => {
+    if (s.nlink <= 1) return null;
+    inodes = inodes || secretInodes(home, extraDirs, walkMax);
+    if (inodes.seen.has(idOf(s))) return "a hard link to a file in a secret/key directory";
+    if (!inodes.complete) return "a hard-linked file (nlink > 1) and the secret directories could not be fully checked";
+    return null;
+  };
   const idOf = (st) => `${st.dev}:${st.ino}`;
   const st = statSync(real);
   if (st.isFile()) {
-    if (inodes.has(idOf(st))) throw new Error(`attachment refused: ${typed} is a hard link to a file in a secret/key directory`);
+    const hl = linkReason(st);
+    if (hl) throw new Error(`attachment refused: ${typed} is ${hl}`);
     return { typed, real, isDir: false, files: [real], skipped: [], ids: { [real]: idOf(st) } };
   }
   if (!st.isDirectory()) throw new Error(`attachment is not a regular file or folder: ${real}`);
@@ -123,11 +202,12 @@ export function resolveAttachment(input, { home = homedir(), cwd = process.cwd()
     const why0 = secretPathReason(join(real, ent), opt);
     if (why0) { skipped.push(`${ent} (secret: ${why0})`); continue; }
     let r; try { r = realpathSync.native(join(real, ent)); } catch { skipped.push(`${ent} (unreadable)`); continue; }
-    const why = secretPathReason(r, opt);
+    const why = secretPathReason(r, opt) || (chainReason(join(real, ent), opt) || {}).reason;
     if (why) { skipped.push(`${ent} (secret: ${why})`); continue; }
     let s; try { s = statSync(r); } catch { skipped.push(`${ent} (unreadable)`); continue; }
     if (!s.isFile()) { skipped.push(`${ent} (not a regular file)`); continue; }
-    if (inodes.has(idOf(s))) { skipped.push(`${ent} (secret: hard link to a key/token file)`); continue; }
+    const hl = linkReason(s);
+    if (hl) { skipped.push(`${ent} (secret: ${hl})`); continue; }
     files.push(r); ids[r] = idOf(s);
   }
   if (!files.length) throw new Error(`attachment folder ${real} has no attachable files${skipped.length ? ` (skipped: ${skipped.join(", ")})` : ""}`);
@@ -158,7 +238,10 @@ const MSG_CAP = 4000;
 // definition names use. One exception keeps emoji readable: a SINGLE U+FE0E/U+FE0F straight after
 // a visible character is left alone; a second one in a row, or any VS17–256 (U+E0100–E01EF), is
 // escaped (a run of variation selectors is the "emoji smuggling" encoding).
-const CONTENT_ESCAPE_SRC = `[\\u0000-\\u001f\\u007f\\u0085\\u2028\\u2029${INVISIBLE_CLASS}]`;
+// v0.2.31 re-check: all C1 controls U+0080–U+009F are escaped (CSI U+009B is an ANSI escape on
+// some terminals; U+0085 NEL is a line break — it was already escaped and is kept: no real text
+// needs a raw C1 control, and leaving any one of them raw would let a message forge a row).
+const CONTENT_ESCAPE_SRC = `[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029${INVISIBLE_CLASS}]`;
 const CONTENT_ESCAPE_G = new RegExp(CONTENT_ESCAPE_SRC, "gu");
 const CONTENT_ESCAPE_1 = new RegExp(CONTENT_ESCAPE_SRC, "u");
 const isVS = (c) => c === "\ufe0e" || c === "\ufe0f";

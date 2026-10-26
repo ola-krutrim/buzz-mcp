@@ -360,8 +360,21 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   the shim's own key store and wire tokens (`~/.config/buzz-cli/**` incl. `identities/*.hex` and
   `wire-refresh/*.tok`, plus the identity / token dirs the shim actually uses, resolved at runtime),
   `~/.buzz`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.kube`, `~/.azure`, `~/.password-store`,
-  `~/.config/{gcloud,gh,ekam}`, and anywhere: `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`,
-  `.credentials.json`, `kubeconfig`, `id_*`, `.env*`, `*.key`, `*.pem`, `*.hex`, `*.tok`, `*.authtag`.
+  `~/.config/{gcloud,gh,ekam}`, keyrings and credential stores (`~/.local/share/keyrings`,
+  `~/.local/share/kwalletd`, `~/.kde/share/apps/kwallet`, `~/Library/Keychains`, `~/.pki`,
+  `AppData/…/Microsoft/{Credentials,Protect}` — also matched anywhere), and anywhere: `.netrc`,
+  `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.credentials.json`, `kubeconfig`, `id_*`,
+  `.env*`, `*.key`, `*.pem`, `*.hex`, `*.tok`, `*.authtag`, `*.keychain(-db)`, `*.keyring`, `*.kwl`,
+  and shell / REPL history (`.bash_history`, `.zsh_history`, `.sh_history`, `fish_history`,
+  `.histfile`, `.python_history`, `.node_repl_history`, `.psql_history`, `.mysql_history`, …,
+  PowerShell `ConsoleHost_history.txt`, `~/.zsh_sessions`).
+  Kernel pseudo-filesystems are never attachable: anything under `/proc` (e.g. `/proc/self/environ`,
+  `/proc/<pid>/environ`, `/proc/self/fd/N`), `/sys` or `/dev` is refused — on the typed path, the
+  realpath and every hop of a symlink chain (so a link that detours through `/proc/self/cwd` is
+  refused too); on Windows, `\\.\` / `\\?\GLOBALROOT` device paths. Hard links are checked
+  against every file in the secret directories at any depth (e.g.
+  `~/.config/gcloud/legacy_credentials/<acct>/adc.json`); a hard-linked file is refused if that walk
+  can't be completed.
   The upload re-opens the checked file with `O_NOFOLLOW` and re-checks its device/inode, so a swap
   after the check is refused. This is a best-effort denylist: a secret stored under an ordinary
   name elsewhere is **not** detected. The result shows the resolved path.
@@ -370,12 +383,16 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 - **Untrusted output.** Every tool that returns relay text (`buzz_read`, `buzz_dm_read`,
   `buzz_thread_read`, `buzz_search`, `buzz_profile`, `buzz_attachment_read`, `buzz_channels`) starts
   with an "untrusted data" note. Message text, names and channel descriptions are escaped: newlines,
-  C0/DEL, and every invisible character — `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}`,
+  C0/DEL, the C1 controls U+0080–U+009F (NEL included), and every invisible character — `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}`,
   `\p{Cf}`, U+00AD, U+2061–2064 and the tag characters U+E0000–E007F — become visible `\u{..}`
   escapes (one shared definition with `names.mjs`; a single emoji variation selector is kept). Authors are shown as `name (pk8)`, with `⚠name-collision`
   when two people share a name, and the newest kind:0 wins. Inbound events are
   signature-verified (messages, edits, reactions, profiles): bad ones are dropped by default (`BUZZ_VERIFY_INBOUND=flag` keeps and flags them),
   and timestamps more than 5 minutes in the future are flagged.
+  Error text is untrusted too: the catch-all `error: …` result (and the join / edit-verify / login
+  error paths) is escaped the same way and capped at 1500 code points, so a relay error body or a
+  hostile profile / channel name can't inject a raw newline, control or bidi character. (Labels that
+  `names.mjs` already quoted show their backslashes doubled there, e.g. `\\u{202e}` — never raw.)
 - **Write safety.** A per-session throttle (`BUZZ_WRITE_PER_MIN`, default 10, 0 = off) plus duplicate
   suppression for an identical message or reaction within 2 minutes. @mentions use the
   v0.2.30 fail-closed resolution: a name that two people share, or that only matches as a lookalike,
