@@ -2436,6 +2436,11 @@ ${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }
 
+// nip44.mjs
+var SALT = new TextEncoder().encode("nip44-v2");
+var te = new TextEncoder();
+var td = new TextDecoder("utf-8", { fatal: true });
+
 // signer.mjs
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
