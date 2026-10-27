@@ -7,6 +7,8 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 import * as nip19 from "nostr-tools/nip19";
 import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
+import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
+import { verifyEvent } from "nostr-tools/pure";
 // buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
 // import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
 // (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
@@ -45,6 +47,13 @@ function sessionId() {
 // and calls /v1/me/wire-sign so events are signed AS the user (#317, Path A). PK is
 // the identity's pubkey either way.
 const signer = await resolveSigner({ sessionId: sessionId() });
+// (E, v0.2.30) Strict p-tag guard on EVERY event this shim signs: a p-tag value that isn't exactly
+// 64 lowercase hex (a malformed relay profile pubkey, an uppercase id, junk from a mention index)
+// never reaches the signer. Wrapping sign() covers posts, replies, DMs, moderation and openDm alike.
+{
+  const rawSign = signer.sign.bind(signer);
+  signer.sign = (tpl) => { assertPTags(tpl && tpl.tags); return rawSign(tpl); };
+}
 const PK = signer.pubkey;
 
 // ---- context-derived friendly name (like Codex): <repo-or-dir>·<memorable> ----
@@ -142,7 +151,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.29";
+const SHIM_VERSION = "0.2.30";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -511,6 +520,7 @@ async function publishProfile(name) {
     display_name: name, name,
     about: `${AGENT_MODEL} · ${AGENT_HARNESS} · ${AGENT_INTERFACE} · ${host}`,
     model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE,
+    client_version: SHIM_VERSION,   // (C, v0.2.30) which shim build published this profile
   };
   // The kind:0 profile is the write-health canary — record its outcome (via bridge()). In agent mode
   // this fires on boot, so even a read-only session gets a real write signal.
@@ -521,8 +531,9 @@ async function publishProfile(name) {
   // the 10100 permission would otherwise show a false "posts failing" every boot (dx #2). Use
   // bridgeCore (full transport self-heal, but NOT recorded).
   try {
-    const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed" };
-    const cardTags = [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"]];
+    const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed", client_version: SHIM_VERSION };
+    const cardTags = [["model", AGENT_MODEL], ["harness", AGENT_HARNESS], ["interface", AGENT_INTERFACE], ["L", "agent-card"],
+      ["client", "buzz-mcp", SHIM_VERSION]];   // (C, v0.2.30) client + version on the agent card
     // 2b — individual-signed owner attestation for the owner-admission picker. kind:10100 ONLY,
     // appended VERBATIM as its own ["picker-owner",…] tag (NOT a second ["auth",…], so it never rides
     // the relay's auth-tag / >1-auth-tag-multiplicity path). C3: it is placed here and nowhere else.
@@ -568,10 +579,17 @@ async function profiles() {
   for (const e of evs || []) { try { const c = JSON.parse(e.content); m[e.pubkey] = c.display_name || c.name || e.pubkey.slice(0, 8); } catch {} }
   return m;
 }
+// (v0.2.30 fix, buzz_security review §3.1) Fail-closed channel lookup: exact id, else matchChannel
+// (exact → case-only → lookalike; two channels sharing a name — "general"/"General" — or a single
+// lookalike-only hit are REFUSED with the ids to pick from, never resolved to whichever came first).
+class ChannelAmbiguousError extends Error {}
+const CHANNELS_LISTED_MAX = 50;
 async function resolveChannel(nameOrId) {
   const cs = await channels();
-  const hit = cs.find((c) => c.id === nameOrId) || cs.find((c) => c.name.toLowerCase() === String(nameOrId).toLowerCase());
-  if (!hit) throw new Error(`channel not found: ${nameOrId}. Available: ${cs.map((c) => c.name).join(", ")}`);
+  let hit;
+  try { hit = matchChannel(nameOrId, cs); } catch (e) { throw new ChannelAmbiguousError(e.message); }
+  // (v0.2.30 re-check nit) the typed input and every listed name are quoted + escaped + capped.
+  if (!hit) throw new Error(`channel not found: ${quoteLabel(nameOrId)}. Available: ${cs.slice(0, CHANNELS_LISTED_MAX).map((c) => quoteLabel(c.name)).join(", ")}${cs.length > CHANNELS_LISTED_MAX ? ` …and ${cs.length - CHANNELS_LISTED_MAX} more (buzz_channels lists all)` : ""}`);
   return hit;
 }
 
@@ -593,43 +611,88 @@ async function dmChannels() {
     })
     .filter((c) => c.id);
 }
-// Fetch kind:0 profiles matching a free-text term via the relay's NIP-50 profile search
-// (buzz-search prefix/typeahead on kinds:[0]) — NOT the 200-newest {kinds:[0]} window that
-// profiles() uses. A profile that hasn't been updated recently (pushed past that window by
-// hundreds of newer ones) is still found this way. Returns the candidate set, unparsed names
-// kept verbatim so resolveRecipient* can exact-match. Fails SOFT (returns []) so a relay that
-// doesn't serve profile search degrades to "not found", never to a wrong match.
+// Candidate kind:0 profiles for a free-text name, NOT the 200-newest {kinds:[0]} window that
+// profiles() uses (a profile not updated recently is still found). (B, v0.2.30) Prefer the relay's
+// dedicated POST /profiles/search (NIP-98; matches name/display_name only, best match first —
+// buzz docs/profile-search.md); on 404/405 (older relay) or a non-array body fall back to NIP-50
+// {kinds:[0], search} and remember that for 5 min, like the mobile client. Fails SOFT (returns [])
+// so a relay without profile search degrades to "not found", never to a wrong match — matching
+// itself is always done client-side by matchProfiles (name/display_name only, fail-closed).
+const PROFILE_SEARCH_FALLBACK_MS = 5 * 60_000;
+let PROFILE_SEARCH_UNSUPPORTED_UNTIL = 0;
+const profileFromEvent = (e) => {
+  try {
+    const c = JSON.parse(e.content);
+    return { pubkey: e.pubkey, created_at: e.created_at || 0, name: typeof c.name === "string" ? c.name : "", display_name: typeof c.display_name === "string" ? c.display_name : "", nip05: c.nip05 || "" };
+  } catch { return null; }
+};
+// (v0.2.30 re-check nit, buzz_security REVIEW §7.8) FAIL CLOSED: a search that could not run is an
+// ERROR, never an empty result — "no results" would let a partial candidate set look unambiguous
+// (and read as "nobody by that name"). /profiles/search 404/405 still falls back to NIP-50.
+class ProfileSearchError extends Error {}
 async function searchProfiles(term, limit = 50) {
   const q = String(term || "").trim();
   if (!q) return [];
-  let evs = [];
-  try { evs = await query([{ kinds: [0], search: q, limit }]) || []; } catch { evs = []; }
-  const out = [];
-  for (const e of evs) {
-    try { const c = JSON.parse(e.content); out.push({ pubkey: e.pubkey, name: c.name || "", display_name: c.display_name || "", nip05: c.nip05 || "" }); } catch { /* skip unparseable */ }
+  let evs = null, apiErr = null;
+  if (Date.now() >= PROFILE_SEARCH_UNSUPPORTED_UNTIL && [...q].length <= 100) {
+    try {
+      const r = await bridge("/profiles/search", { query: q, limit: Math.min(limit, 100) });
+      if (Array.isArray(r)) evs = r;
+      else PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
+    } catch (e) {
+      if (/HTTP 40[45]\b/.test(String(e && e.message))) PROFILE_SEARCH_UNSUPPORTED_UNTIL = Date.now() + PROFILE_SEARCH_FALLBACK_MS;
+      else apiErr = e;
+    }
   }
-  return out;
+  if (evs === null) {
+    try { evs = await query([{ kinds: [0], search: q, limit }]) || []; }
+    catch (e) {
+      const why = [apiErr && `/profiles/search: ${apiErr.message}`, `NIP-50 search: ${e && e.message || e}`].filter(Boolean).map((m) => quoteLabel(m, 160)).join("; ");
+      throw new ProfileSearchError(`profile search for ${quoteLabel(q)} failed (${why}) — the directory could not be searched, so the name can't be resolved safely; try again, or use an npub`);
+    }
+  }
+  return evs.filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean);
 }
-// Invisible / direction-manipulating characters used to forge lookalike names: bidi overrides
-// (U+202A–202E, U+2066–2069) and zero-width chars (U+200B–200D, U+2060, U+FEFF). Rejected outright
-// in a channel name (channelNameError), and stripped before name matching so a bidi/zero-width
-// lookalike can't slip past an exact compare (buzz_security #12 note a / #13 note b).
-const NAME_INVIS = /[‪-‮⁦-⁩​-‍⁠﻿]/;
-const NAME_INVIS_G = new RegExp(NAME_INVIS.source, "g");
-const normName = (s) => String(s).normalize("NFC").replace(NAME_INVIS_G, "").trim().toLowerCase();
-// Match against BOTH profile name fields — a client may show `display_name` while the profile's
-// `name` differs (or vice versa), e.g. "Anirban Das" vs "Anirban D Das", so matching one field
-// alone silently misses. Both sides are normalized (NFC + invisible chars stripped) so a
-// bidi/zero-width lookalike can't evade the compare. FAIL-CLOSED: >1 distinct pubkey is ambiguous
-// and refused (never auto-pick a DM/moderation target); 0 returns null → caller throws.
+// Merge candidate sets by pubkey, newest kind:0 wins.
+function mergeProfiles(...lists) {
+  const m = new Map();
+  for (const l of lists) for (const p of l) { const prev = m.get(p.pubkey); if (!prev || p.created_at > prev.created_at) m.set(p.pubkey, p); }
+  return [...m.values()];
+}
+// (A, v0.2.30) NIP-IA archived identities: the newest kind:13535 signed by the relay's NIP-11
+// `self` key (exactly one ["-"] tag, bare ["p", pk] entries). Lists by any other key are ignored.
+// Archived pubkeys are hidden from name resolution and buzz_agents. FAIL OPEN: no `self`, no list,
+// an invalid signature or a read error → nothing is hidden (archival is a UX filter, not authz).
+let ARCHIVED = { set: new Set(), at: 0, eventId: null };
+const ARCHIVED_TTL = 30_000;
+async function archivedPubkeys() {
+  if (Date.now() - ARCHIVED.at < ARCHIVED_TTL) return ARCHIVED.set;
+  let next = { set: new Set(), eventId: null };
+  try {
+    const info = await relayInfo();
+    if (info && isPubkeyHex(info.self)) {
+      const evs = await query([{ kinds: [13535], authors: [info.self], limit: 10 }]) || [];
+      next = archivedFromEvents(evs, info.self, verifyEvent);
+    }
+  } catch { /* fail open */ }
+  ARCHIVED = { ...next, at: Date.now() };
+  return ARCHIVED.set;
+}
+// Resolve a display name → pubkey (v0.2.30 hardening). Candidates come from searching BOTH the input
+// as typed and its NFKC+case-folded form (merged by pubkey); matchProfiles then matches only the
+// name/display_name fields, ranks exact > case-only > lookalike (NFKC / TR39 skeleton), and FAILS
+// CLOSED: >1 distinct pubkey → ambiguous; a single non-exact hit → "ambiguous / lookalike - use an
+// npub" (case-only per CASE_ONLY_IS_AMBIGUOUS). Archived (NIP-IA) identities never resolve.
 async function resolveRecipientByName(s) {
-  const want = normName(s);
-  if (!want) return null;
-  const hits = [...new Set((await searchProfiles(s)).filter((p) =>
-    normName(p.name) === want || normName(p.display_name) === want
-  ).map((p) => p.pubkey))];
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw new Error(`"${s}" is ambiguous (${hits.length} people share that name) — use an npub`);
+  const folded = foldName(s);
+  if (!folded) return null;
+  const typed = String(s).trim();
+  const lists = [await searchProfiles(typed)];
+  if (folded !== typed) lists.push(await searchProfiles(folded));
+  const archived = await archivedPubkeys();
+  const r = matchProfiles(s, mergeProfiles(...lists), { caseOnlyIsAmbiguous: CASE_ONLY_IS_AMBIGUOUS, archived });
+  if (r.pubkey) return r.pubkey;
+  if (r.archived) throw new Error(`${quoteLabel(s)} matches only an archived identity on this relay (NIP-IA) — use an npub if you really mean it`);
   return null;
 }
 // Resolve a recipient token → pubkey hex. npub / hex are exact. An email resolves ONLY via Ekam's
@@ -641,19 +704,24 @@ async function resolveRecipient(to) {
   const s = String(to || "").trim();
   if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
   if (s.startsWith("npub")) { const d = nip19.decode(s); if (d.type === "npub") return d.data; throw new Error(`bad npub: ${s}`); }
-  if (s.includes("@")) {
+  if (looksLikeEmail(s)) {
+    // (v0.2.30) refuse a homoglyph / zero-width / fullwidth email BEFORE any Ekam or directory call.
+    const bad = emailError(s);
+    if (bad) throw new Error(bad);
     if (signer.mode === "wire" && typeof signer.ekamToken === "function") return await resolveEmail(s);
     throw new Error(`email addressing needs wire mode ("post as me") — in agent mode, use an npub, hex pubkey, or exact display name instead`);
   }
   const pk = await resolveRecipientByName(s);
   if (pk) return pk;
-  throw new Error(`can't resolve recipient "${to}" — pass an npub, hex pubkey, email, or exact display name`);
+  throw new Error(`can't resolve recipient ${quoteLabel(to)} — pass an npub, hex pubkey, email, or exact display name`);
 }
 // email→pubkey via Ekam's directory resolver (ekam #324): GET /v1/directory/resolve?email=,
 // bearer the wire:sign token (same WHO-gate, no new credential). Returns the CANONICAL live
 // pubkey for governed recipients only — a `404 not_governed` is the SAFE signal to fall back
 // to npub/name (Ekam won't mint a device-key user a key they never read on). Wire-mode only.
 async function resolveEmail(email) {
+  const bad = emailError(email);   // defense in depth: never send a non-ASCII/invisible email to the directory
+  if (bad) throw new Error(bad);
   if (signer.mode !== "wire" || typeof signer.ekamToken !== "function")
     throw new Error(`email addressing needs wire mode ("post as me") — pass an npub, hex pubkey, or exact display name instead`);
   const base = (signer.ekamBase ? signer.ekamBase() : (process.env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com")).replace(/\/+$/, "");
@@ -670,6 +738,42 @@ async function resolveEmail(email) {
   if (res.status === 404)
     throw new Error(`no directory identity for "${email}" in your workspace`);
   throw new Error(`directory resolve "${email}" -> HTTP ${res.status}: ${text.slice(0, 120)}`);
+}
+// (D, v0.2.30) Re-read a channel's newest kind:39000 and compare the fields an edit asked for.
+// The relay regenerates 39000 synchronously on a 9002, but allow a short settle (3 reads) before
+// declaring a mismatch. `want`: { name?, visibility?: "open"|"private", about?, ttl?: string|null }.
+const EDIT_VERIFY_TRIES = 3, EDIT_VERIFY_GAP_MS = 400;
+function channelMetaFields(ev) {
+  const tags = (ev && ev.tags) || [];
+  const get = (k) => { const t = tags.find((x) => x[0] === k); return t ? (t[1] ?? "") : null; };
+  return {
+    name: get("name"),
+    visibility: tags.some((t) => t[0] === "private") ? "private" : tags.some((t) => t[0] === "public") ? "open" : null,
+    about: (get("about") || "").trim(),
+    ttl: get("ttl") || null,
+  };
+}
+async function verifyChannelEdit(chId, want) {
+  let mismatches = [], unreadable = null;
+  for (let i = 0; i < EDIT_VERIFY_TRIES; i++) {
+    if (i) await new Promise((r) => setTimeout(r, EDIT_VERIFY_GAP_MS));
+    let evs;
+    try { evs = await query([{ kinds: [39000], "#d": [chId], limit: 5 }]) || []; }
+    catch (e) { unreadable = (e && e.message) || String(e); continue; }
+    const latest = evs.filter((e) => e && e.kind === 39000 && (e.tags || []).some((t) => t[0] === "d" && t[1] === chId))
+      .sort((a, b) => b.created_at - a.created_at)[0];
+    if (!latest) { unreadable = "no kind:39000 for this channel"; continue; }
+    unreadable = null;
+    const got = channelMetaFields(latest);
+    mismatches = [];
+    const norm = (x) => (x == null ? x : String(x).normalize("NFC").trim());
+    if ("visibility" in want && got.visibility !== want.visibility) mismatches.push(`visibility: asked ${want.visibility}, relay shows ${got.visibility || "unknown"}${want.visibility === "private" ? " (channel may still be PUBLIC)" : ""}`);
+    if ("name" in want && norm(got.name) !== norm(want.name)) mismatches.push(`name: asked ${JSON.stringify(want.name)}, relay shows ${JSON.stringify(got.name)}`);
+    if ("ttl" in want && (got.ttl || null) !== (want.ttl || null)) mismatches.push(`ttl: asked ${want.ttl ? want.ttl + "s" : "none (permanent)"}, relay shows ${got.ttl ? got.ttl + "s" : "none"}`);
+    if ("about" in want && got.about !== want.about) mismatches.push(`description: asked ${JSON.stringify(want.about.slice(0, 60))}, relay shows ${JSON.stringify(got.about.slice(0, 60))}`);
+    if (!mismatches.length) return { ok: true, mismatches, unreadable: null };
+  }
+  return { ok: false, mismatches, unreadable: mismatches.length ? null : unreadable };
 }
 // Open (idempotent) a DM with the given OTHER-participant pubkeys → { channelId, created }.
 async function openDm(others) {
@@ -713,22 +817,35 @@ async function resolveEventInChannel(chId, chName, rawEvent) {
     throw new Error(`target message is not bound to #${chName} — refusing a cross-channel operation`);
   return hit;
 }
-// @-mention → p-tag pubkeys. Same multi-key index buzz_post uses so @Pulse resolves even when the
-// display name carries an icon/space ("Pulse 💓") or punctuation ("bharatrouter·falcon").
-function mentionPtags(text, names) {
-  const byName = {};
-  for (const [pk, n] of Object.entries(names)) {
-    const low = String(n).toLowerCase();
-    const keys = new Set([low, low.replace(/[^a-z0-9]+/g, ""), (low.match(/[a-z0-9]+/) || [""])[0]]);
-    for (const k of keys) if (k && !(k in byName)) byName[k] = pk;
+// @-mention → p-tag pubkeys (v0.2.30 fix, buzz_security review §3.1). The old index was a
+// lowercase FIRST-WINS map over the 200-newest kind:0 window, so "@buzz_security" tagged whichever
+// of two same-named keys came first (the retired 7731945f…). Mentions now go through the same
+// fail-closed matchProfiles tiers as recipient names (names.mjs resolveMentions): candidates are the
+// 200-newest window PLUS a server-side profile search per token (so a real profile outside the window
+// is still seen and collides with an impostor), archived (NIP-IA) identities never resolve, and an
+// ambiguous / lookalike-only token tags NOBODY and is reported back. "Pulse 💓" → @pulse and
+// "bharatrouter·falcon" → @bharatrouterfalcon still work (derived aliases, see mentionAliases).
+async function mentionPtags(text) {
+  const toks = mentionTokens(text);
+  if (!toks.length) return { pubkeys: [], refused: [] };
+  const lists = [];
+  try { lists.push(((await query([{ kinds: [0], limit: 200 }])) || []).filter((e) => e && e.kind === 0).map(profileFromEvent).filter(Boolean)); } catch { /* search below */ }
+  // A token whose search FAILED is never resolved from the partial (200-newest) list — that list
+  // can't prove the name is unique — it is reported "NOT tagged" with the search error instead.
+  const searched = toks.slice(0, MENTION_MAX_TOKENS), failed = [];
+  for (const t of searched) {
+    try { lists.push(await searchProfiles(t)); }
+    catch (e) { failed.push({ token: t, reason: String(e && e.message || e).replace(/; try again, or use an npub$/, "") }); }
   }
-  const out = [];
-  for (const m of (String(text).match(/@([A-Za-z0-9_-]+)/g) || [])) {
-    const pk = byName[m.slice(1).toLowerCase()];
-    if (pk && !out.includes(pk)) out.push(pk);
-  }
-  return out;
+  const archived = await archivedPubkeys();
+  const okToks = searched.filter((t) => !failed.some((f) => f.token === t));
+  const r = resolveMentions(okToks.map((t) => "@" + t).join(" "), mergeProfiles(...lists), { archived });
+  const over = toks.slice(MENTION_MAX_TOKENS).map((token) => ({ token, reason: `more than ${MENTION_MAX_TOKENS} distinct @mentions in one message` }));
+  return { pubkeys: r.pubkeys, refused: [...failed, ...r.refused, ...over] };
 }
+const mentionNote = (r) => (r && r.refused && r.refused.length)
+  ? ` — NOT tagged (fail-closed): ${r.refused.map((x) => `@${x.token}: ${x.reason}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.`
+  : "";
 
 // ---- channel name/about client-side limits (v0.2.27, per buzz_security's 0.2.26 GO notes) ----
 // The relay caps neither a channel name nor its description — the only server check is
@@ -742,13 +859,19 @@ const CHANNEL_ABOUT_MAX = 500;
 const CTRL_ANY = /[\u0000-\u001f\u007f]/;                          // all C0 controls + DEL (incl. TAB/LF/CR)
 const CTRL_NON_WS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/; // C0 + DEL except TAB/LF/CR
 const cpLen = (s) => [...String(s)].length;                        // count code points, not UTF-16 units
+// Channel-name canonicalization shared by create/edit: drop leading '#'/space, trailing space, and
+// strip variation selectors (VS1–VS256) so emoji names like "Pulse 💓" / "Pulse ❤️" still work —
+// every other invisible / Bidi_Control char is rejected by channelNameError, never silently stripped.
+const canonChannelName = (s) => stripVariationSelectors(String(s)).replace(/^[#\s]+/, "").replace(/\s+$/, "");
 function channelNameError(name) {
   if (cpLen(name) > CHANNEL_NAME_MAX)
     return `channel name is too long (${cpLen(name)} chars; max ${CHANNEL_NAME_MAX}).`;
   if (CTRL_ANY.test(name))
     return "channel name can't contain control characters or line breaks.";
-  if (NAME_INVIS.test(name))
-    return "channel name can't contain bidirectional-override or zero-width characters.";
+  if (BIDI_CONTROL.test(name))
+    return "channel name can't contain bidirectional control characters (LRM/RLM/ALM, embeddings, overrides, isolates).";
+  if (CHANNEL_NAME_FORBIDDEN.test(name))
+    return "channel name can't contain zero-width or other invisible (default-ignorable) characters.";
   return null;
 }
 function channelAboutError(about) {
@@ -811,7 +934,7 @@ async function relayInfo() {
   try {
     const r = await fetch(`${RELAY}/`, { headers: { Accept: "application/nostr+json" } });
     const j = await r.json();
-    RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null };
+    RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null, self: typeof j.self === "string" ? j.self : null };
     try {
       CLIENT_VERSION = clientVersionStatus(SHIM_VERSION, pickAdvertised(j));
       if (CLIENT_VERSION.message && !VERSION_NUDGED) { VERSION_NUDGED = true; process.stderr.write(CLIENT_VERSION.message + "\n"); }
@@ -870,7 +993,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "buzz_agents") {
       const p = await profiles();
-      return ok(Object.entries(p).map(([pk, n]) => `${n}  ${pk.slice(0, 12)}…`).join("\n") || "(none)");
+      const archived = await archivedPubkeys();   // (A) NIP-IA archived identities are hidden
+      const rows = Object.entries(p).filter(([pk]) => !archived.has(pk));
+      const hidden = Object.keys(p).length - rows.length;
+      return ok((rows.map(([pk, n]) => `${n}  ${pk.slice(0, 12)}…`).join("\n") || "(none)")
+        + (hidden ? `\n(${hidden} archived identit${hidden === 1 ? "y" : "ies"} hidden — NIP-IA)` : ""));
     }
 
     if (name === "buzz_read") {
@@ -929,26 +1056,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (bodyText === null)
         return { content: [{ type: "text", text: "buzz_post requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
       const ch = await resolveChannel(a.channel);
-      const names = await profiles();
-      // Index each identity under several keys so @Pulse resolves even when the
-      // display name carries an icon/space (e.g. "Pulse 💓") or punctuation
-      // (e.g. "bharatrouter·falcon"): full-normalized, spaceless, and first token.
-      const byName = {};
-      for (const [pk, n] of Object.entries(names)) {
-        const low = n.toLowerCase();
-        const keys = new Set([
-          low,
-          low.replace(/[^a-z0-9]+/g, ""),            // "pulse💓"->"pulse", strip icon/space
-          (low.match(/[a-z0-9]+/) || [""])[0],       // first alnum token: "pulse"
-        ]);
-        for (const k of keys) if (k && !(k in byName)) byName[k] = pk;
-      }
+      // @-mentions → p-tags, fail-closed (mentionPtags: exact first, ambiguous/lookalike/archived
+      // tags nobody and is reported). (E) only strict 64-lowercase-hex pubkeys.
       const tags = [["h", ch.id]];
       if (AUTH_TAG) tags.push(AUTH_TAG);   // NIP-OA owner attestation → "Agent managed by <owner>"
-      for (const m of (bodyText.match(/@([A-Za-z0-9_-]+)/g) || [])) {
-        const pk = byName[m.slice(1).toLowerCase()];
-        if (pk) tags.push(["p", pk]);
-      }
+      const mres = await mentionPtags(bodyText);
+      for (const pk of mres.pubkeys) tags.push(["p", pk]);
       // Optional attachment: upload the local file (Blossom) → attach a NIP-92 imeta tag
       // whose url/x match exactly what was uploaded (hash-bound). Content echoes the url too,
       // matching how Buzz clients render attachments.
@@ -962,7 +1075,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${bodyText}`);
+      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}${mentionNote(mres)}: ${bodyText}`);
     }
 
     if (name === "buzz_attachment_read") {
@@ -1084,7 +1197,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // p-tags: the author being replied to (NIP-10) + any @-mentions in the body (buzz_post idiom).
       const ptags = new Set();
       if (/^[0-9a-f]{64}$/i.test(target.pubkey || "")) ptags.add(target.pubkey.toLowerCase());
-      for (const pk of mentionPtags(bodyText, names)) ptags.add(pk);
+      const mres = await mentionPtags(bodyText);
+      for (const pk of mres.pubkeys) ptags.add(pk);
       for (const pk of ptags) tags.push(["p", pk]);
       // Optional attachment: upload the local file (Blossom) → NIP-92 imeta tag, url echoed in content.
       let attached = null, content = bodyText;
@@ -1098,7 +1212,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       await bridge("/events", ev);
       const who = names[target.pubkey] || (target.pubkey || "").slice(0, 8);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`replied in #${ch.name} to ${who}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}: ${bodyText}`);
+      return ok(`replied in #${ch.name} to ${who}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}${mentionNote(mres)}: ${bodyText}`);
     }
 
     if (name === "buzz_forward") {
@@ -1165,7 +1279,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "buzz_create_channel") {
       if (!IDENTITY_OK) return modRefuse("creating a channel");
       // Mirror buzz-core canonical_channel_name: strip a leading '#'/whitespace and trailing whitespace.
-      const chName = (typeof a.name === "string" ? a.name : "").replace(/^[#\s]+/, "").replace(/\s+$/, "");
+      const chName = canonChannelName(typeof a.name === "string" ? a.name : "");
       if (!chName)
         return { content: [{ type: "text", text: "buzz_create_channel needs a non-empty `name`." }], isError: true };
       const nameErr = channelNameError(chName);
@@ -1204,7 +1318,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const tags = [["h", ch.id]];
       const changed = [];
       if (a.name != null && String(a.name).trim() !== "") {
-        const nn = String(a.name).replace(/^[#\s]+/, "").replace(/\s+$/, "");
+        const nn = canonChannelName(a.name);
         if (!nn) return { content: [{ type: "text", text: "buzz_edit_channel: `name` can't be only '#'/whitespace." }], isError: true };
         const nameErr = channelNameError(nn);
         if (nameErr) return { content: [{ type: "text", text: `buzz_edit_channel: ${nameErr}` }], isError: true };
@@ -1247,7 +1361,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: 9002, tags, content: "" });
       await bridge("/events", ev);
-      return ok(`edited #${ch.name}: ${changed.join(", ")}. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
+      // (D, v0.2.30) Read-back: an accepted 9002 is not proof the relay applied it. Re-read the
+      // channel's kind:39000 and compare every field we asked to change — a mismatch (above all
+      // visibility/private, name, ttl) is reported as an ERROR, never as "edited".
+      const want = {};
+      for (const t of tags) {
+        if (t[0] === "name") want.name = t[1];
+        if (t[0] === "visibility") want.visibility = t[1];
+        if (t[0] === "about") want.about = t[1].trim();
+        if (t[0] === "ttl") want.ttl = t[1] || null;
+      }
+      const v = await verifyChannelEdit(ch.id, want);
+      if (!v.ok)
+        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${ch.name}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${v.unreadable})` : `its kind:39000 metadata does NOT reflect it — ${v.mismatches.join("; ")}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
+      return ok(`edited #${ch.name}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
     }
 
     if (name === "buzz_join_channel") {
@@ -1273,7 +1400,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           }
         } catch { /* unknown → relay remains the gate */ }
       } else {
-        try { const hit = await resolveChannel(q); chId = hit.id; chName = hit.name; } catch { /* not a member yet — discover below */ }
+        try { const hit = await resolveChannel(q); chId = hit.id; chName = hit.name; }
+        catch (e) { if (e instanceof ChannelAmbiguousError) throw e; /* not a member yet — discover below */ }
         if (!chId) {
           // resolveChannel is member-first and can't see an OPEN channel you're not in yet. Discover
           // by name among the workspace's kind:39000 metadata. Only an OPEN match is self-joinable;
@@ -1282,11 +1410,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           const named = (metas || []).map((e) => {
             const t = Object.fromEntries((e.tags || []).map((x) => [x[0], x[1]]));
             const isPrivate = (e.tags || []).some((x) => x[0] === "private");
-            return { id: t.d, name: t.name || "", open: !isPrivate };
-          }).filter((c) => c.id && c.name.toLowerCase() === q.toLowerCase());
-          const open = named.find((c) => c.open);
-          if (open) { chId = open.id; chName = open.name; }
-          else if (named.length > 0) return privateRefusal(named[0].name || q);
+            return { id: t.d, name: t.name || "", open: !isPrivate, at: e.created_at || 0 };
+          }).filter((c) => c.id).sort((x, y) => y.at - x.at)
+            .filter((c, i, arr) => arr.findIndex((o) => o.id === c.id) === i);   // newest 39000 per channel id
+          // Same fail-closed matcher: two channels sharing the name (open or private) → refused.
+          let hit = null;
+          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${e.message}` }], isError: true }; }
+          if (hit && hit.open) { chId = hit.id; chName = hit.name; }
+          else if (hit) return privateRefusal(hit.name || q);
         }
       }
       if (knownPrivate) return privateRefusal(chName);

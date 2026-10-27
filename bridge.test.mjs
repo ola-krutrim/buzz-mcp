@@ -27,11 +27,11 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { statSync } from "node:fs";
-import { getPublicKey } from "nostr-tools/pure";
+import { getPublicKey, finalizeEvent } from "nostr-tools/pure";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHIM = join(HERE, "buzz-mcp.mjs");
@@ -39,6 +39,10 @@ const SHIM = join(HERE, "buzz-mcp.mjs");
 let pass = 0, fail = 0, skip = 0;
 const ok = (c, m) => (c ? (pass++, console.log("  ✅ " + m)) : (fail++, console.log("  ❌ " + m)));
 const skipped = (m) => (skip++, console.log("  ⊘ SKIP " + m));
+// v0.2.30: in the capture-based cases (31–34 and the new 35+), "nothing was captured" is a FAILURE,
+// never a skip — a shim that crashed before signing must not read as green.
+const missing = (m) => ok(false, "MISSING CAPTURE (counts as a failure): " + m);
+const isErr = (text) => typeof text === "string" && /"isError":true/.test(text);
 
 // Drive the shim over stdio: initialize, one buzz_read, capture the reply text a
 // client would receive. Returns the stringified result/error for tool call id 2.
@@ -734,7 +738,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.29), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.30), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -745,7 +749,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.29", `serverInfo.version === '0.2.29' (got '${si.version}')`);
+    ok(si.version === "0.2.30", `serverInfo.version === '0.2.30' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -763,7 +767,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.29/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.29'");
+    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.30'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -780,7 +784,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.29/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.29'");
+    ok(/@ola\/buzz-mcp v0\.2\.30/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.30'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1205,26 +1209,42 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
     { name: "private forum, #-prefixed padded name + description", args: { name: "#  Ops Review ", visibility: "private", type: "forum", description: "weekly ops" },
       wantName: "Ops Review", wantVis: "private", wantType: "forum", wantAbout: "weekly ops" },
     // v0.2.27 client-side limits (per buzz_security's 0.2.26 GO notes) — each must be refused, no 9007 signed.
-    { name: "name too long (81 chars) is refused", args: { name: "x".repeat(81) }, wantRefused: true },
-    { name: "name with a control char is refused", args: { name: "ops\u0007room" }, wantRefused: true },
-    { name: "name with a line break is refused", args: { name: "ops\nroom" }, wantRefused: true },
-    { name: "name with a bidi override is refused (v0.2.29 anti-lookalike)", args: { name: "ops‮room" }, wantRefused: true },
-    { name: "name with a zero-width char is refused (v0.2.29 anti-lookalike)", args: { name: "ops​room" }, wantRefused: true },
-    { name: "description too long (501 chars) is refused", args: { name: "notes", description: "y".repeat(501) }, wantRefused: true },
+    { name: "name too long (81 chars) is refused", args: { name: "x".repeat(81) }, wantRefused: true, wantErr: /too long/ },
+    { name: "name with a control char is refused", args: { name: "ops\u0007room" }, wantRefused: true, wantErr: /control characters/ },
+    { name: "name with a line break is refused", args: { name: "ops\nroom" }, wantRefused: true, wantErr: /control characters/ },
+    { name: "name with a bidi override is refused (v0.2.29 anti-lookalike)", args: { name: "ops\u202Eroom" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "name with a zero-width char is refused (v0.2.29 anti-lookalike)", args: { name: "ops\u200Broom" }, wantRefused: true, wantErr: /invisible|zero-width/ },
+    { name: "description too long (501 chars) is refused", args: { name: "notes", description: "y".repeat(501) }, wantRefused: true, wantErr: /too long/ },
+    // v0.2.30: every Bidi_Control is refused (LRM/RLM/ALM were not in the v0.2.29 set) + other default-ignorables.
+    { name: "name with LRM U+200E is refused (v0.2.30)", args: { name: "ops\u200Eroom" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "name with RLM U+200F is refused (v0.2.30)", args: { name: "ops\u200Froom" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "name with ALM U+061C is refused (v0.2.30)", args: { name: "ops\u061Croom" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "name with an isolate U+2067 is refused (v0.2.30)", args: { name: "ops\u2067room" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "name with a soft hyphen U+00AD is refused (v0.2.30)", args: { name: "ops\u00ADroom" }, wantRefused: true, wantErr: /invisible/ },
+    { name: "name with a BOM U+FEFF is refused (v0.2.30)", args: { name: "ops\uFEFFroom" }, wantRefused: true, wantErr: /invisible/ },
+    // Variation selectors are STRIPPED, not refused: emoji names keep working.
+    { name: "emoji name 'Pulse 💓' still works (v0.2.30)", args: { name: "Pulse 💓", visibility: "private" },
+      wantName: "Pulse 💓", wantVis: "private", wantType: "stream", wantAbout: undefined },
+    { name: "emoji + VS16 'Pulse ❤️' → VS stripped, accepted (v0.2.30)", args: { name: "Pulse \u2764\uFE0F", visibility: "private" },
+      wantName: "Pulse \u2764", wantVis: "private", wantType: "stream", wantAbout: undefined },
   ];
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   for (const c of cases) {
     const { relay, posted } = mk();
     await new Promise((r) => relay.listen(0, "127.0.0.1", r));
     const port = relay.address().port;
-    await probeTool({
+    const text = await probeTool({
       BUZZ_PRIVATE_KEY: "66".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
       BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
     }, "buzz_create_channel", c.args, { waitMs: 7000, callDelay: 1500 });
     relay.close();
     const ev = posted.find((e) => e && e.kind === 9007);
-    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9007 posted (client-side validation blocked it)`); continue; }
-    if (!ev) { skipped(`no kind:9007 event captured for '${c.name}'`); continue; }
+    if (c.wantRefused) {
+      ok(!ev, `${c.name} → no kind:9007 posted (client-side validation blocked it)`);
+      ok(isErr(text) && (!c.wantErr || c.wantErr.test(JSON.parse(text).content[0].text)), `${c.name} → the client got the refusal error${c.wantErr ? ` (${c.wantErr})` : ""}, not a crash/silence`);
+      continue;
+    }
+    if (!ev) { missing(`no kind:9007 event captured for '${c.name}'`); continue; }
     const tg = (k) => { const t = (ev.tags || []).find((x) => x[0] === k); return t ? t[1] : undefined; };
     console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
     ok(ev.kind === 9007, `${c.name} → kind 9007`);
@@ -1244,21 +1264,38 @@ console.log("\ncase 31: buzz_create_channel → kind:9007 create-group with the 
 console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed fields, under the channel h-tag");
 {
   const CHID = "c0ffee00-1111-2222-3333-444455556666";
+  // v0.2.30 (D): the mock now APPLIES each kind:9002 to its 39000 state (like the relay), so the
+  // shim's post-edit read-back verification sees the change; case 35 covers a relay that doesn't.
   const relayWith = () => {
     const posted = [];
     const PK = getPublicKey(Uint8Array.from(Buffer.from("77".repeat(32), "hex")));
     const now = Math.floor(Date.now() / 1000);
+    const st = { name: "projects", vis: "private", about: "", ttl: "", ver: 0 };
+    const meta = () => ({ id: "c1", pubkey: PK, kind: 39000, created_at: now + st.ver, content: "",
+      tags: [["d", CHID], ["name", st.name], [st.vis === "private" ? "private" : "public"], ...(st.about ? [["about", st.about]] : []), ...(st.ttl ? [["ttl", st.ttl]] : [])] });
     const relay = createServer((rq, rs) => {
       let body = ""; rq.on("data", (c) => (body += c));
       rq.on("end", () => {
         const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
         if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
-        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/events") {
+          let ev = null; try { ev = JSON.parse(body); posted.push(ev); } catch {}
+          if (ev && ev.kind === 9002) {
+            for (const t of ev.tags || []) {
+              if (t[0] === "name") st.name = t[1];
+              if (t[0] === "visibility") st.vis = t[1];
+              if (t[0] === "about") st.about = t[1];
+              if (t[0] === "ttl") st.ttl = t[1];
+            }
+            st.ver++;
+          }
+          return reply({ event_id: "e1", accepted: true, message: "ok" });
+        }
         if (rq.url === "/query") {
           let filters = []; try { filters = JSON.parse(body); } catch {}
           const kinds = new Set(filters.flatMap((f) => f.kinds || []));
           if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", CHID], ["p", PK]], content: "" }]);
-          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", CHID], ["name", "projects"], ["private"]], content: "" }]);
+          if (kinds.has(39000)) return reply([meta()]);
           return reply([]);
         }
         reply({});
@@ -1275,28 +1312,39 @@ console.log("\ncase 32: buzz_edit_channel → kind:9002 carries only the changed
       wantTags: [["h", CHID], ["ttl", ""]] },
     // The mock channel's current visibility is private, so flipping it open is the exposing transition.
     { name: "private→open WITHOUT confirm is refused (history-exposure guard)", args: { channel: "projects", visibility: "open" },
-      wantRefused: true },
+      wantRefused: true, wantErr: /confirm_make_public/ },
     { name: "private→open WITH confirm_make_public", args: { channel: "projects", visibility: "open", confirm_make_public: true },
       wantTags: [["h", CHID], ["visibility", "open"]] },
     // v0.2.27 client-side limits (per buzz_security's 0.2.26 GO notes) — refused, no 9002 signed.
-    { name: "rename to a too-long name is refused", args: { channel: "projects", name: "z".repeat(81) }, wantRefused: true },
-    { name: "rename with a zero-width char is refused (v0.2.29)", args: { channel: "projects", name: "Proj​ects" }, wantRefused: true },
-    { name: "description too long is refused", args: { channel: "projects", description: "w".repeat(501) }, wantRefused: true },
+    { name: "rename to a too-long name is refused", args: { channel: "projects", name: "z".repeat(81) }, wantRefused: true, wantErr: /too long/ },
+    { name: "rename with a zero-width char is refused (v0.2.29)", args: { channel: "projects", name: "Proj\u200Bects" }, wantRefused: true, wantErr: /invisible|zero-width/ },
+    { name: "description too long is refused", args: { channel: "projects", description: "w".repeat(501) }, wantRefused: true, wantErr: /too long/ },
+    // v0.2.30: LRM / RLM / ALM refused on EDIT too.
+    { name: "rename with LRM U+200E is refused (v0.2.30)", args: { channel: "projects", name: "Proj\u200Eects" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "rename with RLM U+200F is refused (v0.2.30)", args: { channel: "projects", name: "Proj\u200Fects" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "rename with ALM U+061C is refused (v0.2.30)", args: { channel: "projects", name: "Proj\u061Cects" }, wantRefused: true, wantErr: /bidirectional control/ },
+    { name: "rename to an emoji+VS16 name → VS stripped (v0.2.30)", args: { channel: "projects", name: "Pulse \u2764\uFE0F" },
+      wantTags: [["h", CHID], ["name", "Pulse \u2764"]] },
   ];
   for (const c of cases) {
     const { relay, posted } = relayWith();
     await new Promise((r) => relay.listen(0, "127.0.0.1", r));
     const port = relay.address().port;
-    await probeTool({
+    const text = await probeTool({
       BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
       BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
     }, "buzz_edit_channel", c.args, { waitMs: 7000, callDelay: 1500 });
     relay.close();
     const ev = posted.find((e) => e && e.kind === 9002);
-    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9002 posted (guard blocked the write)`); continue; }
-    if (!ev) { skipped(`no kind:9002 captured for '${c.name}'`); continue; }
+    if (c.wantRefused) {
+      ok(!ev, `${c.name} → no kind:9002 posted (guard blocked the write)`);
+      ok(isErr(text) && (!c.wantErr || c.wantErr.test(JSON.parse(text).content[0].text)), `${c.name} → the client got the refusal error${c.wantErr ? ` (${c.wantErr})` : ""}`);
+      continue;
+    }
+    if (!ev) { missing(`no kind:9002 captured for '${c.name}'`); continue; }
     console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
     ok(JSON.stringify(ev.tags) === JSON.stringify(c.wantTags), `${c.name} → tags ${JSON.stringify(c.wantTags)} (patch — only the changed fields)`);
+    ok(!isErr(text) && /verified against the relay's kind:39000/.test(text || ""), `${c.name} → (D) read-back verified, reported as success`);
   }
 }
 
@@ -1358,7 +1406,7 @@ console.log("\ncase 33: buzz_join_channel → self-join only OPEN channels; refu
     relay.close();
     const ev = posted.find((e) => e && e.kind === 9021);
     if (c.wantRefused) { ok(!ev, `${c.name} → no kind:9021 posted`); continue; }
-    if (!ev) { skipped(`no kind:9021 captured for '${c.name}'`); continue; }
+    if (!ev) { missing(`no kind:9021 captured for '${c.name}'`); continue; }
     console.log(`  ${c.name}: tags ${JSON.stringify(ev.tags)}`);
     ok(ev.kind === 9021 && ev.content === "", `${c.name} → kind 9021, empty content`);
     ok(JSON.stringify((ev.tags || []).filter((t) => t[0] === "e")) === "[]", `${c.name} → no e-tags`);
@@ -1377,33 +1425,156 @@ console.log("\ncase 33: buzz_join_channel → self-join only OPEN channels; refu
 // Exercised through buzz_dm_open: resolves `to` → pubkey → signs a kind:41010 DM_OPEN whose p-tag is
 // the resolved pubkey. The mock serves kind:0 "search" results for any kinds:[0] query and answers
 // /events so openDm gets a channel id (no listing fallback).
-console.log("\ncase 34: resolveRecipient → name search (both fields, normalized), agent-mode email refused, fail-closed");
+console.log("\ncase 34: resolveRecipient → name search (both fields, NFKC+fold+TR39 skeleton), fail-closed, archived/profile-search aware");
 {
   const ANI = "a".repeat(64), BOB = "b".repeat(64), CAR = "c".repeat(64);
+  const RELAY_SK = Uint8Array.from(Buffer.from("99".repeat(32), "hex"));
+  const RELAY_SELF = getPublicKey(RELAY_SK);
+  const OTHER_SK = Uint8Array.from(Buffer.from("98".repeat(32), "hex"));
+  const archiveList = (sk, pks, extraTags = [["-"]]) => finalizeEvent({ kind: 13535, created_at: Math.floor(Date.now() / 1000), tags: [...extraTags, ...pks.map((p) => ["p", p])], content: "" }, sk);
   // Anirban's profile: `name` and `display_name` DIFFER — the real-world bug (a client shows one,
   // the profile's other field differs: "Anirban Das" vs "Anirban D Das").
   const DIR = {
     anirban: [{ pubkey: ANI, name: "Anirban Das", display_name: "Anirban D Das", nip05: "anirban.das@olaelectric.com" }],
     dupe:    [{ pubkey: BOB, name: "Sam Roy", display_name: "Sam Roy", nip05: "" },
               { pubkey: CAR, name: "Sam Roy", display_name: "Sam Roy", nip05: "" }],
-    // A zero-width twin of the real name (BOB injects U+200B): it normalizes to the same "anirban das"
-    // as ANI, so the two collide → ambiguous → refused, instead of silently resolving to the lookalike.
+    // A zero-width twin of the real name (BOB injects U+200B) → collides with ANI → ambiguous → refused.
     lookalike: [{ pubkey: ANI, name: "Anirban Das", display_name: "", nip05: "" },
-                { pubkey: BOB, name: "Anirban​ Das", display_name: "", nip05: "" }],
+                { pubkey: BOB, name: "Anirban\u200B Das", display_name: "", nip05: "" }],
+    // v0.2.30: the ONLY hit is a Cyrillic-А homoglyph of what was typed (skeleton-equal, raw differs).
+    cyrOnly: [{ pubkey: BOB, name: "\u0410nirban Das", display_name: "", nip05: "" }],
+    // v0.2.30: the ONLY hit is a fullwidth (NFKC-equal) twin.
+    fullwidthOnly: [{ pubkey: BOB, name: "\uFF21nirban Das", display_name: "", nip05: "" }],
+    // v0.2.30: a ligature twin "ﬁnance-bot" (U+FB01) of "finance-bot".
+    ligOnly: [{ pubkey: BOB, name: "\uFB01nance-bot", display_name: "", nip05: "" }],
+    // v0.2.30 (B): matched by the search engine only through bio / nip05 — never a resolution.
+    bioOnly: [{ pubkey: CAR, name: "Mallory", display_name: "Mal", about: "assistant to Anirban Das", nip05: "anirban-das@evil.example" }],
+    exactPlusBio: [{ pubkey: CAR, name: "Mallory", display_name: "", about: "Anirban Das fan account", nip05: "" },
+                   { pubkey: ANI, name: "Anirban Das", display_name: "", nip05: "" }],
     none:    [],
   };
-  const mkDir = (profs) => {
-    const posted = [];
+  // opts: { self, archive: [events], search: "none" | "api" | "404" }
+  const mkDir = (profs, opts = {}) => {
+    const posted = [], seen = { searchApi: [], nip50: 0, archiveQ: 0 };
+    const k0 = () => profs.map((p, i) => ({ id: `pf${i}`, pubkey: p.pubkey, kind: 0, created_at: Math.floor(Date.now() / 1000), tags: [], content: JSON.stringify({ name: p.name, display_name: p.display_name, about: p.about || "", nip05: p.nip05 }) }));
     const relay = createServer((rq, rs) => {
       let body = ""; rq.on("data", (c) => (body += c));
       rq.on("end", () => {
-        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
-        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        const reply = (o, st = 200) => { rs.writeHead(st, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy", ...(opts.self ? { self: opts.self } : {}) });
         if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: 'response:{"channel_id":"dm-1","created":true}' }); }
+        if (rq.url === "/profiles/search") {
+          let b = null; try { b = JSON.parse(body); } catch {}
+          seen.searchApi.push({ body: b, auth: String(rq.headers.authorization || "").startsWith("Nostr ") });
+          if (opts.search === "api") return reply(k0());
+          if (opts.search === "404") return reply({ error: "not found" }, 404);
+          return reply({});
+        }
         if (rq.url === "/query") {
           let filters = []; try { filters = JSON.parse(body); } catch {}
           const kinds = new Set(filters.flatMap((f) => f.kinds || []));
-          if (kinds.has(0)) return reply(profs.map((p, i) => ({ id: `pf${i}`, pubkey: p.pubkey, kind: 0, created_at: Math.floor(Date.now() / 1000), tags: [], content: JSON.stringify({ name: p.name, display_name: p.display_name, nip05: p.nip05 }) })));
+          if (kinds.has(13535)) { seen.archiveQ++; return reply(opts.archive || []); }
+          if (kinds.has(0)) {
+            if (filters.some((f) => f.search)) seen.nip50++;
+            // With a working /profiles/search, NIP-50 returns nothing — so a resolution PROVES the API path.
+            if (opts.search === "api") return reply([]);
+            return reply(k0());
+          }
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, posted, seen };
+  };
+  const cases = [
+    { name: "name matches display_name field", profiles: DIR.anirban, to: "Anirban D Das", wantPk: ANI },
+    { name: "name matches the OTHER field (client-shown name ≠ stored field)", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI },
+    { name: "agent-mode email is REFUSED (self-asserted nip05 not trusted — #1492)", profiles: DIR.anirban, to: "anirban.das@olaelectric.com", wantRefused: true, wantErr: /wire mode/ },
+    { name: "zero-width lookalike collides with real name → ambiguous, refused", profiles: DIR.lookalike, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous/ },
+    { name: "ambiguous name → refused, no DM_OPEN", profiles: DIR.dupe, to: "Sam Roy", wantRefused: true, wantErr: /ambiguous/ },
+    { name: "unknown name → refused", profiles: DIR.none, to: "Nobody Here", wantRefused: true, wantErr: /can't resolve recipient/ },
+    // ---- v0.2.30: NFKC + case-fold + TR39 skeleton, fail-closed on a non-exact single hit ----
+    { name: "Cyrillic 'Аnirban Das' typed vs the real Latin name → lookalike, refused", profiles: DIR.anirban.slice(0, 1).map((p) => ({ ...p, display_name: "" })), to: "\u0410nirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "single skeleton-only hit (Cyrillic twin) for the Latin name → refused", profiles: DIR.cyrOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "fullwidth NFKC collision → refused", profiles: DIR.fullwidthOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "ligature 'ﬁnance-bot' NFKC collision with 'finance-bot' → refused", profiles: DIR.ligOnly, to: "finance-bot", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "case-only difference → refused (CASE_ONLY_IS_AMBIGUOUS default true)", profiles: DIR.anirban, to: "anirban das", wantRefused: true, wantErr: /letter case/ },
+    { name: "invisible LRM inside the typed name vs real → lookalike, refused", profiles: DIR.anirban, to: "Anirban\u200E Das", wantRefused: true, wantErr: /lookalike/ },
+    // ---- v0.2.30 (B): only name/display_name ever match; exact first ----
+    { name: "(B) bio/nip05-only search hit → NOT resolved", profiles: DIR.bioOnly, to: "Anirban Das", wantRefused: true, wantErr: /can't resolve recipient/ },
+    { name: "(B) exact name + a bio-only hit → resolves to the exact one", profiles: DIR.exactPlusBio, to: "Anirban Das", wantPk: ANI },
+    { name: "(B) POST /profiles/search used when supported (NIP-50 returns nothing)", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI, opts: { search: "api" },
+      check: (seen) => {
+        ok(seen.searchApi.length >= 1, "(B) /profiles/search was called");
+        ok(seen.searchApi.every((x) => x.auth), "(B) /profiles/search carried NIP-98 auth");
+        ok(seen.searchApi.every((x) => x.body && typeof x.body.query === "string" && Object.keys(x.body).every((k) => ["query", "limit", "page"].includes(k)) && x.body.limit >= 1 && x.body.limit <= 100), "(B) body is {query, limit≤100} only (relay rejects unknown fields)");
+        ok(seen.nip50 === 0, "(B) no NIP-50 fallback when the API answered");
+      } },
+    { name: "(B) /profiles/search 404 → falls back to NIP-50", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI, opts: { search: "404" },
+      check: (seen) => { ok(seen.searchApi.length === 1, "(B) API tried once, then cached as unsupported"); ok(seen.nip50 >= 1, "(B) NIP-50 fallback used"); } },
+    // ---- v0.2.30 (A): NIP-IA archived identities ----
+    { name: "(A) archived (relay-self-signed 13535) identity → not resolved", profiles: DIR.anirban, to: "Anirban Das", wantRefused: true, wantErr: /archived identity/,
+      opts: { self: RELAY_SELF, archive: [archiveList(RELAY_SK, [ANI])] }, check: (seen) => ok(seen.archiveQ >= 1, "(A) 13535 list queried") },
+    { name: "(A) 13535 signed by a NON-self key is ignored → resolves", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI,
+      opts: { self: RELAY_SELF, archive: [archiveList(OTHER_SK, [ANI])] } },
+    { name: "(A) 13535 without exactly one '-' tag is ignored → resolves", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI,
+      opts: { self: RELAY_SELF, archive: [archiveList(RELAY_SK, [ANI], [])] } },
+    { name: "(A) tampered 13535 (bad signature) is ignored → resolves", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI,
+      opts: { self: RELAY_SELF, archive: [{ ...archiveList(RELAY_SK, [BOB]), tags: [["-"], ["p", ANI]] }] } },
+    { name: "(A) no NIP-11 self → fail open → resolves", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI,
+      opts: { archive: [archiveList(RELAY_SK, [ANI])] } },
+    { name: "(A) archived twin filtered → the remaining exact match resolves", profiles: DIR.dupe, to: "Sam Roy", wantPk: BOB,
+      opts: { self: RELAY_SELF, archive: [archiveList(RELAY_SK, [CAR])] } },
+  ];
+  for (const c of cases) {
+    const { relay, posted, seen } = mkDir(c.profiles, c.opts);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_dm_open", { to: c.to }, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 41010);
+    if (c.check) c.check(seen);
+    if (c.wantRefused) {
+      ok(!ev, `${c.name} → no kind:41010 DM_OPEN posted (resolver refused)`);
+      ok(isErr(text) && (!c.wantErr || c.wantErr.test(JSON.parse(text).content[0].text)), `${c.name} → refusal error reached the client${c.wantErr ? ` (${c.wantErr})` : ""}`);
+      continue;
+    }
+    if (!ev) { missing(`no kind:41010 captured for '${c.name}' (reply=${String(text).slice(0, 160)})`); continue; }
+    const p = (ev.tags || []).find((t) => t[0] === "p");
+    console.log(`  ${c.name}: p=${p ? p[1].slice(0, 8) + "…" : "(none)"}`);
+    ok(p && p[1] === c.wantPk, `${c.name} → DM_OPEN p-tag is the resolved pubkey`);
+  }
+}
+
+// ---- Case 35 (v0.2.30 D): buzz_edit_channel re-reads kind:39000 and reports a mismatch as an ERROR --
+// A relay that ACKs the kind:9002 but never applies it (the real bug: "private" flip silently ignored
+// → channel stays PUBLIC) must not be reported as success.
+console.log("\ncase 35 (D): edit accepted but NOT applied by the relay → isError with the mismatch");
+{
+  const CHID = "c0ffee".repeat(6).slice(0, 36);
+  const lazyRelay = ({ vanish = false } = {}) => {
+    const posted = [];
+    const PK = getPublicKey(Uint8Array.from(Buffer.from("77".repeat(32), "hex")));
+    const now = Math.floor(Date.now() / 1000);
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (obj, status = 200) => { rs.writeHead(status, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let filters = []; try { filters = JSON.parse(body); } catch {}
+          const kinds = new Set(filters.flatMap((f) => f.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", CHID], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) {
+            const byD = filters.some((f) => f["#d"]);
+            if (vanish && byD && posted.some((e) => e.kind === 9002)) return reply([]);
+            return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", CHID], ["name", "projects"], ["public"]], content: "" }]);
+          }
           return reply([]);
         }
         reply({});
@@ -1412,28 +1583,342 @@ console.log("\ncase 34: resolveRecipient → name search (both fields, normalize
     return { relay, posted };
   };
   const cases = [
-    { name: "name matches display_name field", profiles: DIR.anirban, to: "Anirban D Das", wantPk: ANI },
-    { name: "name matches the OTHER field (client-shown name ≠ stored field)", profiles: DIR.anirban, to: "Anirban Das", wantPk: ANI },
-    { name: "agent-mode email is REFUSED (self-asserted nip05 not trusted — #1492)", profiles: DIR.anirban, to: "anirban.das@olaelectric.com", wantRefused: true },
-    { name: "zero-width lookalike collides with real name → ambiguous, refused", profiles: DIR.lookalike, to: "Anirban Das", wantRefused: true },
-    { name: "ambiguous name → refused, no DM_OPEN", profiles: DIR.dupe, to: "Sam Roy", wantRefused: true },
-    { name: "unknown name → refused", profiles: DIR.none, to: "Nobody Here", wantRefused: true },
+    { name: "visibility→private ignored by relay", args: { channel: "projects", visibility: "private" }, want: /does NOT reflect it — visibility: asked private, relay shows open \(channel may still be PUBLIC\)/ },
+    { name: "rename ignored by relay", args: { channel: "projects", name: "Renamed" }, want: /does NOT reflect it — name: asked "Renamed", relay shows "projects"/ },
+    { name: "ttl ignored by relay", args: { channel: "projects", ttl: 3600 }, want: /does NOT reflect it — ttl: asked 3600s, relay shows none/ },
+    { name: "39000 can't be re-read after edit → fail closed", args: { channel: "projects", name: "Renamed" }, vanish: true, want: /could not be re-read/ },
   ];
   for (const c of cases) {
-    const { relay, posted } = mkDir(c.profiles);
+    const { relay, posted } = lazyRelay({ vanish: c.vanish });
     await new Promise((r) => relay.listen(0, "127.0.0.1", r));
     const port = relay.address().port;
-    await probeTool({
+    const text = await probeTool({
       BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
       BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
-    }, "buzz_dm_open", { to: c.to }, { waitMs: 7000, callDelay: 1500 });
+    }, "buzz_edit_channel", c.args, { waitMs: 9000, callDelay: 1500 });
     relay.close();
-    const ev = posted.find((e) => e && e.kind === 41010);
-    if (c.wantRefused) { ok(!ev, `${c.name} → no kind:41010 DM_OPEN posted (resolver refused)`); continue; }
-    if (!ev) { skipped(`no kind:41010 captured for '${c.name}'`); continue; }
-    const p = (ev.tags || []).find((t) => t[0] === "p");
-    console.log(`  ${c.name}: p=${p ? p[1].slice(0, 8) + "…" : "(none)"}`);
-    ok(p && p[1] === c.wantPk, `${c.name} → DM_OPEN p-tag is the resolved pubkey`);
+    if (!posted.some((e) => e && e.kind === 9002)) { missing(`no kind:9002 captured for '${c.name}'`); continue; }
+    if (text === null) { missing(`no reply for '${c.name}'`); continue; }
+    const t = JSON.parse(text).content[0].text;
+    console.log(`  ${c.name}: ${t.slice(0, 150)}…`);
+    ok(isErr(text), `${c.name} → reported as an ERROR (not success)`);
+    ok(c.want.test(t), `${c.name} → names the mismatch (${c.want})`);
+    ok(/Treat the edit as NOT applied/.test(t), `${c.name} → tells the caller the edit is NOT applied`);
+  }
+}
+
+// ---- Case 36 (v0.2.30): a homoglyph / zero-width / fullwidth email is refused BEFORE any Ekam call --
+console.log("\ncase 36: wire-mode email addressing refuses non-ASCII/invisible/NFKC-changing emails before the directory");
+{
+  const HOME_ISO = mkdtempSync(join(tmpdir(), "buzz-email-home-"));
+  const ANI = "a".repeat(64);
+  const mk = () => {
+    const seen = { directory: [], ekamAny: 0 };
+    const srv = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o, st = 200) => { rs.writeHead(st, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.url.startsWith("/v1/")) seen.ekamAny++;
+        if (rq.url.startsWith("/v1/directory/resolve")) { seen.directory.push(decodeURIComponent(rq.url.split("email=")[1] || "")); return reply({ nostr_pub: ANI }); }
+        if (rq.url.startsWith("/v1/")) return reply({ error: "mock" }, 500);
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/query") return reply([]);
+        reply({});
+      });
+    });
+    return { srv, seen };
+  };
+  const cases = [
+    { name: "Cyrillic-а homoglyph email", to: "\u0430nirban.das@olaelectric.com", want: /non-ASCII/ },
+    { name: "zero-width-space email", to: "anirban\u200B.das@olaelectric.com", want: /invisible/ },
+    { name: "LRM-bearing email", to: "anirban.das@olaelectric.com\u200E", want: /invisible/ },
+    { name: "fullwidth-＠ email (NFKC changes it)", to: "anirban.das\uFF20olaelectric.com", want: /non-ASCII|NFKC/ },
+    { name: "fullwidth-letter email", to: "\uFF41nirban.das@olaelectric.com", want: /non-ASCII|NFKC/ },
+  ];
+  let n = 0;
+  for (const c of [...cases, { name: "ASCII control email reaches the directory", to: "anirban.das@olaelectric.com", control: true }]) {
+    const { srv, seen } = mk();
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const port = srv.address().port;
+    const text = await probeTool({
+      HOME: HOME_ISO, BUZZ_PRIVATE_KEY: "", BUZZ_NAME: "", BUZZ_AUTH_TAG: "",
+      BUZZ_WIRE_SIGN: "1", BUZZ_WIRE_ID: `emailprobe${n++}`, BUZZ_USER_PUBKEY: "e".repeat(64), BUZZ_EKAM_HUMAN_TOKEN: "mock-static-token",
+      BUZZ_EKAM_BASE: `http://127.0.0.1:${port}`,
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_dm_open", { to: c.to }, { waitMs: 7000, callDelay: 1200 });
+    srv.close();
+    if (text === null) { missing(`no reply for '${c.name}'`); continue; }
+    if (c.control) { ok(seen.directory.length === 1 && seen.directory[0] === c.to, `${c.name} (positive control: the directory IS called for a clean email)`); continue; }
+    const t = JSON.parse(text).content[0].text;
+    ok(isErr(text) && c.want.test(t), `${c.name} → refused (${c.want})`);
+    ok(seen.directory.length === 0, `${c.name} → NO /v1/directory/resolve call was made`);
+  }
+  rmSync(HOME_ISO, { recursive: true, force: true });
+}
+
+// ---- Case 37 (v0.2.30 C): client identification on kind:0 and kind:10100 ------------------------
+console.log("\ncase 37 (C): kind:10100 carries [client,buzz-mcp,<ver>]; kind:0 JSON carries client_version");
+{
+  const VER = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
+  const { relay, SK, posted } = captureRelay();
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  await probeTool({
+    BUZZ_PRIVATE_KEY: SK, BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_whoami", {}, { waitMs: 6000, callDelay: 1500 });
+  relay.close();
+  const k0 = posted.find((e) => e && e.kind === 0);
+  const k10100 = posted.find((e) => e && e.kind === 10100);
+  if (!k10100) missing("no kind:10100 card captured");
+  else ok((k10100.tags || []).some((t) => JSON.stringify(t) === JSON.stringify(["client", "buzz-mcp", VER])), `kind:10100 tags include ["client","buzz-mcp","${VER}"]`);
+  if (!k0) missing("no kind:0 captured");
+  else {
+    let c = {}; try { c = JSON.parse(k0.content); } catch {}
+    ok(c.client_version === VER, `kind:0 content.client_version === "${VER}"`);
+  }
+}
+
+// ---- Case 38 (v0.2.30 A): buzz_agents hides relay-archived identities ---------------------------
+console.log("\ncase 38 (A): buzz_agents filters pubkeys on the relay-self-signed kind:13535 list");
+{
+  const ANI = "a".repeat(64), BOB = "b".repeat(64);
+  const RELAY_SK = Uint8Array.from(Buffer.from("99".repeat(32), "hex"));
+  const mk = (self, signer) => createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy", ...(self ? { self } : {}) });
+      if (rq.url === "/query") {
+        let f = []; try { f = JSON.parse(body); } catch {}
+        const kinds = new Set(f.flatMap((x) => x.kinds || []));
+        if (kinds.has(13535)) return reply([finalizeEvent({ kind: 13535, created_at: Math.floor(Date.now() / 1000), tags: [["-"], ["p", ANI]], content: "" }, signer)]);
+        if (kinds.has(0)) return reply([ANI, BOB].map((pk, i) => ({ id: `p${i}`, pubkey: pk, kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: i ? "Bob Archer" : "Anirban Das" }) })));
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  for (const c of [
+    { name: "relay-signed list", self: getPublicKey(RELAY_SK), signer: RELAY_SK, hidden: true },
+    { name: "list signed by another key", self: getPublicKey(RELAY_SK), signer: Uint8Array.from(Buffer.from("98".repeat(32), "hex")), hidden: false },
+    { name: "no NIP-11 self (fail open)", self: null, signer: RELAY_SK, hidden: false },
+  ]) {
+    const relay = mk(c.self, c.signer);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "77".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_agents", {}, { waitMs: 6000, callDelay: 1200 });
+    relay.close();
+    if (text === null) { missing(`no buzz_agents reply for '${c.name}'`); continue; }
+    const t = JSON.parse(text).content[0].text;
+    ok(/Bob Archer/.test(t), `${c.name} → non-archived Bob listed`);
+    if (c.hidden) { ok(!/Anirban/.test(t), `${c.name} → archived Anirban hidden`); ok(/1 archived identity hidden — NIP-IA/.test(t), `${c.name} → says 1 hidden`); }
+    else ok(/Anirban/.test(t) && !/hidden/.test(t), `${c.name} → list ignored, Anirban still listed`);
+  }
+}
+
+// ---- Case 39 (v0.2.30 E): strict 64-lowercase-hex on @mention p-tags ------------------------------
+console.log("\ncase 39 (E): a malformed/uppercase profile pubkey never becomes a p-tag");
+{
+  const GOOD = "d".repeat(64), UPPER = "AB".repeat(32), SHORT = "ab".repeat(20);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const posted = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+      if (rq.url === "/query") {
+        let f = []; try { f = JSON.parse(body); } catch {}
+        const kinds = new Set(f.flatMap((x) => x.kinds || []));
+        if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+        if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+        if (kinds.has(0)) return reply([[GOOD, "Pulse"], [UPPER, "Mallory"], [SHORT, "Shorty"]].map(([pk, n], i) => ({ id: `p${i}`, pubkey: pk, kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: n }) })));
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  await probeTool({
+    BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_post", { channel: "testchan", text: "@pulse @mallory @shorty @pulse hello" }, { waitMs: 7000, callDelay: 1500 });
+  relay.close();
+  const ev = posted.find((e) => e && e.kind === 9);
+  if (!ev) missing("no kind:9 captured for the mention post");
+  else {
+    const ps = (ev.tags || []).filter((t) => t[0] === "p").map((t) => t[1]);
+    console.log(`  p-tags: ${JSON.stringify(ps.map((p) => p.slice(0, 8)))}`);
+    ok(ps.length === 1 && ps[0] === GOOD, "only the valid 64-lowercase-hex mention became a p-tag (deduped)");
+    ok(ps.every((p) => /^[0-9a-f]{64}$/.test(p)), "every signed p-tag is 64 lowercase hex");
+  }
+}
+
+// ---- Case 40 (v0.2.30 fix): @mention resolution is fail-closed (buzz_security review §3.1) ---------
+// Regression: two kind:0 profiles both named "buzz_security" — the OLD key 7731945f… listed first.
+// The old first-wins index tagged the old key; now nobody is tagged and the post reports why.
+console.log("\ncase 40: @mention of a duplicated name tags nobody (old key never tagged); exact single name tags");
+{
+  const OLD = "7731945f" + "0".repeat(56), REAL = "28ff3202" + "1".repeat(56), PULSE = "d".repeat(64);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const run = async (profilesList, msg) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+        if (rq.url === "/query") {
+          let f = []; try { f = JSON.parse(body); } catch {}
+          const kinds = new Set(f.flatMap((x) => x.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", "testchan"]], content: "" }]);
+          if (kinds.has(0)) return reply(profilesList.map(([pk, n], i) => ({ id: `p${i}`, pubkey: pk, kind: 0, created_at: 1 + i, tags: [], content: JSON.stringify({ name: n }) })));
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, "buzz_post", { channel: "testchan", text: msg }, { waitMs: 7000, callDelay: 1500 });
+    relay.close();
+    const ev = posted.find((e) => e && e.kind === 9);
+    return { text, ps: ev ? (ev.tags || []).filter((t) => t[0] === "p").map((t) => t[1]) : null };
+  };
+  let r = await run([[OLD, "buzz_security"], [REAL, "buzz_security"], [PULSE, "Pulse"]], "@buzz_security review please @pulse");
+  if (!r.ps) missing("no kind:9 captured for the duplicate-name mention post");
+  else {
+    console.log(`  p-tags: ${JSON.stringify(r.ps.map((p) => p.slice(0, 8)))}`);
+    ok(!r.ps.includes(OLD) && !r.ps.includes(REAL), "duplicate 'buzz_security' (old key first) → NEITHER key tagged");
+    ok(r.ps.length === 1 && r.ps[0] === PULSE, "the unambiguous @pulse is still tagged");
+    ok(/NOT tagged \(fail-closed\)/.test(r.text || "") && /buzz_security/.test(r.text || ""), "the post result reports the refused @buzz_security mention");
+  }
+  r = await run([[REAL, "buzz_security"]], "@buzz_security hello");
+  if (!r.ps) missing("no kind:9 captured for the single-name mention post");
+  else ok(r.ps.length === 1 && r.ps[0] === REAL, "a single exact 'buzz_security' profile → tagged");
+  r = await run([[OLD, "buzz_s\u0435curity"]], "@buzz_security hello");
+  if (!r.ps) missing("no kind:9 captured for the lookalike mention post");
+  else ok(r.ps.length === 0 && /lookalike/.test(r.text || ""), "a lookalike-only profile → not tagged, reported");
+}
+
+// ---- Case 41 (v0.2.30 fix): duplicate channel names are refused, never first-match ----------------
+console.log("\ncase 41: two channels named 'general'/'General' → buzz_post refused with both ids; nothing signed");
+{
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const posted = [];
+  const relay = createServer((rq, rs) => {
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const reply = (o) => { rs.writeHead(200, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+      if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+      if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: "ok" }); }
+      if (rq.url === "/query") {
+        let f = []; try { f = JSON.parse(body); } catch {}
+        const kinds = new Set(f.flatMap((x) => x.kinds || []));
+        if (kinds.has(39002)) return reply(["gen-aaaa", "gen-bbbb"].map((d, i) => ({ id: `m${i}`, pubkey: PK, kind: 39002, created_at: now, tags: [["d", d], ["p", PK]], content: "" })));
+        if (kinds.has(39000)) return reply([["gen-aaaa", "general"], ["gen-bbbb", "General"]].map(([d, n], i) => ({ id: `c${i}`, pubkey: PK, kind: 39000, created_at: now, tags: [["d", d], ["name", n]], content: "" })));
+        return reply([]);
+      }
+      reply({});
+    });
+  });
+  await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+  const port = relay.address().port;
+  const text = await probeTool({
+    BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+    BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+  }, "buzz_post", { channel: "general", text: "hello" }, { waitMs: 7000, callDelay: 1500 });
+  relay.close();
+  if (text === null) missing("no buzz_post reply for the duplicate-channel case");
+  else {
+    ok(/ambiguous/.test(text) && /gen-aaaa/.test(text) && /gen-bbbb/.test(text), "refused as ambiguous, listing both channel ids");
+    ok(!posted.some((e) => e && e.kind === 9), "nothing was signed or sent");
+  }
+}
+
+// ---- Case 42 (v0.2.30 re-check nits, buzz_security REVIEW §7.8) ---------------------------------
+// (a) A profile search that FAILS is an error, never "no results": buzz_dm_open refuses with the
+//     reason; an @mention whose search failed is NOT tagged (even though the partial 200-newest list
+//     holds a unique match) and the post says why. (b) "channel not found … Available:" is escaped.
+console.log("\ncase 42: failed profile search → clear error / NOT tagged; 'Available:' channel list escaped");
+{
+  const PULSE = "d".repeat(64);
+  const PK = getPublicKey(Uint8Array.from(Buffer.from("88".repeat(32), "hex")));
+  const now = Math.floor(Date.now() / 1000);
+  const RAW = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]|[\u{E0000}-\u{E007F}]/u;
+  const mk = ({ searchFails = true, chanName = "testchan" } = {}) => {
+    const posted = [];
+    const relay = createServer((rq, rs) => {
+      let body = ""; rq.on("data", (c) => (body += c));
+      rq.on("end", () => {
+        const reply = (o, st = 200) => { rs.writeHead(st, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
+        if (rq.method === "GET") return reply({ name: "mock", version: "0", software_sha: "healthy" });
+        if (rq.url === "/events") { try { posted.push(JSON.parse(body)); } catch {} return reply({ event_id: "e1", accepted: true, message: 'response:{"channel_id":"dm-1","created":true}' }); }
+        if (rq.url === "/profiles/search") return searchFails ? reply({ error: "search backend down" }, 500) : reply({ error: "not found" }, 404);
+        if (rq.url === "/query") {
+          let f = []; try { f = JSON.parse(body); } catch {}
+          const kinds = new Set(f.flatMap((x) => x.kinds || []));
+          if (kinds.has(39002)) return reply([{ id: "m1", pubkey: PK, kind: 39002, created_at: now, tags: [["d", "chanA"], ["p", PK]], content: "" }]);
+          if (kinds.has(39000)) return reply([{ id: "c1", pubkey: PK, kind: 39000, created_at: now, tags: [["d", "chanA"], ["name", chanName]], content: "" }]);
+          if (kinds.has(0)) {
+            if (searchFails && f.some((x) => x.search)) return reply({ error: "nip50 down" }, 500);
+            return reply([{ id: "p0", pubkey: PULSE, kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: "Pulse" }) }]);
+          }
+          return reply([]);
+        }
+        reply({});
+      });
+    });
+    return { relay, posted };
+  };
+  const call = async (opts, tool, args) => {
+    const { relay, posted } = mk(opts);
+    await new Promise((r) => relay.listen(0, "127.0.0.1", r));
+    const port = relay.address().port;
+    const text = await probeTool({
+      BUZZ_PRIVATE_KEY: "88".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_WIRE_SIGN: "", BUZZ_AUTH_TAG: "",
+      BUZZ_RELAY_HTTP: `http://127.0.0.1:${port}`, BUZZ_RELAY_URL: `ws://127.0.0.1:${port}`,
+    }, tool, args, { waitMs: 9000, callDelay: 1500 });
+    relay.close();
+    let msg = ""; try { msg = JSON.parse(text).content[0].text; } catch {}
+    return { text, msg, posted };
+  };
+  let r = await call({}, "buzz_dm_open", { to: "Pulse" });
+  if (r.text === null) missing("no buzz_dm_open reply for the failed-search case");
+  else {
+    ok(isErr(r.text) && /profile search for "Pulse" failed/.test(r.msg) && /can't be resolved safely/.test(r.msg), "search down → buzz_dm_open errors 'profile search … failed', not 'can't resolve recipient'");
+    ok(!r.posted.some((e) => e && e.kind === 41010), "search down → no DM_OPEN signed");
+  }
+  r = await call({}, "buzz_post", { channel: "testchan", text: "@pulse hi" });
+  const ev = r.posted.find((e) => e && e.kind === 9);
+  if (!ev) missing(`no kind:9 captured for the failed-mention-search post (reply=${String(r.text).slice(0, 160)})`);
+  else {
+    ok(!(ev.tags || []).some((t) => t[0] === "p"), "search down → @pulse NOT tagged, even though the partial 200-newest list has a unique 'Pulse'");
+    ok(/NOT tagged \(fail-closed\)/.test(r.msg) && /profile search for "pulse" failed/.test(r.msg), "the post result says the mention wasn't tagged because the search failed");
+  }
+  r = await call({ searchFails: false }, "buzz_dm_open", { to: "Pulse" });
+  ok(r.posted.some((e) => e && e.kind === 41010), "control: with search working, the same name resolves (NIP-50 fallback path)");
+  const evilChan = "ops\u202e" + String.fromCodePoint(0xe0041) + "\u009b\nFAKE";
+  r = await call({ searchFails: false, chanName: evilChan }, "buzz_post", { channel: "nope\u202e", text: "hi" });
+  if (r.text === null) missing("no buzz_post reply for the channel-not-found case");
+  else {
+    ok(isErr(r.text) && /channel not found: "nope\\u\{202e\}"/.test(r.msg), "not-found error: the typed channel is quoted + escaped");
+    ok(/Available: "ops\\u\{202e\}\\u\{e0041\}\\u\{9b\}\\u\{a\}FAKE"/.test(r.msg) && !RAW.test(r.msg) && !/\n/.test(r.msg), "'Available:' list: RLO / tag / C1 / newline in a channel name are escaped, never raw");
+    ok(!r.posted.some((e) => e && e.kind === 9), "nothing was signed");
   }
 }
 
