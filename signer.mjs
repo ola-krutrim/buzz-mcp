@@ -43,7 +43,7 @@ export const wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter
 // ── wire-refresh persistence (0600), mirroring loadkey_v2's service-refresh side-file.
 // The offline_access refresh is single-use/rotating; we persist the rotated one so the
 // next session doesn't replay a spent token (which would revoke the family → lockout).
-const WIRE_REFRESH_DIR = join(homedir(), ".config", "buzz-cli", "wire-refresh");
+export const WIRE_REFRESH_DIR = join(homedir(), ".config", "buzz-cli", "wire-refresh");
 const wireRefreshFile = (id) => join(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
 export function wireRefreshGet(id) {
   try { const f = wireRefreshFile(id); return existsSync(f) ? (readFileSync(f, "utf8").trim() || null) : null; } catch { return null; }
@@ -154,7 +154,8 @@ export function makeWireTokenProvider(env, fetchFn) {
   };
 }
 
-// wire-sign kind allowlist — MIRRORS ekam's server allowlist {22242, 9, 27235}
+// wire-sign kind allowlist — MIRRORS ekam's server allowlist (HUMAN_SIGN_ALLOWED_KINDS) plus
+// 40003/9022, which Ekam is adding (see below). Originally {22242, 9, 27235}
 // (requirement A, buzz-main 03:50). The server is the authority; this is a fast
 // client-side guard so the shim never makes a wire-sign call the server would
 // refuse — e.g. the startup kind:0/10100 profile publish is skipped in wire mode.
@@ -173,7 +174,17 @@ export function makeWireTokenProvider(env, fetchFn) {
 //           validate_admin_event authorizes each against the SIGNER's OWN channel role (a wire-signed
 //           create/edit only works where the human is already owner/admin; 9021 is open-channel
 //           self-join, private refused) — so mirroring these does not widen authority.
-export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021]);
+//   40003 = edit one of your own messages, 9022 = leave a channel (v0.2.32-pre, approved by
+//           Navendu). NOTE: the shim allows them, but Ekam only signs them once its own
+//           HUMAN_SIGN_ALLOWED_KINDS gains them (pending security-reviewed Ekam PR). Until then
+//           Ekam answers 400 kind_not_allowed, which wireSign() turns into a clear error naming
+//           the refused kind and Ekam's current allowed set — no version pinning here.
+//   NOT here, on purpose: 9008 (delete channel), 5 (deletion — unreact), 41012 (DM hide). Ekam
+//           refuses them deliberately (pinned by Ekam tests), so the shim refuses them locally
+//           before any network call; they only work with an agent's own key (agent mode).
+export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021, 40003, 9022]);
+// Kinds Ekam refuses to wire-sign BY DESIGN (not "not yet"): the shim names them as such.
+export const EKAM_REFUSED_BY_DESIGN = new Map([[9008, "delete channel"], [5, "deletion / remove reaction"], [41012, "hide a DM"]]);
 
 // NIP-29 governed moderation (kinds 9000 add-member / 9001 remove-member / 9005 delete-message),
 // live server-side via Ekam v206 (allowlist {…,9000,9001,9005}). Ekam stays content-agnostic; the
@@ -331,6 +342,44 @@ function normalizePubkey(v) {
   return null;
 }
 
+// v0.2.32-pre: Ekam's `400 kind_not_allowed` names the kinds it DOES sign in error_description
+// (format not contractual). Pull them out defensively: an explicit array field if Ekam ever sends
+// one, else the first {…} / […] / (…) group holding only integers, else the integers after the
+// nearest "allow…" word that is followed by a list (up to the next . ; newline or "("). Only 0..65535 count (Nostr kinds). Anything else → null; never throws.
+export function parseAllowedKinds(body) {
+  try {
+    const pick = (arr) => {
+      const ks = [...new Set(arr.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 65535))].sort((a, b) => a - b);
+      return ks.length ? ks : null;
+    };
+    if (body && typeof body === "object") {
+      for (const f of ["allowed_kinds", "allowed"]) if (Array.isArray(body[f])) { const r = pick(body[f]); if (r) return r; }
+    }
+    const desc = typeof body === "string" ? body : (body && typeof body.error_description === "string" ? body.error_description : "");
+    if (!desc) return null;
+    const d = desc.slice(0, 4000);
+    const ints = (t) => (t.match(/\d+/g) || []);
+    for (const m of d.matchAll(/[{[(]([^{}[\]()]*)[}\])]/g)) {
+      if (/^[\s\d,;|]+$/.test(m[1]) && ints(m[1]).length) return pick(ints(m[1]));
+    }
+    for (const at of [...d.matchAll(/allow\w*/gi)].reverse()) {
+      const tail = d.slice(at.index + at[0].length).split(/[.;\n(]/, 1)[0];
+      const r = /^[\s\w:=,|]*$/.test(tail) ? pick(ints(tail)) : null;
+      if (r) return r;
+    }
+    return null;
+  } catch { return null; }
+}
+// Printable, single-line, bounded echo of a server string (no control / bidi characters).
+const echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+export function kindNotAllowedMessage(kind, body) {
+  const allowed = parseAllowedKinds(body);
+  const desc = body && typeof body === "object" ? body.error_description : body;
+  const what = allowed ? `it currently allows {${allowed.join(", ")}}`
+    : `it didn't say which kinds it allows${desc ? ` (Ekam said: "${echo(desc)}")` : ""}`;
+  return `Ekam (your signing service) doesn't sign kind ${kind} yet; ${what}. Ask the Ekam owner to add it, or use an agent's own key. (wire-sign HTTP 400 kind_not_allowed)`;
+}
+
 // The SINGLE isolation boundary for the wire-sign wire format.
 // CONTRACT CONFIRMED by ekam_agent (buzz-main 04:00, verified against ola-silicon/ekam#319):
 //   Request : POST {base}/v1/me/wire-sign, `Authorization: Bearer <wire:sign-scoped token>`,
@@ -341,6 +390,7 @@ function normalizePubkey(v) {
 //   Errors  : 401 unauthorized (revoked/expired/no token, agent token, or wrong aud),
 //             403 forbidden (missing wire:sign scope / suspended human),
 //             400 kind_not_allowed, 503 escrow/Vault unavailable — {error,error_description}.
+//             (v0.2.32-pre) 400 kind_not_allowed → kindNotAllowedMessage(): refused kind + Ekam's allowed set.
 // Guarded to fail LOUD on any mismatch, so a wrong/unsigned event never passes silently.
 export async function wireSign(base, token, template, fetchFn = fetch) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
@@ -355,8 +405,13 @@ export async function wireSign(base, token, template, fetchFn = fetch) {
     // surface ekam's typed failures cleanly, with a hint pointing at the WHO-gate
     // (#319): a wire:sign-scoped, ISSUER-audience token is required — a general
     // human token 403s/401s. The scoped-token mint is a loadkey_v2 Phase-2 concern.
-    let detail = text.slice(0, 200);
-    try { const j = JSON.parse(text); detail = j.error_description || j.error || detail; } catch { /* keep raw */ }
+    let detail = text.slice(0, 200), j = null;
+    try { j = JSON.parse(text); detail = j.error_description || j.error || detail; } catch { /* keep raw */ }
+    if (res.status === 400 && j && typeof j === "object" && j.error === "kind_not_allowed") {
+      const err = new Error(kindNotAllowedMessage(template.kind, j));
+      err.code = "kind_not_allowed"; err.kind = template.kind; err.allowedKinds = parseAllowedKinds(j);
+      throw err;
+    }
     const hint = res.status === 403 ? " (token likely missing the wire:sign scope, or human suspended)"
                : res.status === 401 ? " (token revoked/expired, or wrong audience — must be minted resource=ISSUER)"
                : res.status === 503 ? " (escrow/Vault unavailable — transient)"
@@ -403,6 +458,7 @@ export async function resolveSigner(opts = {}) {
       mode: "wire",
       pubkey,
       canSign: (kind) => WIRE_ALLOWLIST.has(kind),
+      wipe() { /* wire mode holds no key */ },
       // Expose a valid wire:sign access token for authed Ekam reads (e.g. the
       // email→pubkey directory resolve) — same WHO-gate as signing, no new credential.
       ekamToken: () => tokens.get(false),
@@ -427,11 +483,17 @@ export async function resolveSigner(opts = {}) {
   // local (default): resolve a key and sign in-process — existing behavior, intact.
   const sk = await resolveKey(opts);
   const pubkey = getPublicKey(sk);
+  let wiped = false;
   return {
     mode: "local",
     pubkey,
     canSign: () => true,
+    // v0.2.31 (item 8): zero the in-memory secret key on shutdown. After wipe() the signer refuses
+    // rather than signing with an all-zero key. (Best effort: JS strings the key passed through as
+    // hex cannot be wiped; the Uint8Array the signer holds can.)
+    wipe() { wiped = true; sk.fill(0); },
     async sign(template) {
+      if (wiped) throw new Error("signer: key already wiped (shutting down)");
       return finalizeEvent(
         { kind: template.kind, created_at: template.created_at ?? now(), tags: template.tags || [], content: template.content ?? "" },
         sk,

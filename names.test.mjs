@@ -50,7 +50,7 @@ ok(!confusableNames("Alice", "Bob"), "unrelated names do not collide");
 
 console.log("\nmatchProfiles — fail closed, exact first, name/display_name only");
 const A = "a".repeat(64), B = "b".repeat(64), C = "c".repeat(64);
-ok(CASE_ONLY_IS_AMBIGUOUS === true, "CASE_ONLY_IS_AMBIGUOUS defaults to true");
+ok(CASE_ONLY_IS_AMBIGUOUS === false, "CASE_ONLY_IS_AMBIGUOUS defaults to false (v0.2.32-pre: case-only single match resolves)");
 ok(matchProfiles("Anirban Das", [{ pubkey: A, name: "Anirban Das" }]).pubkey === A, "exact name → resolves");
 ok(matchProfiles("Anirban D Das", [{ pubkey: A, name: "Anirban Das", display_name: "Anirban D Das" }]).pubkey === A, "exact display_name → resolves");
 throws(() => matchProfiles("\u0410nirban Das", [{ pubkey: A, name: "Anirban Das" }]), /ambiguous \/ lookalike - use an npub/, "Cyrillic input vs real name → lookalike refused");
@@ -60,7 +60,19 @@ throws(() => matchProfiles("Anirban Das", [{ pubkey: B, name: "\uFF21nirban Das"
 throws(() => matchProfiles("Anirban Das", [{ pubkey: A, name: "Anirban Das" }, { pubkey: B, name: "Anirban\u200B Das" }]), /ambiguous \(2 people match/, "exact + zero-width twin → ambiguous (2)");
 throws(() => matchProfiles("Sam", [{ pubkey: A, name: "Sam" }, { pubkey: B, name: "sam" }]), /ambiguous \(2 people/, "exact + case twin → still ambiguous (ranking orders, never picks)");
 // case-only policy, BOTH settings
-throws(() => matchProfiles("anirban das", [{ pubkey: A, name: "Anirban Das" }]), /letter case/, "CASE_ONLY_IS_AMBIGUOUS=true: case-only single hit → refused");
+throws(() => matchProfiles("anirban das", [{ pubkey: A, name: "Anirban Das" }], { caseOnlyIsAmbiguous: true }), /letter case/, "CASE_ONLY_IS_AMBIGUOUS=true: case-only single hit → refused");
+// v0.2.32-pre DEFAULT (false): case-only resolves; lookalike / hidden-bidi / multiple still refused
+ok(matchProfiles("navendu", [{ pubkey: A, name: "Navendu" }]).pubkey === A, "default: 'navendu' → the single 'Navendu' resolves");
+ok(matchProfiles("NAVENDU AGARWAL", [{ pubkey: A, display_name: "Navendu Agarwal" }]).pubkey === A, "default: case-only match on display_name resolves");
+throws(() => matchProfiles("Sam", [{ pubkey: A, name: "Sam" }, { pubkey: B, name: "SAM" }]), /ambiguous \(2/, "default: 'Sam' + 'SAM' (two people) → ambiguous, refused");
+throws(() => matchProfiles("sam", [{ pubkey: A, name: "Sam" }, { pubkey: B, name: "SAM" }]), /ambiguous \(2/, "default: case-only query vs two case-variants → ambiguous, refused");
+throws(() => matchProfiles("navendu", [{ pubkey: A, name: "N\u0430vendu" }]), /lookalike/, "default: Cyrillic lookalike + case difference → refused");
+throws(() => matchProfiles("\u0430nirban das", [{ pubkey: A, name: "Anirban Das" }]), /lookalike/, "default: homoglyph input → refused");
+throws(() => matchProfiles("navendu", [{ pubkey: A, name: "Nav\u202Eendu" }]), /lookalike/, "default: profile name with hidden bidi (RLO) → refused");
+throws(() => matchProfiles("Nav\u200Fendu", [{ pubkey: A, name: "Navendu" }]), /lookalike/, "default: typed name with hidden RLM → refused");
+throws(() => matchProfiles("navendu", [{ pubkey: A, name: "Nav\u200Bendu" }]), /lookalike/, "default: zero-width inside the profile name → refused");
+throws(() => matchProfiles("strasse", [{ pubkey: A, name: "STRAßE" }]), /lookalike/, "default: case-FOLD-only (ß/ss) is not plain case → refused");
+throws(() => matchProfiles("navendu", [{ pubkey: A, name: "Navendu" }, { pubkey: B, name: "Nav\u200Bendu" }]), /ambiguous \(2/, "default: case-only + invisible twin → ambiguous, refused");
 ok(matchProfiles("anirban das", [{ pubkey: A, name: "Anirban Das" }], { caseOnlyIsAmbiguous: false }).pubkey === A, "CASE_ONLY_IS_AMBIGUOUS=false: case-only single hit → resolves");
 throws(() => matchProfiles("\u0430nirban das", [{ pubkey: A, name: "Anirban Das" }], { caseOnlyIsAmbiguous: false }), /lookalike/, "CASE_ONLY_IS_AMBIGUOUS=false: a homoglyph is STILL refused");
 throws(() => matchProfiles("sam", [{ pubkey: A, name: "Sam" }, { pubkey: B, name: "SAM" }], { caseOnlyIsAmbiguous: false }), /ambiguous \(2/, "CASE_ONLY_IS_AMBIGUOUS=false: two case-variants → ambiguous");

@@ -5,16 +5,29 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
+import { resolveSigner, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN } from "./signer.mjs";
+import { IDENTITY_DIR } from "./loadkey_v2.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
 import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
 import { verifyEvent } from "nostr-tools/pure";
+// v0.2.31 best-practice guards (each unit-tested in safety.test.mjs).
+import {
+  UNTRUSTED_NOTE, escapeContent, escapeName, buildProfileIndex, whoLabel, resolveAttachment, openCheckedAttachment,
+  createConfirmGate, privateDownloadDir, openExclusive, downloadLeaf, downloadCap,
+  createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
+  openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
+} from "./safety.mjs";
+const ERROR_TEXT_CAP = 1500; // v0.2.31 re-check: catch-all error text cap (code points)
+import { AsyncLocalStorage } from "node:async_hooks";
+// v0.2.32 Slack-parity helpers (message links, search dates, dry-run previews, open-channel
+// directory, files, presence, custom emoji) — pure, unit-tested in parity32.test.mjs.
+import { buildMessageLink, parseMessageLink, parseWhen, DryRunStop, dryRunPreview, openChannelsFromMeta, filesFromEvents, fmtBytes, presenceFromEvents, emojiPalette, CUSTOM_EMOJI_D } from "./parity32.mjs";
 // buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
 // import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
 // (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
 import { pkce, authorizeUrl, exchangeAuthCode, bindLoopback } from "./wirelogin.mjs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream, writeSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
 import { Readable } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
@@ -46,7 +59,11 @@ function sessionId() {
 // and signs in-process; wire mode (BUZZ_WIRE_SIGN + Ekam human token) holds NO key
 // and calls /v1/me/wire-sign so events are signed AS the user (#317, Path A). PK is
 // the identity's pubkey either way.
-const signer = await resolveSigner({ sessionId: sessionId() });
+// v0.2.31 (item 8): the signer reads key/credential env vars from a boot-time SNAPSHOT; once identity
+// and the NIP-OA tags are resolved below, those vars are DELETED from process.env so nothing later in
+// the process (a child process, a diagnostic dump, a dependency) can read them back.
+const BOOT_ENV = { ...process.env };
+const signer = await resolveSigner({ sessionId: sessionId(), env: BOOT_ENV });
 // (E, v0.2.30) Strict p-tag guard on EVERY event this shim signs: a p-tag value that isn't exactly
 // 64 lowercase hex (a malformed relay profile pubkey, an uppercase id, junk from a mention index)
 // never reaches the signer. Wrapping sign() covers posts, replies, DMs, moderation and openDm alike.
@@ -61,7 +78,7 @@ const ANIMALS = ["otter","falcon","lynx","heron","ibex","marten","tern","shrike"
   "saki","tapir","serval","caracal","fossa","dhole","quokka","kagu","takin","gaur","civet"];
 function contextName() {
   let ctx;
-  try { ctx = basename(execSync("git rev-parse --show-toplevel", { stdio: ["ignore","pipe","ignore"] }).toString().trim()); } catch {}
+  try { ctx = basename(execSync("git rev-parse --show-toplevel", { stdio: ["ignore","pipe","ignore"], env: minimalChildEnv(), timeout: 5000 }).toString().trim()); } catch {}
   if (!ctx) {
     const b = basename(process.cwd());
     ctx = (b && b !== basename(homedir())) ? b : hostname().split(".")[0].toLowerCase();
@@ -122,6 +139,14 @@ if (AUTH_TAG_MALFORMED)
   process.stderr.write(`[buzz-mcp] ⚠ BUZZ_AUTH_TAG is set but is not a valid ["auth",owner,conditions,sig] JSON array — owner attestation OMITTED, so the relay will reject membership/posts with 403 relay_membership_required. Most common cause: sourcing agent.env in bash strips the JSON quotes. Fix: single-quote the value (BUZZ_AUTH_TAG='["auth",...]') or avoid \`source\`. Run buzz_doctor for the same diagnosis.\n`);
 if (PICKER_OWNER_TAG_MALFORMED)
   process.stderr.write(`[buzz-mcp] ⚠ BUZZ_PICKER_OWNER_TAG is set but is not a valid ["picker-owner",owner,conditions,sig] JSON array — the discovery attestation will be OMITTED from your kind:10100 card (same bash quote-strip cause; single-quote the value).\n`);
+// v0.2.31 (item 8): everything that needs a key/credential env var has now read it (signer from
+// BOOT_ENV, the two NIP-OA tags above, keyProvenance below from KEY_ENV_PIN) → scrub them.
+// boolean only (review nice-to-have): keep no second copy of the key string around for the session.
+const KEY_ENV_PIN = !!(BOOT_ENV.BUZZ_PRIVATE_KEY || BOOT_ENV.BUZZ_IDENTITY_KEY || "").trim();
+const SCRUBBED_ENV = scrubKeyEnv(process.env);
+// Zero the local key buffer on the way out (wire mode holds no key). Best effort.
+process.once("exit", () => { try { signer.wipe?.(); } catch {} });
+for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) process.once(sig, () => process.exit(code)); // → "exit" → wipe
 
 // ---- fail-CLOSED identity pinning (anti-impersonation) ----
 // If BUZZ_EXPECTED_PUBKEY is pinned and the running key does NOT derive to it, this session is
@@ -151,7 +176,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.30";
+const SHIM_VERSION = "0.2.32";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -286,6 +311,51 @@ function ageStr(ms) {
 // wedge is seen we stick to the raw path for the rest of the process so every later call keeps
 // working without a restart; a clean undici attempt clears the flag. `whoami` surfaces it.
 let TRANSPORT_WEDGED = false;
+
+// v0.2.31 (item 6): per-tool-call context. The CallTool handler runs each call inside REQ_CTX with
+// the client's cancellation signal (extra.signal) and a progress reporter, so deep helpers (bridge,
+// upload, download) can abort when the client cancels and report progress without threading args.
+const REQ_CTX = new AsyncLocalStorage();
+const reqSignal = () => REQ_CTX.getStore()?.signal;
+// v0.2.32 (dry_run): a write called with dry_run:true runs its whole resolution path and then STOPS
+// here — every signer.sign of a real event throws DryRunStop carrying the unsigned template, so
+// nothing is signed (no Ekam wire-sign call in "post as me") and nothing is sent. Only NIP-98
+// (kind 27235) request auth is still signed, because the READS a dry run performs need it.
+// bridgeCore("/events") and blossomUpload refuse in a dry run too (defense in depth).
+const isDryRun = () => REQ_CTX.getStore()?.dryRun === true;
+{
+  const realSign = signer.sign.bind(signer);
+  signer.sign = async (template) => {
+    const c = REQ_CTX.getStore();
+    if (c && c.dryRun === true && !(template && template.kind === 27235)) {
+      if (!c.dryStop) c.dryStop = template;   // the FIRST event a multi-step write would sign
+      throw new DryRunStop(template);
+    }
+    return realSign(template);
+  };
+}
+// Combine our own timeout with the client's cancel signal (either aborts the request).
+function withCancel(signal) {
+  const s = reqSignal();
+  return s && typeof AbortSignal.any === "function" ? AbortSignal.any([signal, s]) : signal;
+}
+function throwIfCancelled() {
+  const s = reqSignal();
+  if (s?.aborted) throw new Error("cancelled by the client");
+}
+async function progress(done, total, message) {
+  const c = REQ_CTX.getStore();
+  if (!c || c.progressToken == null || !c.sendNotification) return;
+  try {
+    await c.sendNotification({ method: "notifications/progress", params: { progressToken: c.progressToken, progress: done, ...(total ? { total } : {}), ...(message ? { message } : {}) } });
+  } catch { /* progress is best-effort */ }
+}
+// Hard timeouts (seconds, env-tunable, clamped) for the calls that previously had none.
+const envSecs = (k, def, max) => { const n = parseInt(process.env[k] || "", 10); return Number.isFinite(n) && n > 0 ? Math.min(n, max) : def; };
+const RELAYINFO_TIMEOUT_S = envSecs("BUZZ_RELAYINFO_TIMEOUT_S", 8, 60);
+const TRANSFER_TIMEOUT_S = envSecs("BUZZ_TRANSFER_TIMEOUT_S", 600, 3600); // whole upload / download
+const timeoutSignal = (secs) => withCancel(AbortSignal.timeout(secs * 1000));
+
 function rawPost(urlStr, headers, body) {
   return new Promise((resolve, reject) => {
     let u; try { u = new URL(urlStr); } catch (e) { return reject(e); }
@@ -301,6 +371,8 @@ function rawPost(urlStr, headers, body) {
     });
     req.on("error", reject);
     req.setTimeout(30_000, () => req.destroy(new Error("rawPost timeout")));
+    const cs = reqSignal();
+    if (cs) { if (cs.aborted) req.destroy(new Error("cancelled by the client")); else cs.addEventListener("abort", () => req.destroy(new Error("cancelled by the client")), { once: true }); }
     req.end(body);
   });
 }
@@ -328,6 +400,7 @@ function rawGet(urlStr, headers, timeoutMs) {
 }
 
 async function bridgeCore(path, bodyObj) {
+  if (path === "/events" && isDryRun()) throw new Error("dry run: refusing to send an event");
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
@@ -358,7 +431,7 @@ async function bridgeCore(path, bodyObj) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(new Error(`undici attempt exceeded BUZZ_HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S}s`)), HTTP_TIMEOUT_S * 1000);
     timer.unref?.();
-    return fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body, signal: ac.signal })
+    return fetch(dialUrl, { method: "POST", headers: headersFor(authz, isRetry, rClass), body, signal: withCancel(ac.signal) })
       .finally(() => clearTimeout(timer));
   };
   // v0.2.16 — NIP-98 FRESHNESS INVARIANT. `freshAuthz()` builds a brand-new NIP-98 auth event
@@ -389,6 +462,7 @@ async function bridgeCore(path, bodyObj) {
       ? await rawPost(dialUrl, headersFor(authz, true, "wedged_reroute"), body)
       : await attempt(authz, false);
   } catch (e) {
+    throwIfCancelled(); // the client cancelled → don't retry, just stop
     // NETWORK-level throw only (dead pooled socket / reset / connect timeout). HTTP errors return a
     // response (handled below) and are NEVER retried — a 401/403/4xx is not a throw. The retry goes
     // over a FRESH node:https socket (not the wedged undici pool), and marks the pool wedged so every
@@ -435,11 +509,20 @@ async function bridgeCore(path, bodyObj) {
 // sign failure) and then re-throw unchanged, so callers and the existing error text are untouched.
 // buzz_doctor consults WRITE_HEALTH to close the "check can't see failing posts" blind spot. No extra
 // I/O, no test-write.
+// v0.2.31 (item 7): the same choke-point applies the per-session write throttle + duplicate-post
+// suppression to every POST /events. A throttle/duplicate refusal is LOCAL (nothing was sent), so it
+// is NOT recorded as a write failure — buzz_doctor must not report "posts failing" for it.
+const WRITE_GUARD = createWriteGuard({ perMin: writeLimitFromEnv() });
 async function bridge(path, bodyObj) {
   const isWrite = path === "/events";
+  if (isWrite) {
+    const refusal = WRITE_GUARD.check(bodyObj);
+    if (refusal) throw new Error(refusal);
+  }
+  throwIfCancelled();
   try {
     const r = await bridgeCore(path, bodyObj);
-    if (isWrite) recordWrite(true, null);
+    if (isWrite) { recordWrite(true, null); WRITE_GUARD.commit(bodyObj); }
     return r;
   } catch (e) {
     if (isWrite) recordWrite(false, (e && e.message) || String(e));
@@ -465,16 +548,28 @@ async function blossomAuthHeader(verb, sha) {
 const DOWNLOAD_CHUNK = 16 * MB; // relay caps a single 206 range at 16 MiB → loop for larger
 
 // Upload a local file → NIP-92 descriptor {url, sha256, size, mime, filename}. Streamed hash + PUT body.
-async function blossomUpload(filePath) {
-  let st; try { st = statSync(filePath); } catch { throw new Error(`attachment not found: ${filePath}`); }
-  if (!st.isFile()) throw new Error(`attachment is not a file: ${filePath}`);
-  const { mime } = mediaCapCheck(basename(filePath), st.size); // per-type cap; throws a distinguishable local refusal if over
-  const sha = await sha256File(filePath);
+// v0.2.31 (item 6): whole-transfer timeout (BUZZ_TRANSFER_TIMEOUT_S), client cancel, progress.
+// v0.2.31 fix (review §3.8): the bytes come from ONE fd opened O_NOFOLLOW and proven to be the
+// same dev:ino that resolveAttachment checked against the secret-path denylist (no check/use swap).
+async function blossomUpload(filePath, expectId) {
+  if (isDryRun()) throw new Error("dry run: refusing to upload");
+  const { fd, size } = openCheckedAttachment(filePath, expectId);
+  const st = { size };
+  let src, mime, sha;
+  try {
+    ({ mime } = mediaCapCheck(basename(filePath), st.size)); // per-type cap; throws a distinguishable local refusal if over
+    sha = await new Promise((res, rej) => { const h = createHash("sha256"); const r = createReadStream(null, { fd, start: 0, autoClose: false }); r.on("error", rej); r.on("data", (c) => h.update(c)); r.on("end", () => res(h.digest("hex"))); });
+    throwIfCancelled();
+    src = createReadStream(null, { fd, start: 0, autoClose: true });
+  } catch (e) { try { closeSync(fd); } catch {} throw e; }
+  let sent = 0, lastPct = -1;
+  src.on("data", (c) => { sent += c.length; const pct = st.size ? Math.floor((sent * 20) / st.size) : 20; if (pct !== lastPct) { lastPct = pct; progress(sent, st.size, `uploading ${basename(filePath)}`); } });
   const res = await fetch(`${RELAY}/upload`, {
     method: "PUT",
     headers: { Authorization: await blossomAuthHeader("upload", sha), "X-SHA-256": sha, "Content-Type": mime, "Content-Length": String(st.size), ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}) },
-    body: Readable.toWeb(createReadStream(filePath)),
+    body: Readable.toWeb(src),
     duplex: "half",
+    signal: timeoutSignal(TRANSFER_TIMEOUT_S),
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`upload ${basename(filePath)} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -482,22 +577,51 @@ async function blossomUpload(filePath) {
   return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename(filePath) };
 }
 
-// Download a media blob (sha[.ext]) → destPath, streamed to disk with Range-based resume.
-async function blossomDownload(shaExt, destPath) {
+// Download a media blob (sha[.ext]) into the PRIVATE download dir (item 5): dir 0700, file created
+// O_CREAT|O_EXCL|O_NOFOLLOW 0600 (never overwrites, never follows a planted symlink), streamed chunk
+// by chunk to disk (no whole-blob buffering), refused past the size cap (BUZZ_DOWNLOAD_MAX_MB,
+// default 200) both up front (Content-Range / Content-Length total) and while streaming. Range loop
+// for blobs larger than one 16 MiB relay range. Whole-transfer timeout + client cancel (item 6).
+async function blossomDownload(shaExt, { ext = "" } = {}) {
   const sha = String(shaExt).split(".")[0].toLowerCase();
+  const dir = privateDownloadDir();
+  const cap = downloadCap();
+  const destPath = join(dir, downloadLeaf(sha, ext));
   const part = destPath + ".part";
-  let start = 0; try { start = statSync(part).size; } catch {}
-  let total = Infinity;
-  while (start < total) {
-    const res = await fetch(`${RELAY}/media/${shaExt}`, { headers: { Authorization: await blossomAuthHeader("get", sha), Range: `bytes=${start}-${start + DOWNLOAD_CHUNK - 1}`, ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}) } });
-    if (res.status === 200) { const buf = Buffer.from(await res.arrayBuffer()); writeFileSync(part, buf); start = buf.length; total = buf.length; break; }
-    if (res.status !== 206) { const t = await res.text().catch(() => ""); throw new Error(`download <${sha.slice(0, 8)}> -> HTTP ${res.status}: ${t.slice(0, 160)}`); }
-    const cr = res.headers.get("content-range") || ""; const m = cr.match(/\/(\d+)\s*$/); if (m) total = Number(m[1]);
-    const buf = Buffer.from(await res.arrayBuffer());
-    start === 0 ? writeFileSync(part, buf) : appendFileSync(part, buf);
-    start += buf.length;
-    if (!buf.length) break;
+  const fd = openExclusive(part);
+  const signal = timeoutSignal(TRANSFER_TIMEOUT_S);
+  const overCap = (n) => new Error(`download <${sha.slice(0, 8)}> refused: ${n} bytes exceeds the ${Math.round(cap / 1048576)} MB download cap (BUZZ_DOWNLOAD_MAX_MB)`);
+  let ok = false;
+  try {
+    let start = 0, total = Infinity;
+    while (start < total) {
+      const res = await fetch(`${RELAY}/media/${shaExt}`, { signal, headers: { Authorization: await blossomAuthHeader("get", sha), Range: `bytes=${start}-${start + DOWNLOAD_CHUNK - 1}`, ...(AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {}) } });
+      if (res.status !== 200 && res.status !== 206) { const t = await res.text().catch(() => ""); throw new Error(`download <${sha.slice(0, 8)}> -> HTTP ${res.status}: ${t.slice(0, 160)}`); }
+      const whole = res.status === 200;
+      if (whole) { const cl = Number(res.headers.get("content-length")); if (Number.isFinite(cl) && cl > 0) total = cl; if (start) throw new Error(`download <${sha.slice(0, 8)}>: relay ignored the Range request mid-transfer`); }
+      else { const m = (res.headers.get("content-range") || "").match(/\/(\d+)\s*$/); if (m) total = Number(m[1]); }
+      if (Number.isFinite(total) && total > cap) { try { await res.body?.cancel(); } catch {} throw overCap(total); }
+      let got = 0;
+      const reader = res.body ? res.body.getReader() : null;
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (start + got + value.length > cap) { try { await reader.cancel(); } catch {} throw overCap(start + got + value.length); }
+        writeSync(fd, value);
+        got += value.length;
+      }
+      start += got;
+      progress(start, Number.isFinite(total) ? total : undefined, `downloading <${sha.slice(0, 8)}>`);
+      if (whole) { total = start; break; }
+      if (!got) break;
+    }
+    fsyncSync(fd);
+    ok = true;
+  } finally {
+    closeSync(fd);
+    if (!ok) { try { unlinkSync(part); } catch {} }
   }
+  if (existsSync(destPath)) throw new Error(`download target already exists: ${destPath}`);
   renameSync(part, destPath);
   return destPath;
 }
@@ -514,7 +638,7 @@ const KIND_AGENT_PROFILE = 10100; // Buzz: agent metadata (replaceable, agent-au
 // interface, plus a structured kind:10100 agent card, so the fleet sees what each
 // agent actually is (which model, which harness, which interface).
 async function publishProfile(name) {
-  MY_NAME = name;
+  if (!isDryRun()) MY_NAME = name;
   const host = hostname().split(".")[0];
   const profile = {
     display_name: name, name,
@@ -573,10 +697,54 @@ async function channels() {
     return { id: t.d, name: t.name || "(unnamed)", about: t.about || "" };
   }).filter((c) => c.id);
 }
+// v0.2.31 (items 2 + 12): kind:0 events are signature-verified (forged profiles dropped), the NEWEST
+// kind:0 per pubkey wins (not arrival order), and look-alike names across different pubkeys are
+// flagged. The index is kept for whoLabel() so every rendered author shows "name (pk8)".
+const INBOUND_MODE = inboundMode();
+let PROFILE_IDX = { names: {}, collide: new Set() };
 async function profiles() {
   const evs = await query([{ kinds: [0], limit: 200 }]);
-  const m = {};
-  for (const e of evs || []) { try { const c = JSON.parse(e.content); m[e.pubkey] = c.display_name || c.name || e.pubkey.slice(0, 8); } catch {} }
+  const { events } = screenInbound(evs || [], verifyEvent, { mode: INBOUND_MODE });
+  PROFILE_IDX = buildProfileIndex(events);
+  return PROFILE_IDX.names;
+}
+const who = (pk) => whoLabel(pk, PROFILE_IDX);
+// Verify inbound content events (kind 9 etc.): drop (default) or flag forged signatures, flag a
+// created_at from the future. → { events, note } where note is a header line when anything happened.
+function screen(evs) {
+  const r = screenInbound(evs || [], verifyEvent, { mode: INBOUND_MODE });
+  const notes = [];
+  if (r.dropped) notes.push(`⚠ ${r.dropped} event(s) failed signature verification and were hidden`);
+  return { events: r.events, flagOf: r.flagOf, note: notes.join("; ") };
+}
+// One rendered message row: escaped single-line content, verified-author label, flags.
+function row(e, { withDate = false, attach = "", flagOf, content = e.content, edited = false } = {}) {
+  const f = flagOf ? flagOf(e) : "";
+  return `[${fmtTime(e.created_at, withDate)}] ${who(e.pubkey)} <${String(e.id).slice(0, 8)}>${attach}: ${escapeContent(content)}${edited ? " (edited)" : ""}${f ? "  " + f : ""}`;
+}
+// A kind:9 row with its 📎 attachment labels and, when the author edited it (kind:40003 by the SAME
+// pubkey, newest wins), the edited text marked "(edited)".
+function renderMsg(e, { edits, flagOf, withDate = false } = {}) {
+  const atts = messageAttachments(e);
+  const attach = atts.length ? " " + atts.map((x) => `📎${escapeName(x.filename || x.mime || "file")}`).join("") : "";
+  const ed = edits && edits.get(e.id);
+  return row(e, { withDate, attach, flagOf, content: ed ? ed.content : e.content, edited: !!ed });
+}
+async function latestEdits(chId, events) {
+  const m = new Map();
+  const byId = new Map((events || []).map((e) => [e.id, e]));
+  if (!byId.size) return m;
+  let evs = [];
+  try { evs = screen(await query([{ kinds: [40003], "#h": [chId], "#e": [...byId.keys()], limit: 500 }])).events; } catch { return m; }
+  for (const ed of evs) {
+    if (!ed || ed.kind !== 40003) continue;
+    if (!(ed.tags || []).some((t) => t[0] === "h" && t[1] === chId)) continue;
+    const tgt = ((ed.tags || []).find((t) => t[0] === "e") || [])[1];
+    const orig = byId.get(tgt);
+    if (!orig || orig.pubkey !== ed.pubkey) continue;   // only the author's own edit counts
+    const prev = m.get(tgt);
+    if (!prev || ed.created_at > prev.created_at) m.set(tgt, ed);
+  }
   return m;
 }
 // (v0.2.30 fix, buzz_security review §3.1) Fail-closed channel lookup: exact id, else matchChannel
@@ -844,7 +1012,7 @@ async function mentionPtags(text) {
   return { pubkeys: r.pubkeys, refused: [...failed, ...r.refused, ...over] };
 }
 const mentionNote = (r) => (r && r.refused && r.refused.length)
-  ? ` — NOT tagged (fail-closed): ${r.refused.map((x) => `@${x.token}: ${x.reason}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.`
+  ? ` — NOT tagged (fail-closed): ${r.refused.map((x) => `@${escapeName(x.token)}: ${escapeContent(x.reason, { cap: 300 })}`).join("; ")}. Use buzz_agents to find the right person and mention them by an unambiguous name.`
   : "";
 
 // ---- channel name/about client-side limits (v0.2.27, per buzz_security's 0.2.26 GO notes) ----
@@ -883,17 +1051,250 @@ function channelAboutError(about) {
 }
 
 // ---- MCP server ----
+// ---- v0.2.31 shared tool helpers ----
+const CONFIRM = createConfirmGate();
+// Wire mode only: the first 9001/9005/9002 of the session needs confirm:true (item 4).
+// v0.2.32: in a dry run the gate never records a confirm (confirm:true is ignored) and never blocks
+// the preview — it adds a note that the real run will need confirm:true.
+const gate = (kind, a, label) => {
+  const c = REQ_CTX.getStore();
+  if (c && c.dryRun === true) {
+    const r = CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: false, label });
+    if (r) (c.dryNotes || (c.dryNotes = [])).push(`the real run needs confirm: true (${label}, kind ${kind}, signed as you)`);
+    return null;
+  }
+  return CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: a && a.confirm, label });
+};
+const wireBlocked = (kind, tool) => (signer.canSign(kind) ? null
+  : EKAM_REFUSED_BY_DESIGN.has(kind)
+    ? `${tool}: kind ${kind} (${EKAM_REFUSED_BY_DESIGN.get(kind)}) is blocked on Ekam wire-sign allowlist — Ekam deliberately doesn't sign it "as you" ("post as me"), so nothing was sent. Use an agent-mode session (an agent's own key) for this.`
+    : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist — it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`);
+// Upload a file OR every regular file in a folder (item 1). ANY file type / folder is allowed; only
+// secret locations are refused — checked on the typed path AND the realpath (symlinks followed), incl.
+// this shim's own key store (IDENTITY_DIR), wire-refresh tokens and ~/.config/buzz-cli (safety.mjs).
+async function uploadAttachments(input) {
+  const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR, IDENTITY_DIR, WIRE_REFRESH_DIR] });
+  const ups = [];
+  if (isDryRun()) {
+    // dry run: the secret-path refusals above and the per-type size caps still apply; nothing uploads.
+    for (const f of r.files) { const size = statSync(f).size; const { mime } = mediaCapCheck(basename(f), size); ups.push({ dry: true, url: `(dry run — ${basename(f)} not uploaded)`, filename: basename(f), size, mime }); }
+    return { r, ups };
+  }
+  for (const f of r.files) { throwIfCancelled(); ups.push(await blossomUpload(f, r.ids && r.ids[f])); }
+  return { r, ups };
+}
+function attachedLabel(att) {
+  if (!att) return "";
+  const { r, ups } = att;
+  const tot = ups.reduce((n, u) => n + (u.size || 0), 0);
+  const names = ups.map((u) => u.filename).join(", ");
+  const src = r.real === r.typed ? r.real : `${r.typed} → ${r.real}`;
+  const skipped = r.skipped && r.skipped.length ? `; skipped ${r.skipped.length}: ${r.skipped.join(", ")}` : "";
+  return ` [+attachment${ups.length > 1 ? `s (${ups.length})` : ""} ${names}, ${tot >= MB ? (tot / MB).toFixed(1) + " MB" : tot >= 1024 ? (tot / 1024).toFixed(1) + " KB" : tot + " B"} from ${src}${skipped}]`;
+}
+// `to` may be one recipient or an array (group DM, up to 8 others, item: group DMs).
+async function resolveRecipients(to) {
+  const list = Array.isArray(to) ? to : [to];
+  if (!list.length || list.length > 8) throw new Error(`a DM needs 1–8 other participants (got ${list.length})`);
+  const out = [];
+  for (const t of list) { const pk = await resolveRecipient(t); if (pk !== PK && !out.includes(pk)) out.push(pk); }
+  if (!out.length) throw new Error("a DM needs at least one participant other than you");
+  return out;
+}
+const toLabel = (to) => (Array.isArray(to) ? to.join(", ") : String(to));
+const threadRootOf = (ev) => {
+  let mRoot = null, mReply = null;
+  for (const t of (ev && ev.tags) || []) if (t[0] === "e" && /^[0-9a-f]{64}$/i.test(t[1] || "")) {
+    if (t[3] === "root") mRoot = t[1];
+    if (t[3] === "reply") mReply = t[1];
+  }
+  return mReply ? (mRoot || mReply) : ev.id;
+};
+async function dmById(id) {
+  const hit = (await dmChannels()).find((c) => c.id === id);
+  if (!hit) throw new Error(`no DM conversation ${String(id).slice(0, 8)}… that you're in — see buzz_dm_list`);
+  return hit;
+}
+
+async function parityTool(name, a, { ok, fail }) {
+  const guard = (verb) => (IDENTITY_OK ? null : fail(`refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not ${verb} as the wrong identity.`));
+  const withAuth = (tags) => (AUTH_TAG ? [...tags, AUTH_TAG] : tags);
+  const publish = async (kind, tags, content = "") => { const ev = await signer.sign({ kind, tags: withAuth(tags), content }); await bridge("/events", ev); return ev; };
+
+  if (name === "buzz_edit_message") {
+    const g = guard("editing"); if (g) return g;
+    const wb = wireBlocked(40003, name); if (wb) return fail(wb);
+    const text = typeof a.text === "string" ? a.text : (typeof a.message === "string" ? a.message : "");
+    if (!text.trim()) return fail("buzz_edit_message needs the new `text`.");
+    if (Buffer.byteLength(text, "utf8") > 65536) return fail("buzz_edit_message: the new text is over the relay's 64 KB edit limit.");
+    const ch = await resolveChannel(a.channel);
+    const hit = await resolveEventInChannel(ch.id, ch.name, a.event);
+    if (hit.pubkey !== PK) return fail(`buzz_edit_message: <${String(hit.id).slice(0, 8)}> isn't yours — you can only edit your own messages.`);
+    if (hit.kind !== 9) return fail("buzz_edit_message: only chat messages (kind 9) can be edited.");
+    await publish(40003, [["h", ch.id], ["e", hit.id]], text);
+    return ok(`edited your message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)}: ${text}`);
+  }
+
+  if (name === "buzz_thread_read") {
+    const ch = await resolveChannel(a.channel);
+    const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+    await profiles();
+    const rootId = threadRootOf(target);
+    const root = rootId === target.id ? target : (await query([{ ids: [rootId], "#h": [ch.id] }]) || [])[0];
+    const replies = await query([{ kinds: [9], "#h": [ch.id], "#e": [rootId], limit: clampLimit(a.limit, 50, 200) }]) || [];
+    const seen = new Set(); const all = [];
+    for (const e of [root, ...replies]) if (e && !seen.has(e.id) && (e.tags || []).some((t) => t[0] === "h" && t[1] === ch.id)) { seen.add(e.id); all.push(e); }
+    const scr = screen(all);
+    const edits = await latestEdits(ch.id, scr.events);
+    const rows = scr.events.sort((x, y) => x.created_at - y.created_at).map((e) => (e.id === rootId ? "▶ " : "  ↳ ") + renderMsg(e, { edits, flagOf: scr.flagOf }));
+    return ok(`thread <${rootId.slice(0, 8)}> in #${escapeName(ch.name)} (${rows.length} msgs${root ? "" : "; root not readable"}):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n${rows.join("\n") || "(empty)"}`);
+  }
+
+  if (name === "buzz_channel_topic") {
+    const g = guard("editing a channel"); if (g) return g;
+    const ch = await resolveChannel(a.channel);
+    const tags = [["h", ch.id]], changed = [];
+    for (const k of ["topic", "purpose"]) {
+      if (typeof a[k] !== "string") continue;
+      const v = a[k];
+      if (v) { const err = channelAboutError(v); if (err) return fail(`buzz_channel_topic: ${k}: ${err.replace(/description/gi, k)}`); }
+      tags.push([k, v]); changed.push(v ? `${k} set` : `${k} cleared`);
+    }
+    if (!changed.length) return fail("buzz_channel_topic: pass `topic` and/or `purpose` (empty string clears).");
+    { const gg = gate(9002, a, `set the ${changed.join(" + ")} on #${escapeName(ch.name)}`); if (gg) return fail(gg); }
+    await publish(9002, tags);
+    return ok(`#${escapeName(ch.name)}: ${changed.join(", ")}. (Applied only if the relay confirms your owner/admin role.)`);
+  }
+
+  if (name === "buzz_leave_channel") {
+    const g = guard("leaving a channel"); if (g) return g;
+    const wb = wireBlocked(9022, name); if (wb) return fail(wb);
+    const ch = await resolveChannel(a.channel);
+    await publish(9022, [["h", ch.id]]);
+    return ok(`left #${escapeName(ch.name)}. Rejoin an open channel with buzz_join_channel; a private one needs an owner/admin to re-add you.`);
+  }
+
+  if (name === "buzz_archive_channel") {
+    const g = guard("archiving a channel"); if (g) return g;
+    const ch = await resolveChannel(a.channel);
+    const archive = a.archived !== false;
+    if (archive && a.confirm !== true) return fail(`buzz_archive_channel: archiving #${escapeName(ch.name)} makes it read-only for everyone. Re-run with confirm: true to proceed.`);
+    { const gg = gate(9002, a, `${archive ? "archive" : "unarchive"} #${escapeName(ch.name)}`); if (gg) return fail(gg); }
+    await publish(9002, [["h", ch.id], ["archived", archive ? "true" : "false"]]);
+    return ok(`${archive ? "archived" : "unarchived"} #${escapeName(ch.name)}. (Applied only if the relay confirms your owner/admin role.)`);
+  }
+
+  if (name === "buzz_delete_channel") {
+    const g = guard("deleting a channel"); if (g) return g;
+    const wb = wireBlocked(9008, name); if (wb) return fail(wb);
+    const ch = await resolveChannel(a.channel);
+    if (a.confirm !== true) return fail(`buzz_delete_channel: deleting #${escapeName(ch.name)} [${ch.id}] is permanent for every member. Re-run with confirm: true to proceed.`);
+    await publish(9008, [["h", ch.id]]);
+    return ok(`deleted #${escapeName(ch.name)} [${ch.id}]. (Allowed only if the relay confirms you own it.)`);
+  }
+
+  if (name === "buzz_profile") {
+    const q = String(a.user || "").trim();
+    if (!q) return fail("buzz_profile needs `user` (npub / hex pubkey / email / exact display name).");
+    const pk = await resolveRecipient(q);
+    const scr = screen(await query([{ kinds: [0], authors: [pk], limit: 10 }]));
+    const ev = scr.events.filter((e) => e.kind === 0 && e.pubkey === pk).sort((x, y) => y.created_at - x.created_at)[0];
+    await profiles();
+    const head = `profile ${who(pk)}\n  npub: ${nip19.npubEncode(pk)}\n  pubkey: ${pk}`;
+    if (!ev) return ok(`${head}\n  (no kind:0 profile found${scr.note ? "; " + scr.note : ""})`);
+    let c = {}; try { c = JSON.parse(ev.content) || {}; } catch {}
+    const lines = ["display_name", "name", "about", "nip05", "model", "harness", "interface", "client_version", "picture", "website"]
+      .filter((k) => typeof c[k] === "string" && c[k]).map((k) => `  ${k}: ${escapeContent(c[k], { cap: 500 })}`);
+    const f = scr.flagOf(ev);
+    return ok(`${head}\n${UNTRUSTED_NOTE.replace("message content", "profile content")}\n${lines.join("\n") || "  (empty profile)"}\n  updated: ${fmtTime(ev.created_at, true)}${f ? "  " + f : ""}`);
+  }
+
+  if (name === "buzz_unreact") {
+    const g = guard("removing a reaction"); if (g) return g;
+    const wb = wireBlocked(5, name); if (wb) return fail(wb);
+    const ch = await resolveChannel(a.channel);
+    const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+    const want = a.emoji != null && String(a.emoji).trim() ? String(a.emoji).trim() : null;
+    const mine = (screen(await query([{ kinds: [7], authors: [PK], "#e": [target.id], limit: 50 }])).events)
+      .filter((r) => r.kind === 7 && r.pubkey === PK && (r.tags || []).some((t) => t[0] === "e" && t[1] === target.id) && (!want || r.content === want));
+    if (!mine.length) return fail(`buzz_unreact: you have no ${want ? want + " " : ""}reaction on <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}.`);
+    // buzz-sdk build_remove_reaction: kind 5, exactly ONE e tag (the reaction id), empty content.
+    for (const r of mine) await publish(5, [["e", r.id]]);
+    return ok(`removed ${mine.length} reaction${mine.length > 1 ? "s" : ""} (${[...new Set(mine.map((r) => r.content))].join(" ")}) from <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}`);
+  }
+
+  if (name === "buzz_reactions") {
+    const ch = await resolveChannel(a.channel);
+    const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+    const rs = screen(await query([{ kinds: [7], "#e": [target.id], limit: 500 }])).events
+      .filter((r) => r.kind === 7 && (r.tags || []).some((t) => t[0] === "e" && t[1] === target.id));
+    let gone = new Set();
+    if (rs.length) {
+      const dels = screen(await query([{ kinds: [5], "#e": rs.map((r) => r.id), limit: 500 }])).events;
+      const byId = new Map(rs.map((r) => [r.id, r]));
+      for (const d of dels) for (const t of d.tags || []) if (t[0] === "e" && byId.get(t[1]) && byId.get(t[1]).pubkey === d.pubkey) gone.add(t[1]);
+    }
+    await profiles();
+    const groups = new Map();
+    for (const r of rs) {
+      if (gone.has(r.id)) continue;
+      const emo = escapeName(r.content || "+");
+      const g = groups.get(emo) || new Set(); g.add(r.pubkey); groups.set(emo, g);
+    }
+    const rows = [...groups].sort((x, y) => y[1].size - x[1].size).map(([emo, pks]) => `${emo} ×${pks.size}: ${[...pks].map(who).join(", ")}`);
+    return ok(`reactions on <${String(target.id).slice(0, 8)}> in #${escapeName(ch.name)}:\n${rows.join("\n") || "(none)"}`);
+  }
+
+  if (name === "buzz_dm_add") {
+    const g = guard("adding to a DM"); if (g) return g;
+    const wb = wireBlocked(41011, name); if (wb) return fail(wb);
+    const dm = await dmById(String(a.channel || "").trim());
+    const pk = await resolveRecipient(a.user);
+    if (dm.participants.includes(pk)) return ok(`already in that DM.`);
+    if (dm.participants.length >= 9) return fail("buzz_dm_add: a group DM holds at most 9 people (you + 8).");
+    // v0.2.31 fix (review §3.8): adding someone exposes the DM's PRIOR history, so in wire / "post as
+    // me" mode it needs confirm:true — once per session, like the other membership changes (9001).
+    // The write throttle still applies to every call.
+    await profiles();   // so the confirm prompt names the person
+    { const gg = gate(41011, a, `adding ${who(pk)} to DM [${dm.id}]`); if (gg) return fail(gg); }
+    await publish(41011, [["h", dm.id], ["p", pk]]);
+    await profiles();
+    return ok(`added ${who(pk)} to DM [${dm.id}]. ⚠️ they can see the conversation's prior history.`);
+  }
+
+  if (name === "buzz_dm_hide") {
+    const g = guard("hiding a DM"); if (g) return g;
+    const wb = wireBlocked(41012, name); if (wb) return fail(wb);
+    let id = String(a.channel || "").trim();
+    if (!id && a.to) {
+      const pk = await resolveRecipient(a.to);
+      const hit = (await dmChannels()).find((c) => c.others.length === 1 && c.others[0] === pk);
+      if (!hit) return fail(`no 1:1 DM with ${a.to} to hide.`);
+      id = hit.id;
+    }
+    if (!id) return fail("buzz_dm_hide needs `channel` (dm id) or `to`.");
+    const dm = await dmById(id);
+    await publish(41012, [["h", dm.id]]);
+    return ok(`hid DM [${dm.id}] from your list.`);
+  }
+  return null;
+}
+
 const server = new Server({ name: "buzz", version: SHIM_VERSION }, { capabilities: { tools: {} } });
 
+const TO_SCHEMA = { type: ["string", "array"], items: { type: "string" }, maxItems: 8, description: "one person (npub / hex / email / exact display-name) or an array of up to 8 for a group DM" };
+const CONFIRM_PROP = { type: "boolean", description: "set true to confirm a destructive action (asked once per session per kind in wire / post-as-me mode)" };
+const CH = { type: "string", description: "channel name or id" };
+const EV = { type: "string", description: "the target message's <id> (from buzz_read)" };
 const TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
+  { name: "buzz_channels", description: "List channels. Default `scope: \"member\"` = the channels you're in. `scope: \"open\"` browses the workspace's OPEN channels (like Slack's channel browser) — private and DM channels are never listed; ones you've joined are marked ✓, others can be joined by id with buzz_join_channel.", inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["member", "open"], description: "\"member\" (default) or \"open\"" } } } },
   { name: "buzz_create_channel", description: "Create a new channel (NIP-29 kind 9007), as you — you become its owner. `name` is required. `visibility`: \"private\" (invite-only; the DEFAULT — fail-closed) or \"open\" (searchable, anyone self-joins). `type`: \"stream\" (default) or \"forum\". Optional `description`, and `ttl` (seconds — an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.", inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; ≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"private\" (default) or \"open\"" }, type: { type: "string", description: "\"stream\" (default) or \"forum\"" }, description: { type: "string", description: "optional channel description/about (≤500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
   { name: "buzz_edit_channel", description: "Edit a channel's metadata (NIP-29 kind 9002), as you — owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` (\"open\"/\"private\"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.", inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"open\" or \"private\"" }, description: { type: "string", description: "new about/description (empty string clears it; ≤500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
   { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent — a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member) — the shim refuses a private target client-side when it can tell, rather than signing a request the relay bounces. `channel` = a channel name (if you can already see it) or its id (UUID — needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
+  { name: "buzz_search", description: "Search recent messages across your channels and DMs (NIP-50 full text), with Slack-style filters: `from` (a person — npub / hex / email in wire mode / exact display name, or \"me\"; resolved fail-closed), `after` / `before` (YYYY-MM-DD, an ISO datetime with a zone, epoch seconds, or an age like 24h / 7d), `in` (\"all\" default, \"channels\", or \"dms\"), `channel` to scope to one channel, `limit` (default 20, max 100). `query` may be empty when a filter is given.", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, from: { type: "string", description: "only messages by this person (npub / hex / email / exact display name / \"me\")" }, after: { type: "string", description: "only messages at/after this time (YYYY-MM-DD, ISO datetime with zone, epoch seconds, or 24h / 7d)" }, before: { type: "string", description: "only messages at/before this time (YYYY-MM-DD = through the end of that UTC day)" }, in: { type: "string", enum: ["all", "channels", "dms"], description: "\"all\" (default), \"channels\" or \"dms\"" }, limit: { type: "number" } } } },
   { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
   { name: "buzz_post", description: "Post a message to a channel. The body goes in `text` (its alias `message` is also accepted). Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel"] } },
@@ -906,14 +1307,82 @@ const TOOLS = [
   { name: "buzz_delete", description: "Delete a message in a channel (NIP-29 kind 9005), as you. Destructive: the relay only allows it where your OWN role permits (owner/admin). Identify the message by `channel` + `event` (the <id> from buzz_read).", inputSchema: { type: "object", properties: { channel: { type: "string" }, event: { type: "string", description: "the target message's <id> (from buzz_read)" } }, required: ["channel", "event"] } },
   { name: "buzz_dm_list", description: "List your direct-message conversations (other participant + dm channel id).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_dm_read", description: "Read a direct-message conversation. Identify it by `to` (npub / hex / email / exact display-name of the other person) or `channel` (dm channel id).", inputSchema: { type: "object", properties: { to: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } } } },
-  { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] } },
-  { name: "buzz_dm_send", description: "Send a direct message to a person — opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } },
+  { name: "buzz_dm_open", description: "Open (or find) a 1:1 DM with a person and return its channel id. `to` = npub / hex / email / exact display-name.", inputSchema: { type: "object", properties: { to: TO_SCHEMA }, required: ["to"] } },
+  { name: "buzz_dm_send", description: "Send a direct message to a person — opens the 1:1 if needed, then sends. `to` = npub / hex / email / exact display-name. The body goes in `text` (its alias `message` is also accepted).", inputSchema: { type: "object", properties: { to: TO_SCHEMA, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" } }, required: ["to"] } },
   { name: "buzz_status_set", description: "Set your live user status (NIP-38 kind 30315, d=general). `text` = the status message (empty allowed), optional `emoji`. AGENT MODE ONLY — wire mode (post-as-the-user) can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: { text: { type: "string", description: "the status text (empty allowed)" }, emoji: { type: "string", description: "optional status emoji" } } } },
   { name: "buzz_status_clear", description: "Clear your live user status (NIP-38 kind 30315 with empty content, d=general — a replaceable-event clear). AGENT MODE ONLY — wire mode can't sign kind 30315 yet, so it refuses there.", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_unread", description: "Read-only activity digest: across your channels and DMs, count recent messages from others (last `hours`, default 24) and how many @mention you. A heuristic (NOT real read-state) — it performs no writes.", inputSchema: { type: "object", properties: { hours: { type: "number", description: "look-back window in hours (default 24)" } } } },
   { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal — for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again — or buzz_whoami — to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
   { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport — it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a structured diagnosis: (1) relay answers but your normal client is stuck → WEDGED CLIENT POOL → restart your MCP client; (2) the relay does not answer → RELAY UNREACHABLE → wait / check status; (3) an authed probe is rejected → LAPSED GRANT → re-run buzz_login; (4) reads/auth are healthy but your recent posts have been failing → POSTS FAILING (READS OK) → retry / report in #buzz-help. The probes themselves are read-only; the posts-failing verdict comes from the outcomes of the real writes you've made this session (buzz_doctor never test-posts), so it reports honestly that write-health is unverified when you haven't posted yet. Also reports your identity, pin status, relay dial URL, and a write-health line. Connector-side probe only — not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } },
+  // ---- v0.2.31 Slack-parity tools ----
+  { name: "buzz_edit_message", description: "Edit one of YOUR OWN messages (kind 40003, h + e tags; new text ≤ 64 KB). Clients show the edited text marked (edited). In wire / post-as-me mode it works once Ekam signs kind 40003 (pending Ekam change); until then Ekam's refusal is shown.", inputSchema: { type: "object", properties: { channel: CH, event: EV, text: { type: "string", description: "the replacement text" }, message: { type: "string", description: "alias for `text`" } }, required: ["channel", "event"] } },
+  { name: "buzz_thread_read", description: "Read a whole thread: the root message plus every reply (NIP-10). `event` may be the root or any reply in it.", inputSchema: { type: "object", properties: { channel: CH, event: EV, limit: { type: "number", description: "max replies (default 50, max 200)" } }, required: ["channel", "event"] } },
+  { name: "buzz_channel_topic", description: "Set or clear a channel's topic and/or purpose (kind 9002, owner/admin only — relay-enforced). Empty string clears.", inputSchema: { type: "object", properties: { channel: CH, topic: { type: "string", description: "new topic (≤500 chars; empty clears)" }, purpose: { type: "string", description: "new purpose (≤500 chars; empty clears)" }, confirm: CONFIRM_PROP }, required: ["channel"] } },
+  { name: "buzz_leave_channel", description: "Leave a channel you're in (kind 9022). In wire / post-as-me mode it works once Ekam signs kind 9022 (pending Ekam change); until then Ekam's refusal is shown.", inputSchema: { type: "object", properties: { channel: CH }, required: ["channel"] } },
+  { name: "buzz_archive_channel", description: "Archive (read-only for everyone) or unarchive a channel (kind 9002 archived tag; owner/admin only). Archiving needs `confirm: true`. `archived` defaults to true; pass false to unarchive.", inputSchema: { type: "object", properties: { channel: CH, archived: { type: "boolean", description: "true = archive (default), false = unarchive" }, confirm: CONFIRM_PROP }, required: ["channel"] } },
+  { name: "buzz_delete_channel", description: "Permanently delete a channel (kind 9008; owner only — relay-enforced). Always needs `confirm: true`. Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 9008) — agent key only.", inputSchema: { type: "object", properties: { channel: CH, confirm: CONFIRM_PROP }, required: ["channel"] } },
+  { name: "buzz_profile", description: "Look up a person's profile (kind 0) by npub / hex pubkey / email (wire mode) / exact display name. Read-only; profile fields are shown escaped as untrusted text.", inputSchema: { type: "object", properties: { user: { type: "string", description: "npub / hex pubkey / email / exact display name" } }, required: ["user"] } },
+  { name: "buzz_unreact", description: "Remove YOUR reaction from a message (kind 5 deletion with one e tag = your reaction's id). Optional `emoji` removes only that one; otherwise all of yours on the message. Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 5) — agent key only.", inputSchema: { type: "object", properties: { channel: CH, event: EV, emoji: { type: "string", description: "only remove this emoji (default: all of yours on the message)" } }, required: ["channel", "event"] } },
+  { name: "buzz_reactions", description: "List the reactions on a message, grouped by emoji, with who reacted. Read-only; reactions their author removed (kind 5) are left out.", inputSchema: { type: "object", properties: { channel: CH, event: EV }, required: ["channel", "event"] } },
+  { name: "buzz_dm_add", description: "Add a person to an existing DM conversation you're in (kind 41011; at most 9 people total). They can see its prior history, so in wire / post-as-me mode the first add of the session needs `confirm: true`.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id (from buzz_dm_list)" }, user: { type: "string", description: "npub / hex pubkey / email / exact display name" }, confirm: CONFIRM_PROP }, required: ["channel", "user"] } },
+  // ---- v0.2.32 Slack-parity tools (read-only) ----
+  { name: "buzz_message_link", description: "Get a shareable link to a message, or open one. With `channel` + `event` (the <id> from buzz_read) → the canonical buzz://message?channel=…&id=…[&thread=…] link (thread = the root when it's a reply). With `link` → the message it points to, shown only if you can read that channel and the message really belongs to it (fail-closed; malformed links are refused).", inputSchema: { type: "object", properties: { channel: CH, event: EV, link: { type: "string", description: "a buzz://message?… link to open" } } } },
+  { name: "buzz_activity", description: "Your activity feed (like Slack's Activity / Mentions): @mentions of you, items needing your action, and activity in your channels, from the relay's feed (feed_types). Falls back to an @mention scan when the relay has no feed support. `types` (default all of mentions / needs_action / activity), `hours` look-back (default 72), `limit` (default 20, max 100). Read-only; feed text is untrusted.", inputSchema: { type: "object", properties: { types: { type: "array", items: { type: "string", enum: ["mentions", "needs_action", "activity"] }, description: "which feed types (default all)" }, hours: { type: "number", description: "look-back window in hours (default 72)" }, limit: { type: "number" } } } },
+  { name: "buzz_files", description: "List the files shared in a channel (or DM): filename, type, size, who shared it, when, and the message <id> + `index` to pass to buzz_attachment_read. Read-only; nothing is downloaded. `limit` = messages scanned (default 200, max 500).", inputSchema: { type: "object", properties: { channel: CH, limit: { type: "number", description: "messages to scan (default 200, max 500)" } }, required: ["channel"] } },
+  { name: "buzz_presence", description: "Who's online: presence for one or more people (`users`: npub / hex / email in wire mode / exact display name), or for a channel's members (`channel`). Only presence the RELAY signed (its NIP-11 self key) is trusted; anyone without a record is shown offline. Read-only.", inputSchema: { type: "object", properties: { users: { type: "array", items: { type: "string" }, maxItems: 50, description: "people to look up" }, channel: CH } } },
+  { name: "buzz_emoji", description: "List the workspace's custom emoji (the union of every member's NIP-30 kind:30030 set): :shortcode: and image URL. Optional `query` filters by shortcode substring. Read-only; the URLs are listed as text and never fetched.", inputSchema: { type: "object", properties: { query: { type: "string", description: "only shortcodes containing this" } } } },
+  { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 41012) — agent key only.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } },
 ];
+
+// ---- v0.2.31 (items 3 + 11): MCP tool annotations, closed schemas, bounded arguments. ----
+// readOnly = never writes; destructive = can remove data/membership/visibility; idempotent =
+// repeating it has no further effect; openWorld = talks to the Buzz relay (all do, except whoami's
+// local identity lines, which still fetch relay info).
+const ANNOTATIONS = {
+  readOnly: ["buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
+  destructive: ["buzz_remove_member", "buzz_delete", "buzz_edit_channel", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_unreact", "buzz_edit_message", "buzz_status_clear", "buzz_dm_hide"],
+  idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel"],
+};
+const ARG_BOUNDS = {
+  limit: { minimum: 1, maximum: 200 }, hours: { minimum: 0, maximum: 720 }, timeout_s: { minimum: 0, maximum: 30 },
+  index: { minimum: 0, maximum: 63 }, ttl: { minimum: 0, maximum: 31536000 },
+  text: { maxLength: 65536 }, message: { maxLength: 65536 }, comment: { maxLength: 65536 }, query: { maxLength: 1000 },
+  attachment: { maxLength: 4096 }, emoji: { maxLength: 64 }, channel: { maxLength: 256 }, source_channel: { maxLength: 256 },
+  event: { maxLength: 128 }, user: { maxLength: 320 }, client_id: { maxLength: 256 }, role: { maxLength: 16 },
+  visibility: { maxLength: 16 }, type: { maxLength: 16 }, name: { maxLength: 400 }, description: { maxLength: 2000 },
+  topic: { maxLength: 2000 }, purpose: { maxLength: 2000 },
+  from: { maxLength: 320 }, after: { maxLength: 40 }, before: { maxLength: 40 }, link: { maxLength: 512 }, scope: { maxLength: 16 }, in: { maxLength: 16 },
+};
+// v0.2.32: every WRITE tool takes dry_run (preview the exact event, sign/send nothing). Not buzz_login
+// (it signs nothing to the relay; its side effect is the OAuth flow itself).
+const DRY_RUN_PROP = { type: "boolean", description: "preview only: resolve everything and show the exact event that would be signed (auth tags redacted) — nothing is signed, uploaded or sent" };
+const DRY_RUN_TOOLS = new Set(TOOLS.map((t) => t.name).filter((n) => !ANNOTATIONS.readOnly.includes(n) && n !== "buzz_login"));
+for (const t of TOOLS) {
+  const sc = t.inputSchema;
+  sc.additionalProperties = false;
+  for (const [k, p] of Object.entries(sc.properties || {})) {
+    const b = ARG_BOUNDS[k];
+    if (!b) continue;
+    const isNum = p.type === "number" || p.type === "integer";
+    for (const [bk, bv] of Object.entries(b)) {
+      if ((bk === "maxLength") === isNum) continue;   // length bounds on strings, range bounds on numbers
+      if (p[bk] == null) p[bk] = bv;
+    }
+  }
+  if (["buzz_remove_member", "buzz_delete", "buzz_edit_channel"].includes(t.name)) sc.properties.confirm = CONFIRM_PROP;
+  if (DRY_RUN_TOOLS.has(t.name)) sc.properties.dry_run = DRY_RUN_PROP;
+  if (t.name === "buzz_files" && sc.properties.limit) sc.properties.limit.maximum = 500;
+  if (t.name === "buzz_activity" && sc.properties.limit) sc.properties.limit.maximum = 100;
+  if (t.name === "buzz_search" && sc.properties.limit) sc.properties.limit.maximum = 100;
+  const ro = ANNOTATIONS.readOnly.includes(t.name);
+  t.annotations = {
+    title: t.name.replace(/^buzz_/, "Buzz: ").replace(/_/g, " "),
+    readOnlyHint: ro,
+    destructiveHint: !ro && ANNOTATIONS.destructive.includes(t.name),
+    idempotentHint: ro || ANNOTATIONS.idempotent.includes(t.name),
+    openWorldHint: true,
+  };
+}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
@@ -932,7 +1401,7 @@ let VERSION_NUDGED = false;
 async function relayInfo() {
   if (RELAY_INFO && Date.now() - RELAY_INFO_AT < RELAY_INFO_TTL) return RELAY_INFO;
   try {
-    const r = await fetch(`${RELAY}/`, { headers: { Accept: "application/nostr+json" } });
+    const r = await fetch(`${RELAY}/`, { headers: { Accept: "application/nostr+json" }, signal: timeoutSignal(RELAYINFO_TIMEOUT_S) });
     const j = await r.json();
     RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null, self: typeof j.self === "string" ? j.self : null };
     try {
@@ -951,7 +1420,7 @@ const keyProvenance = () => {
     if (EXPECTED_PK) return IDENTITY_OK ? `${base}; pin VERIFIED ✅` : `⚠ IMPERSONATION GUARD TRIPPED: user pubkey ${PK.slice(0, 16)}… ≠ expected ${EXPECTED_PK.slice(0, 16)}… — WRITES DISABLED`;
     return base;
   }
-  const base = (process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY_KEY)
+  const base = KEY_ENV_PIN
     ? "key-pinned via env" : "⚠ no key in env — keyring or RANDOM per-session";
   if (EXPECTED_PK) return IDENTITY_OK
     ? `${base}; pin VERIFIED ✅ (matches BUZZ_EXPECTED_PUBKEY)`
@@ -965,9 +1434,31 @@ const keyProvenance = () => {
 // clientId, status: "pending"|"done"|"error"|"expired", authUrl, expires (epoch ms), error? }.
 let pendingLogin = null;
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+server.setRequestHandler(CallToolRequestSchema, async (req, extra = {}) => {
+  // v0.2.31 (item 6): every tool call runs inside a request context carrying the client's cancel
+  // signal and progress token, so long transfers abort on cancel and report progress.
+  const store = { signal: extra.signal, sendNotification: extra.sendNotification, progressToken: req.params && req.params._meta && req.params._meta.progressToken };
+  const nm = req.params && req.params.name, args = (req.params && req.params.arguments) || {};
+  // v0.2.32: dry_run only on write tools (it's in their schema); a read ignores nothing — validateArgs refuses it.
+  if (args.dry_run === true && DRY_RUN_TOOLS.has(nm)) store.dryRun = true;
+  const res = await REQ_CTX.run(store, () => callTool(req));
+  if (store.dryRun) {
+    if (store.dryStop) return { content: [{ type: "text", text: dryRunPreview(nm, store.dryStop, { notes: store.dryNotes || [] }) }] };
+    if (res && !res.isError) {
+      const txt = ((res.content || [])[0] || {}).text || "";
+      return { content: [{ type: "text", text: `DRY RUN — ${nm}: nothing was signed or sent (this call would not have signed anything).\n${txt}` }] };
+    }
+  }
+  return res;
+});
+async function callTool(req) {
   const { name, arguments: a = {} } = req.params;
   const ok = (s) => ({ content: [{ type: "text", text: s }] });
+  const fail = (s) => ({ content: [{ type: "text", text: s }], isError: true });
+  // v0.2.31 (item 11): refuse unknown keys / wrong types / out-of-range values against the advertised
+  // schema (additionalProperties:false). Missing-argument messages stay with each handler.
+  const tool = TOOLS.find((t) => t.name === name);
+  if (tool) { const bad = validateArgs({ ...tool.inputSchema, required: [] }, a); if (bad) return fail(`${name}: ${bad}`); }
   try {
     if (name === "buzz_whoami") {
       const info = await relayInfo();
@@ -987,8 +1478,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     if (name === "buzz_channels") {
+      const scopeArg = a.scope == null ? "member" : String(a.scope);
+      if (!["member", "open"].includes(scopeArg)) return fail(`buzz_channels: scope must be "member" or "open"`);
+      if (scopeArg === "open") {
+        // v0.2.32: the open-channel browser. The newest kind:39000 per channel; private / hidden / DM
+        // channels are never listed (openChannelsFromMeta). Names + descriptions are untrusted text.
+        const open = openChannelsFromMeta(screen(await query([{ kinds: [39000], limit: 500 }])).events);
+        let mine = new Set();
+        try { mine = new Set((await channels()).map((c) => c.id)); } catch { /* membership unknown → no ✓ marks */ }
+        const lines = open.map((c) => `${mine.has(c.id) ? "✓" : " "} #${escapeName(c.name)}  [${escapeName(c.id)}]${c.archived ? "  (archived)" : ""}${c.about ? `  ${escapeContent(c.about, { cap: 300 })}` : ""}`);
+        return ok(`Open channels — ${open.length} (✓ = you're a member; join others by id with buzz_join_channel):\n${UNTRUSTED_NOTE}\n` + (lines.join("\n") || "(none visible)") + (open.length >= 500 ? "\n(the directory read is capped at 500 channels)" : ""));
+      }
       const cs = await channels();
-      return ok(cs.length ? cs.map((c) => `#${c.name}  [${c.id}]  ${c.about}`).join("\n") : "(no channels)");
+      // v0.2.31 fix (review §3.4): channel names/descriptions are attacker-writable free text
+      // (a description is up to 500 chars incl. newlines) — escape both, one channel per line.
+      return ok(`${UNTRUSTED_NOTE}\n` + (cs.length ? cs.map((c) => `#${escapeName(c.name)}  [${escapeName(c.id)}]${c.about ? `  ${escapeContent(c.about, { cap: 500 })}` : ""}`).join("\n") : "(no channels)"));
     }
 
     if (name === "buzz_agents") {
@@ -996,43 +1500,70 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const archived = await archivedPubkeys();   // (A) NIP-IA archived identities are hidden
       const rows = Object.entries(p).filter(([pk]) => !archived.has(pk));
       const hidden = Object.keys(p).length - rows.length;
-      return ok((rows.map(([pk, n]) => `${n}  ${pk.slice(0, 12)}…`).join("\n") || "(none)")
+      return ok((rows.map(([pk, n]) => `${escapeName(n)}  ${pk.slice(0, 12)}…${PROFILE_IDX.collide.has(pk) ? "  ⚠name-collision" : ""}`).join("\n") || "(none)")
         + (hidden ? `\n(${hidden} archived identit${hidden === 1 ? "y" : "ies"} hidden — NIP-IA)` : ""));
     }
 
     if (name === "buzz_read") {
       const ch = await resolveChannel(a.channel);
       const names = await profiles();
-      const evs = await query([{ kinds: [9], "#h": [ch.id], limit: a.limit || 30 }]);
-      const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
-        const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = fmtTime(e.created_at);
-        // include a short event id so buzz_react/buzz_attachment_read has a target, + 📎 for attachments.
-        const atts = messageAttachments(e);
-        const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
-      });
-      return ok(`#${ch.name} (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
+      void names;
+      const scr = screen(await query([{ kinds: [9], "#h": [ch.id], limit: clampLimit(a.limit, 30, 200) }]));
+      const edits = await latestEdits(ch.id, scr.events);
+      const rows = scr.events.sort((x, y) => x.created_at - y.created_at).map((e) => renderMsg(e, { edits, flagOf: scr.flagOf }));
+      return ok(`#${escapeName(ch.name)} (${rows.length} msgs) — <id> = react target:\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(empty)"));
     }
 
     if (name === "buzz_search") {
       const q = String(a.query || "").trim();
-      if (!q) throw new Error("buzz_search needs a `query` string");
+      // v0.2.32: Slack-style filters. Every filter fails CLOSED: an unresolvable / ambiguous `from`
+      // or an unreadable date is an error, never a silently wider search.
+      const inArg = a.in == null ? "all" : String(a.in);
+      if (!["all", "channels", "dms"].includes(inArg)) return fail(`buzz_search: \`in\` must be "all", "channels" or "dms"`);
+      const hasFilter = a.from != null || a.after != null || a.before != null || a.channel != null || inArg !== "all";
+      if (!q && !hasFilter) throw new Error("buzz_search needs a `query` string (or a filter: from / after / before / in / channel)");
       const names = await profiles();
       const cs = await channels();
-      const chById = Object.fromEntries(cs.map((c) => [c.id, c.name]));
-      const filt = { kinds: [9], search: q, limit: Math.min(a.limit || 20, 100) };
-      let scope = "";
-      if (a.channel) { const ch = await resolveChannel(a.channel); filt["#h"] = [ch.id]; scope = ` in #${ch.name}`; }
-      const evs = await query([filt]);
-      const rows = (evs || []).sort((x, y) => y.created_at - x.created_at).map((e) => {
-        const who = names[e.pubkey] || e.pubkey.slice(0, 8);
+      let dms = [];
+      try { dms = await dmChannels(); } catch { dms = []; }
+      const dmIds = new Set(dms.map((d) => d.id));
+      const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+      for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+      const filt = { kinds: [9], limit: clampLimit(a.limit, 20, 100) };
+      if (q) filt.search = q;
+      const scopeBits = [];
+      if (a.channel) {
+        const ch = await resolveChannel(a.channel); filt["#h"] = [ch.id]; scopeBits.push(`in #${escapeName(ch.name)}`);
+      } else if (inArg === "channels") {
+        const ids = cs.map((c) => c.id).filter((id) => !dmIds.has(id));
+        if (!ids.length) return ok("search: you're not in any channels.");
+        filt["#h"] = ids; scopeBits.push("in channels");
+      } else if (inArg === "dms") {
+        if (!dms.length) return ok("search: you have no DM conversations.");
+        filt["#h"] = [...dmIds]; scopeBits.push("in DMs");
+      }
+      let fromPk = null;
+      if (a.from != null) {
+        const f = String(a.from).trim();
+        fromPk = /^me$/i.test(f) ? PK : await resolveRecipient(f);
+        filt.authors = [fromPk]; scopeBits.push(`from ${who(fromPk)}`);
+      }
+      const since = a.after != null ? parseWhen(a.after) : null;
+      const until = a.before != null ? parseWhen(a.before, { end: true }) : null;
+      if (since != null) { filt.since = since; scopeBits.push(`after ${fmtTime(since, true)}`); }
+      if (until != null) { filt.until = until; scopeBits.push(`before ${fmtTime(until, true)}`); }
+      if (since != null && until != null && since > until) return fail("buzz_search: `after` is later than `before` — nothing can match");
+      void names;
+      const scr = screen(await query([filt]));
+      // Defense in depth: the relay applies the filter; re-check author + window client-side.
+      const hits = scr.events.filter((e) => (!fromPk || e.pubkey === fromPk) && (since == null || e.created_at >= since) && (until == null || e.created_at <= until));
+      const rows = hits.sort((x, y) => y.created_at - x.created_at).map((e) => {
         const hTag = (e.tags || []).find((t) => t[0] === "h");
-        const chan = hTag ? (chById[hTag[1]] || hTag[1].slice(0, 8)) : "?";
-        const t = fmtTime(e.created_at, true);
-        return `#${chan} [${t}] ${who} <${String(e.id).slice(0, 8)}>: ${e.content}`;
+        const chan = hTag ? (labelOf.get(hTag[1]) || `#${escapeName(hTag[1].slice(0, 8))}`) : "?";
+        return `${chan} ${row(e, { withDate: true, flagOf: scr.flagOf })}`;
       });
-      return ok(`search "${q}"${scope} → ${rows.length} result(s):\n` + (rows.join("\n") || "(none)"));
+      const scope = scopeBits.length ? " " + scopeBits.join(", ") : "";
+      return ok(`search ${q ? `"${escapeContent(q)}"` : "(no text)"}${scope} → ${rows.length} result(s):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(none)"));
     }
 
     if (name === "buzz_channel_members") {
@@ -1042,8 +1573,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // kind:39002 = one membership event per channel; p-tags are members, tag[3] = role (owner|member).
       const seen = new Map();
       for (const e of evs || []) for (const tg of e.tags || []) if (tg[0] === "p" && tg[1] && !seen.has(tg[1])) seen.set(tg[1], tg[3] || "member");
-      const rows = [...seen].map(([pk, role]) => `${names[pk] || pk.slice(0, 12) + "…"}${role === "owner" ? " (owner)" : ""}`);
-      return ok(`#${ch.name} — ${rows.length} member(s):\n` + (rows.join("\n") || "(none)"));
+      void names;
+      const rows = [...seen].map(([pk, role]) => `${who(pk)}${role === "owner" ? " (owner)" : ""}`);
+      return ok(`#${escapeName(ch.name)} — ${rows.length} member(s):\n` + (rows.join("\n") || "(none)"));
     }
 
     if (name === "buzz_post") {
@@ -1067,15 +1599,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // matching how Buzz clients render attachments.
       let attached = null, content = bodyText;
       if (a.attachment) {
-        const up = await blossomUpload(String(a.attachment));
-        tags.push(buildImeta(up));
-        content = content ? `${content}\n${up.url}` : up.url;
-        attached = up;
+        attached = await uploadAttachments(a.attachment);
+        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); content = content ? `${content}\n${up.url}` : up.url; }
       }
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`posted to #${ch.name}${mentioned ? ` (mentioned ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}${mentionNote(mres)}: ${bodyText}`);
+      return ok(`posted to #${escapeName(ch.name)}${mentioned ? ` (mentioned ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_attachment_read") {
@@ -1091,31 +1621,34 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       else {
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
       }
-      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}… in #${ch.name} — use the <id> from buzz_read`);
+      if (!hit) throw new Error(`no message ${targetId.slice(0, 8)}… in #${escapeName(ch.name)} — use the <id> from buzz_read`);
       const atts = messageAttachments(hit);
-      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${ch.name} has no attachments.`);
+      if (!atts.length) return ok(`message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)} has no attachments.`);
       const idx = Number.isInteger(a.index) ? a.index : 0;
       const att = atts[idx];
       if (!att) throw new Error(`attachment index ${idx} out of range — message has ${atts.length} (0..${atts.length - 1})`);
       if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) — refusing to fetch an unverifiable blob`);
       const shaExt = basename(new URL(att.url).pathname); // "<sha>.<ext>"
       const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
-      const dest = join(tmpdir(), `buzz-att-${att.sha256.slice(0, 16)}${ext}`);
-      await blossomDownload(shaExt, dest);
+      if (!/^[0-9a-f]{64}$/.test(String(att.sha256).toLowerCase())) throw new Error("attachment sha256 is not 64-hex — refusing");
+      const dest = await blossomDownload(shaExt, { ext });
       const got = await sha256File(dest);
-      if (got !== att.sha256) throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}… ≠ imeta ${att.sha256.slice(0, 12)}… — discarded`);
+      if (got !== att.sha256) { try { unlinkSync(dest); } catch {} throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}… ≠ imeta ${att.sha256.slice(0, 12)}… — discarded`); }
       const size = statSync(dest).size;
       const isText = (att.mime && TEXT_MIME.test(att.mime)) || /\.(md|txt|csv|json|ya?ml|log|tsv)$/i.test(att.filename || shaExt);
       if (isText) {
         const full = readFileSync(dest, "utf8");
         const CAP = 200 * 1024;
+        // review §3.4 nice-to-have: fence the raw file text with a per-call random boundary the
+        // file can't predict, so it can't fake "end of file" and append instructions after it.
+        const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes(6).toString("hex")}>>>`;
         const body = full.length > CAP ? `${full.slice(0, CAP)}\n…[truncated ${full.length - CAP} chars — full file at ${dest}]` : full;
-        return ok(`📎 ${att.filename || shaExt} (${att.mime || "text"}, ${(size / 1024).toFixed(0)} KB) from #${ch.name}:\n\n${body}`);
+        return ok(`📎 ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(size / 1024).toFixed(0)} KB) from #${escapeName(ch.name)} — saved at ${dest}\n${UNTRUSTED_NOTE.replace("message content", "file content")}\n${fence}\n${body}\n${fence.replace("BEGIN", "END")}`);
       }
-      return ok(`📎 saved ${att.filename || shaExt} → ${dest}\n   (${att.mime || "binary"}, ${(size / MB).toFixed(2)} MB, sha ${att.sha256.slice(0, 12)}…) — not text; open the file to view.`);
+      return ok(`📎 saved ${escapeName(att.filename || shaExt)} → ${dest}\n   (${att.mime || "binary"}, ${(size / MB).toFixed(2)} MB, sha ${att.sha256.slice(0, 12)}…) — not text; open the file to view.`);
     }
 
     if (name === "buzz_react") {
@@ -1136,29 +1669,41 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (isFullId) {
         // full event id → channel-scoped exact lookup (works for any age; not a recency scan)
         hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
-        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — reactions must target a message in the channel you name`);
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${escapeName(ch.name)} — reactions must target a message in the channel you name`);
       } else {
         // short <id> prefix from buzz_read → scan THIS channel and match by prefix.
         // NEVER put a prefix in an `ids` filter — the relay rejects a non-64-hex id.
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
-        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${escapeName(ch.name)} — use the <id> shown by buzz_read`);
       }
       // Belt-and-braces: assert the resolved target carries h = this channel before signing.
       if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
-        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel reaction`);
+        throw new Error(`target message is not bound to #${escapeName(ch.name)} — refusing a cross-channel reaction`);
       targetId = hit.id;
       const author = hit.pubkey || "", tkind = hit.kind || 9;
       const emoji = (a.emoji && String(a.emoji).trim()) || "👍";
       // reactionTemplate REFUSES a target-less reaction (throws) → surfaced as a tool error.
       const tmpl = reactionTemplate({ targetId, targetAuthor: author, targetKind: tkind, channelId: ch.id, emoji });
+      // v0.2.32: a ":shortcode:" reaction carries the NIP-30 ["emoji", shortcode, url] tag from the
+      // community palette so clients render the image (desktop reactionEmojiUrl). Unknown → no tag.
+      let customNote = "";
+      if (/^:[A-Za-z0-9_-]{1,64}:$/.test(emoji)) {
+        try {
+          const sc = emoji.slice(1, -1).toLowerCase();
+          const hitE = emojiPalette(screen(await query([{ kinds: [30030], "#d": [CUSTOM_EMOJI_D], limit: 500 }])).events).find((x) => x.shortcode === sc);
+          if (hitE) { tmpl.content = `:${sc}:`; tmpl.tags.push(["emoji", sc, hitE.url]); }
+          else customNote = ` (no custom emoji :${escapeName(sc)}: in the workspace palette — sent as text)`;
+        } catch { customNote = " (custom emoji palette unavailable — sent as text)"; }
+      }
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);   // owner attestation (agent mode; absent in wire mode)
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
-      const who = author ? ((await profiles())[author] || author.slice(0, 8)) : "";
-      return ok(`reacted ${emoji} to ${who ? `${who}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${ch.name}`);
+      if (author) await profiles();
+      const whoL = author ? who(author) : "";
+      return ok(`reacted ${escapeName(emoji)} to ${whoL ? `${whoL}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}${customNote}`);
     }
 
     if (name === "buzz_reply") {
@@ -1203,16 +1748,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Optional attachment: upload the local file (Blossom) → NIP-92 imeta tag, url echoed in content.
       let attached = null, content = bodyText;
       if (a.attachment) {
-        const up = await blossomUpload(String(a.attachment));
-        tags.push(buildImeta(up));
-        content = content ? `${content}\n${up.url}` : up.url;
-        attached = up;
+        attached = await uploadAttachments(a.attachment);
+        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); content = content ? `${content}\n${up.url}` : up.url; }
       }
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
-      const who = names[target.pubkey] || (target.pubkey || "").slice(0, 8);
       const mentioned = tags.filter((t) => t[0] === "p").length;
-      return ok(`replied in #${ch.name} to ${who}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attached ? ` [+attachment ${attached.filename}, ${(attached.size / MB).toFixed(1)} MB]` : ""}${mentionNote(mres)}: ${bodyText}`);
+      return ok(`replied in #${escapeName(ch.name)} to ${who(target.pubkey)}'s <${String(target.id).slice(0, 8)}>${mentioned ? ` (p-tagged ${mentioned})` : ""}${attachedLabel(attached)}: ${bodyText}${mentionNote(mres)}`);
     }
 
     if (name === "buzz_forward") {
@@ -1228,12 +1770,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       let destId, destLabel;
       try {
         const dch = await resolveChannel(a.to);
-        destId = dch.id; destLabel = `#${dch.name}`;
+        destId = dch.id; destLabel = `#${escapeName(dch.name)}`;
       } catch {
         const pk = await resolveRecipient(a.to);   // npub / hex / email / exact name → 64-hex, or throws
         const { channelId } = await openDm([pk]);
         destId = channelId;
-        destLabel = `DM ${(await profiles())[pk] || pk.slice(0, 8)}`;
+        await profiles(); destLabel = `DM ${who(pk)}`;
       }
       // Link-back PILL, not a copy: reference the SOURCE event (+ its kind for context). content = the
       // optional comment only — never the original text. Clients render the e-tag as a quoted pill.
@@ -1260,20 +1802,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
-      const who = (await profiles())[pk] || pk.slice(0, 12) + "…";
-      return ok(`added ${who} to #${ch.name}${a.role ? ` as ${a.role}` : ""}. ⚠️ they can now see this channel's prior history.`);
+      await profiles();
+      return ok(`added ${who(pk)} to #${escapeName(ch.name)}${a.role ? ` as ${a.role}` : ""}. ⚠️ they can now see this channel's prior history.`);
     }
 
     if (name === "buzz_remove_member") {
       if (!IDENTITY_OK) return modRefuse("removing members");
       const ch = await resolveChannel(a.channel);
       const pk = await resolveRecipient(a.user);
+      { const g = gate(9001, a, `remove ${pk.slice(0, 8)} from #${escapeName(ch.name)}`); if (g) return fail(g); }
       const tmpl = removeMemberTemplate({ channelId: ch.id, targetPubkey: pk });
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
-      const who = (await profiles())[pk] || pk.slice(0, 12) + "…";
-      return ok(`removed ${who} from #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+      await profiles();
+      return ok(`removed ${who(pk)} from #${escapeName(ch.name)}. (Allowed only because the relay confirmed your role permits it.)`);
     }
 
     if (name === "buzz_create_channel") {
@@ -1340,7 +1883,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               : (meta.tags || []).some((t) => t[0] === "public") ? "open" : null;
           } catch { /* unknown → fail safe below */ }
           if (curVis !== "open" && a.confirm_make_public !== true)
-            return { content: [{ type: "text", text: `buzz_edit_channel: making #${ch.name} open would expose its entire history to anyone who can find and join it${curVis === null ? " (and I couldn't confirm its current visibility)" : ""}. If that's intended, re-run with confirm_make_public: true.` }], isError: true };
+            return { content: [{ type: "text", text: `buzz_edit_channel: making #${escapeName(ch.name)} open would expose its entire history to anyone who can find and join it${curVis === null ? " (and I couldn't confirm its current visibility)" : ""}. If that's intended, re-run with confirm_make_public: true.` }], isError: true };
         }
         tags.push(["visibility", v]); changed.push(`visibility → ${v}`);
       }
@@ -1358,6 +1901,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       if (changed.length === 0)
         return { content: [{ type: "text", text: "buzz_edit_channel: pass at least one of `name`, `visibility`, `description`, `ttl` to change." }], isError: true };
+      { const g = gate(9002, a, `edit #${escapeName(ch.name)} (${changed.join(", ")})`); if (g) return fail(g); }
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: 9002, tags, content: "" });
       await bridge("/events", ev);
@@ -1373,8 +1917,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const v = await verifyChannelEdit(ch.id, want);
       if (!v.ok)
-        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${ch.name}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${v.unreadable})` : `its kind:39000 metadata does NOT reflect it — ${v.mismatches.join("; ")}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
-      return ok(`edited #${ch.name}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
+        return { content: [{ type: "text", text: `buzz_edit_channel: the relay accepted the kind:9002 for #${escapeName(ch.name)}, but ${v.unreadable ? `its kind:39000 metadata could not be re-read to confirm it (${escapeContent(v.unreadable, { cap: 300 })})` : `its kind:39000 metadata does NOT reflect it — ${escapeContent(v.mismatches.join("; "), { cap: 600 })}`}. Treat the edit as NOT applied; check with buzz_channels and retry, or ask a channel admin.` }], isError: true };
+      return ok(`edited #${escapeName(ch.name)}: ${changed.join(", ")} — verified against the relay's kind:39000. Fields not listed are unchanged. (Allowed only if the relay confirms your owner/admin role on this channel.)`);
     }
 
     if (name === "buzz_join_channel") {
@@ -1415,7 +1959,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             .filter((c, i, arr) => arr.findIndex((o) => o.id === c.id) === i);   // newest 39000 per channel id
           // Same fail-closed matcher: two channels sharing the name (open or private) → refused.
           let hit = null;
-          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${e.message}` }], isError: true }; }
+          try { hit = matchChannel(q, named); } catch (e) { return { content: [{ type: "text", text: `buzz_join_channel: ${escapeContent(e.message, { cap: ERROR_TEXT_CAP })}` }], isError: true }; }
           if (hit && hit.open) { chId = hit.id; chName = hit.name; }
           else if (hit) return privateRefusal(hit.name || q);
         }
@@ -1442,22 +1986,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       let hit = null;
       if (isFullId) {
         hit = (await query([{ ids: [targetId], "#h": [ch.id] }]) || [])[0];
-        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${ch.name} — delete must target a message in the channel you name`);
+        if (!hit) throw new Error(`message ${targetId.slice(0, 8)}… is not in #${escapeName(ch.name)} — delete must target a message in the channel you name`);
       } else {
         const recent = await query([{ kinds: [9], "#h": [ch.id], limit: 200 }]) || [];
         const pref = recent.filter((e) => String(e.id).startsWith(targetId));
-        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${ch.name} (${pref.length} matches) — use more characters`);
+        if (pref.length > 1) throw new Error(`event id "${targetId}" is ambiguous in #${escapeName(ch.name)} (${pref.length} matches) — use more characters`);
         hit = pref[0];
-        if (!hit) throw new Error(`no message with id "${targetId}" found in #${ch.name} — use the <id> shown by buzz_read`);
+        if (!hit) throw new Error(`no message with id "${targetId}" found in #${escapeName(ch.name)} — use the <id> shown by buzz_read`);
       }
       if (!(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
-        throw new Error(`target message is not bound to #${ch.name} — refusing a cross-channel delete`);
+        throw new Error(`target message is not bound to #${escapeName(ch.name)} — refusing a cross-channel delete`);
       targetId = hit.id;
+      { const g = gate(9005, a, `delete message <${targetId.slice(0, 8)}> in #${escapeName(ch.name)}`); if (g) return fail(g); }
       const tmpl = deleteMessageTemplate({ channelId: ch.id, targetId });  // re-asserts concrete h + e
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
-      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${ch.name}. (Allowed only because the relay confirmed your role permits it.)`);
+      return ok(`deleted message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}. (Allowed only because the relay confirmed your role permits it.)`);
     }
 
     // ---- DM tools (v0.2.1) ----
@@ -1468,7 +2013,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!dms.length) return ok("(no direct messages)");
       const names = await profiles();
       return ok(dms.map((c) => {
-        const label = c.others.map((p) => names[p] || p.slice(0, 8)).join(", ") || "(just you)";
+        void names;
+        const label = c.others.map((p) => who(p)).join(", ") || "(just you)";
         return `${label}${c.others.length > 1 ? ` (group, ${c.participants.length})` : ""}  [${c.id}]`;
       }).join("\n"));
     }
@@ -1483,22 +2029,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       if (!chan) return { content: [{ type: "text", text: "buzz_dm_read needs `to` (the other person) or `channel` (dm id)." }], isError: true };
       const names = await profiles();
-      const evs = await query([{ kinds: [9], "#h": [chan], limit: a.limit || 30 }]);
-      const rows = (evs || []).sort((x, y) => x.created_at - y.created_at).map((e) => {
-        const who = names[e.pubkey] || e.pubkey.slice(0, 8);
-        const t = fmtTime(e.created_at);
-        const atts = messageAttachments(e);
-        const att = atts.length ? " " + atts.map((x) => `📎${x.filename || x.mime || "file"}`).join("") : "";
-        return `[${t}] ${who} <${String(e.id).slice(0, 8)}>${att}: ${e.content}`;
-      });
-      return ok(`DM [${chan}] (${rows.length} msgs) — <id> = react target:\n` + (rows.join("\n") || "(empty)"));
+      void names;
+      const scr = screen(await query([{ kinds: [9], "#h": [chan], limit: clampLimit(a.limit, 30, 200) }]));
+      const edits = await latestEdits(chan, scr.events);
+      const rows = scr.events.sort((x, y) => x.created_at - y.created_at).map((e) => renderMsg(e, { edits, flagOf: scr.flagOf }));
+      return ok(`DM [${chan}] (${rows.length} msgs) — <id> = react target:\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(empty)"));
     }
 
     if (name === "buzz_dm_open") {
       if (!IDENTITY_OK) return dmRefuse();
-      const pk = await resolveRecipient(a.to);
-      const { channelId, created } = await openDm([pk]);
-      return ok(`DM ${created ? "opened" : "already exists"} with ${a.to}: ${channelId}`);
+      const pks = await resolveRecipients(a.to);
+      const { channelId, created } = await openDm(pks);
+      return ok(`DM ${created ? "opened" : "already exists"} with ${toLabel(a.to)}${pks.length > 1 ? ` (group of ${pks.length + 1})` : ""}: ${channelId}`);
     }
 
     if (name === "buzz_dm_send") {
@@ -1508,15 +2050,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         : (typeof a.message === "string" && a.message.trim()) ? a.message : null;
       if (bodyText === null)
         return { content: [{ type: "text", text: "buzz_dm_send requires a non-empty `text` (its `message` alias is also accepted)." }], isError: true };
-      const pk = await resolveRecipient(a.to);
-      const { channelId } = await openDm([pk]);
+      const pks = await resolveRecipients(a.to);
+      const { channelId } = await openDm(pks);
       // ["p", recipient] alongside ["h", channel]: desktop and mobile tag every DM
       // recipient, and the relay's push lease matches `#p=self` -- a DM without it
       // can never wake the recipient's phone (ola-silicon/buzz#1152; measured
       // 2026-09-27: no agent-sent DM had ever produced a push).
-      const ev = await signer.sign({ kind: 9, tags: [["h", channelId], ["p", pk]], content: bodyText });
+      const ev = await signer.sign({ kind: 9, tags: [["h", channelId], ...pks.map((pk) => ["p", pk])], content: bodyText });
       await bridge("/events", ev);
-      return ok(`sent DM to ${a.to} [${channelId}]: ${bodyText}`);
+      return ok(`sent DM to ${toLabel(a.to)} [${channelId}]: ${bodyText}`);
     }
 
     // ---- Live user status (NIP-38 kind 30315) — v0.2.13. AGENT MODE ONLY: 30315 is NOT in the
@@ -1551,18 +2093,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // ---- Read-only unread digest (v0.2.13). A HEURISTIC, not NIP-RS real read-state: it counts
     // recent kind:9 from OTHERS per channel/DM and how many @mention this session's PK. No writes. ----
     if (name === "buzz_unread") {
-      const hours = (Number.isFinite(a.hours) && a.hours > 0) ? a.hours : 24;
+      const hours = (Number.isFinite(a.hours) && a.hours > 0) ? Math.min(a.hours, 720) : 24;
       const since = Math.floor(Date.now() / 1000) - Math.floor(hours * 3600);
       const cs = await channels();
       const dms = await dmChannels();
       const names = await profiles();
       const meta = new Map();   // channel/dm id → display label
-      for (const c of cs) meta.set(c.id, `#${c.name}`);
-      for (const d of dms) meta.set(d.id, `DM ${d.others.map((p) => names[p] || p.slice(0, 8)).join(", ") || "(self)"}`);
+      void names;
+      for (const c of cs) meta.set(c.id, `#${escapeName(c.name)}`);
+      for (const d of dms) meta.set(d.id, `DM ${d.others.map((p) => who(p)).join(", ") || "(self)"}`);
       const ids = [...meta.keys()];
       if (!ids.length) return ok("no channels or DMs to scan.");
       // One round-trip over all h-scopes; bucket the union back by each event's own h-tag.
-      const evs = await query([{ kinds: [9], "#h": ids, since, limit: 2000 }]) || [];
+      const evs = screen(await query([{ kinds: [9], "#h": ids, since, limit: 2000 }])).events;
       const stat = new Map();   // id → { msgs, mentions }
       for (const e of evs) {
         const id = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
@@ -1601,7 +2144,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (pendingLogin && pendingLogin.status === "error") {
         const msg = pendingLogin.error || "unknown error";
         pendingLogin = null;   // clear so the next call can retry cleanly
-        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${msg}\nRun buzz_login again to retry.` }], isError: true };
+        return { content: [{ type: "text", text: `buzz_login: the previous sign-in attempt failed: ${escapeContent(msg, { cap: 500 })}\nRun buzz_login again to retry.` }], isError: true };
       }
       // auto-abandon: a pending flow that ran past its TTL (the timer below should have flipped it,
       // but observe it here too in case the timer never ran). Clear so this call's fall-through can
@@ -1682,10 +2225,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       // best-effort auto-open the browser (same pattern as wirelogin; the printed URL is the fallback)
       try {
-        const [cmd, ...pre] = process.platform === "darwin" ? ["open"]
-          : process.platform === "win32" ? ["cmd", "/c", "start", ""]
-          : ["xdg-open"];
-        spawn(cmd, [...pre, authUrl], { stdio: "ignore", detached: true }).unref();
+        // v0.2.31 (item 9): https only, no cmd.exe (rundll32 url.dll on Windows), minimal child env.
+        const { cmd, args } = openUrlCommand(authUrl);
+        spawn(cmd, args, { stdio: "ignore", detached: true, env: minimalChildEnv() }).unref();
       } catch { /* printing the URL is the fallback */ }
 
       return ok(`Opening your browser to sign in as yourself. If it didn't open, use this URL:\n${authUrl}\nThe link is valid for about ${Math.round(ttlMs / 60000)} min — after you approve, run buzz_login again (or buzz_whoami) to confirm. If it expires, just run buzz_login again for a fresh link.`);
@@ -1852,11 +2394,143 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       ].join("\n"));
     }
 
+    // ---- v0.2.32 Slack-parity read tools ----
+    if (name === "buzz_message_link") {
+      if (a.link != null) {
+        if (a.channel != null || a.event != null) return fail("buzz_message_link: pass either `link`, or `channel` + `event` — not both");
+        const L = parseMessageLink(a.link);
+        // Fail-closed: you must be able to read the channel (member-first resolution, by id), and the
+        // event must carry THAT channel's h-tag — a link can't smuggle a message from elsewhere.
+        const ch = await resolveChannel(L.channel).catch(() => null)
+          || (await dmChannels().catch(() => [])).find((d) => d.id === L.channel);
+        if (!ch) return fail(`buzz_message_link: that link is for a channel you can't read (${escapeName(L.channel)}) — join it first (buzz_channels scope:"open")`);
+        await profiles();
+        const hit = (screen(await query([{ ids: [L.id], "#h": [ch.id], limit: 1 }])).events)[0];
+        if (!hit || !(hit.tags || []).some((t) => t[0] === "h" && t[1] === ch.id))
+          return fail(`buzz_message_link: message ${L.id.slice(0, 8)}… isn't in that channel (or was deleted / its signature didn't verify)`);
+        const edits = await latestEdits(ch.id, [hit]);
+        const root = threadRootOf(hit);
+        const label = ch.name ? `#${escapeName(ch.name)}` : "DM";
+        return ok(`${UNTRUSTED_NOTE}\n${label}${root !== hit.id ? ` (reply in thread <${root.slice(0, 8)}>)` : ""}\n${renderMsg(hit, { edits, withDate: true })}`);
+      }
+      if (!a.channel || !a.event) return fail("buzz_message_link needs `channel` + `event` (to make a link) or `link` (to open one)");
+      const ch = await resolveChannel(a.channel);
+      const hit = await resolveEventInChannel(ch.id, ch.name, a.event);
+      const root = threadRootOf(hit);
+      const link = buildMessageLink({ channel: ch.id, id: hit.id, thread: root !== hit.id ? root : null });
+      return ok(`${link}\n(message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)}${root !== hit.id ? `, a reply in thread <${root.slice(0, 8)}>` : ""} — open it with buzz_message_link { link })`);
+    }
+
+    if (name === "buzz_activity") {
+      const TYPES = ["mentions", "needs_action", "activity"];
+      let types = TYPES;
+      if (a.types != null) {
+        if (!Array.isArray(a.types) || !a.types.length || a.types.some((t) => !TYPES.includes(t))) return fail(`buzz_activity: \`types\` must be a non-empty list of ${TYPES.join(" / ")}`);
+        types = [...new Set(a.types)];
+      }
+      const hours = (Number.isFinite(a.hours) && a.hours > 0) ? Math.min(a.hours, 720) : 72;
+      const since = Math.floor(Date.now() / 1000) - Math.floor(hours * 3600);
+      const limit = clampLimit(a.limit, 20, 100);
+      await profiles();
+      let cs = [], dms = [];
+      try { cs = await channels(); } catch { /* labels only */ }
+      try { dms = await dmChannels(); } catch { /* labels only */ }
+      const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+      for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+      // The relay feed (bridge.rs feed_types). "#p":[me] rides along so a relay WITHOUT feed support
+      // (which ignores feed_types) degrades to a plain @mention query instead of returning everything.
+      let evs = null, source = "relay feed";
+      try { evs = await query([{ feed_types: types, "#p": [PK], since, limit }]); }
+      catch (e) { evs = null; source = `@mention scan (relay feed unavailable: ${escapeContent(e && e.message, { cap: 120 })})`; }
+      if (!Array.isArray(evs)) {
+        evs = await query([{ kinds: [9], "#p": [PK], since, limit }]);
+        if (source === "relay feed") source = "@mention scan";
+      }
+      const scr = screen(evs);
+      // Only events from conversations you can see are rendered with a label; others are shown
+      // with a short id. Your own events are never "activity for you".
+      // Metadata / list kinds (0, 3, 1xxxx replaceable, 3xxxx addressable — e.g. membership 39002) are
+      // never "activity": an old relay that ignores feed_types answers "#p":[me] with them too.
+      const isMeta = (k) => k === 0 || k === 3 || (k >= 10000 && k < 20000) || (k >= 30000 && k < 40000);
+      const items = scr.events.filter((e) => e.pubkey !== PK && !isMeta(e.kind)).sort((x, y) => y.created_at - x.created_at).slice(0, limit);
+      const rows = items.map((e) => {
+        const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+        const chan = h ? (labelOf.get(h) || `#${escapeName(h.slice(0, 8))}`) : "";
+        const mention = (e.tags || []).some((t) => t[0] === "p" && t[1] === PK) ? "@you " : "";
+        return `${mention}${chan ? chan + " " : ""}${e.kind === 9 ? renderMsg(e, { withDate: true, flagOf: scr.flagOf }) : `kind ${e.kind} ` + row(e, { withDate: true, flagOf: scr.flagOf })}`;
+      });
+      return ok(`Activity (last ${hours}h, ${types.join(" + ")}; source: ${source}) — ${rows.length} item(s):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(nothing new)"));
+    }
+
+    if (name === "buzz_files") {
+      let ch = null;
+      try { ch = await resolveChannel(a.channel); }
+      catch (e) {
+        if (e instanceof ChannelAmbiguousError) throw e;
+        const dm = (await dmChannels().catch(() => [])).find((d) => d.id === String(a.channel || "").trim());
+        if (!dm) throw e;
+        ch = { id: dm.id, name: null, dm };
+      }
+      const label = ch.name ? `#${escapeName(ch.name)}` : `DM ${ch.dm.others.map((pk) => who(pk)).join(", ")}`;
+      await profiles();
+      const scanN = clampLimit(a.limit, 200, 500);
+      const scr = screen(await query([{ kinds: [9], "#h": [ch.id], limit: scanN }]));
+      const files = filesFromEvents(scr.events, { chId: ch.id });
+      const rows = files.map((f) => `[${fmtTime(f.event.created_at, true)}] ${who(f.event.pubkey)} <${String(f.event.id).slice(0, 8)}> index ${f.index}: ${escapeName(f.filename || "(unnamed)")}  ${escapeName(f.mime || "?")}  ${fmtBytes(f.size)}${f.sha256 ? `  sha256 ${f.sha256.slice(0, 12)}…` : ""}`);
+      return ok(`Files in ${label} — ${files.length} (scanned the last ${scr.events.length} message(s); open one with buzz_attachment_read { channel, event, index }):\n${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}\n` + (rows.join("\n") || "(no files)"));
+    }
+
+    if (name === "buzz_presence") {
+      let pks = [];
+      if (a.users != null) {
+        if (!Array.isArray(a.users) || !a.users.length || a.users.some((u) => typeof u !== "string")) return fail("buzz_presence: `users` must be a non-empty list of names / npubs");
+        for (const u of a.users) { const pk = /^me$/i.test(u.trim()) ? PK : await resolveRecipient(u); if (!pks.includes(pk)) pks.push(pk); }
+      }
+      if (a.channel != null) {
+        const ch = await resolveChannel(a.channel);
+        const mem = await query([{ kinds: [39002], "#d": [ch.id], limit: 5 }]) || [];
+        for (const e of mem) for (const t of e.tags || []) if (t[0] === "p" && /^[0-9a-f]{64}$/.test(t[1] || "") && !pks.includes(t[1])) pks.push(t[1]);
+      }
+      if (!pks.length) return fail("buzz_presence needs `users` or `channel`");
+      pks = pks.slice(0, 200);
+      await profiles();
+      const info = await relayInfo();
+      if (!info || !isPubkeyHex(info.self)) return fail("buzz_presence: the relay doesn't advertise a NIP-11 `self` key, so presence can't be verified — not guessing");
+      // Synthesized by the relay from its presence store; a lookup failure is an ERROR (not "offline").
+      const evs = await query([{ kinds: [20001], authors: pks, limit: pks.length }]);
+      const pres = presenceFromEvents(evs, info.self, verifyEvent, pks);
+      const order = { online: 0, away: 1, unknown: 2, offline: 3 };
+      const rows = pks.map((pk) => ({ pk, st: (pres.get(pk) || { status: "offline" }).status }))
+        .sort((x, y) => order[x.st] - order[y.st])
+        .map(({ pk, st }) => `${st === "online" ? "🟢" : st === "away" ? "🌙" : st === "unknown" ? "❔" : "⚪"} ${who(pk)} — ${st}`);
+      const counted = [...pres.values()].filter((v) => v.status === "online").length;
+      return ok(`Presence (relay-signed) — ${counted} online of ${pks.length}:\n` + rows.join("\n"));
+    }
+
+    if (name === "buzz_emoji") {
+      const evs = screen(await query([{ kinds: [30030], "#d": [CUSTOM_EMOJI_D], limit: 500 }])).events;
+      let pal = emojiPalette(evs);
+      const qq = a.query != null ? String(a.query).trim().replace(/^:+|:+$/g, "").toLowerCase() : "";
+      if (qq) pal = pal.filter((e) => e.shortcode.includes(qq));
+      const rows = pal.slice(0, 500).map((e) => `:${escapeName(e.shortcode)}:  ${escapeContent(e.url, { cap: 300 })}`);
+      return ok(`Custom emoji${qq ? ` matching "${escapeName(qq)}"` : ""} — ${pal.length} (URLs are listed, never fetched; react with buzz_react emoji ":shortcode:"):\n${UNTRUSTED_NOTE}\n` + (rows.join("\n") || "(none)"));
+    }
+
+    // ---- v0.2.31 Slack-parity tools. Kinds and tag shapes mirror buzz-sdk builders.rs (upstream
+    // dc25198d5). Kinds Ekam deliberately won't wire-sign (9008, 41012, 5) are refused
+    // in wire mode with a clear reason, never signed some other way. 40003 / 9022 go to Ekam (v0.2.32-pre). ----
+    const parity = await parityTool(name, a, { ok, fail });
+    if (parity) return parity;
+
     return ok(`unknown tool: ${name}`);
   } catch (e) {
-    return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
+    // v0.2.31 re-check (must-fix): an error message can carry relay-controlled text (profile
+    // names, channel names, relay error bodies), so the catch-all escapes it like message content
+    // (one line, no raw C0/C1/bidi/invisible characters) and caps it. Labels names.mjs already
+    // quoted show their backslashes doubled here ("\\u{202e}") — harmless, and never raw.
+    return { content: [{ type: "text", text: `error: ${escapeContent(e && e.message != null ? e.message : e, { cap: ERROR_TEXT_CAP })}` }], isError: true };
   }
-});
+}
 
 // pilot #4: in wire mode the shim posts AS the human — default the display name to the human.
 // Preferred source is ekam's login-captured `name` (#335, handled at MY_NAME init above); this

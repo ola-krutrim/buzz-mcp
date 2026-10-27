@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { openUrlCommand, minimalChildEnv } from "./safety.mjs";
 import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -100,10 +101,9 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
   console.error(`\n[wire-login] open this URL in your browser to grant "post as me":\n\n${url}\n\n[wire-login] waiting for the redirect on ${redirectUri} …`);
   // pilot #2: best-effort auto-open the browser (fall back to the printed URL if it fails).
   try {
-    const [cmd, ...pre] = process.platform === "darwin" ? ["open"]
-      : process.platform === "win32" ? ["cmd", "/c", "start", ""]
-      : ["xdg-open"];
-    spawn(cmd, [...pre, url], { stdio: "ignore", detached: true }).unref();
+    // v0.2.31: https only, no cmd.exe on Windows (rundll32 url.dll), minimal child env.
+    const { cmd, args } = openUrlCommand(url);
+    spawn(cmd, args, { stdio: "ignore", detached: true, env: minimalChildEnv() }).unref();
     console.error("[wire-login] (tried to open your browser — if nothing opened, paste the URL above)");
   } catch { /* printing the URL above is the fallback */ }
   srv.on("request", async (req, res) => {

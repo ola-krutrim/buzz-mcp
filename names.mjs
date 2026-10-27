@@ -11,10 +11,12 @@
 // Everything here is synchronous and side-effect free so names.test.mjs can unit-test it.
 import { CONFUSABLES } from "./confusables.mjs";
 
-// Case-only mismatch policy. A single hit whose name differs from the input ONLY by case
-// ("anirban das" vs "Anirban Das") is, by default, treated like any other non-exact hit:
-// ambiguous / lookalike → refused, use an npub. Flip to false to accept a case-only match.
-export const CASE_ONLY_IS_AMBIGUOUS = true;
+// Case-only mismatch policy. v0.2.32-pre (Navendu's call): a single hit whose name differs from
+// the input ONLY by letter case ("anirban das" vs "Anirban Das") RESOLVES. Everything else stays
+// fail-closed: a lookalike / confusable (NFKC / TR39 skeleton) hit, a name with hidden bidi /
+// invisible characters, or two or more matching people (e.g. "Sam" and "SAM") → refused, use an
+// npub. Set back to true to treat case-only hits as ambiguous again.
+export const CASE_ONLY_IS_AMBIGUOUS = false;
 
 // ---- invisible / direction-manipulating characters ----
 // Bidi_Control: ALM U+061C, LRM U+200E, RLM U+200F, U+202A–202E, U+2066–2069.
@@ -22,13 +24,20 @@ export const CASE_ONLY_IS_AMBIGUOUS = true;
 // fillers, U+17B4/17B5, U+180B–180F, ZWSP/ZWNJ/ZWJ U+200B–200D, U+2060–206F, variation selectors
 // U+FE00–FE0F & U+E0100–E01EF, BOM/ZWNBSP U+FEFF, tag characters U+E0000–E0FFF, …
 // U+00AD is DICP already; listed explicitly so the intent survives a property-table change.
-export const NAME_INVIS = /[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
+// v0.2.31 fix (buzz_security release review §3.4): ONE definition shared by names (NAME_INVIS) and
+// message content (safety.mjs escapeContent). It adds \p{Cf} (format controls, e.g. U+2061–2064
+// invisible operators, U+0600–0605, U+FFF9–FFFB) and spells out the tag block U+E0000–E007F (the
+// "ASCII smuggling" prompt-injection vector) for the same reason U+00AD is spelled out.
+export const INVISIBLE_CLASS = String.raw`\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD\u2061-\u2064\u{E0000}-\u{E007F}`;
+export const INVISIBLE = new RegExp(`[${INVISIBLE_CLASS}]`, "u");
+export const INVISIBLE_G = new RegExp(`[${INVISIBLE_CLASS}]`, "gu");
+export const NAME_INVIS = INVISIBLE;
 export const NAME_INVIS_G = new RegExp(NAME_INVIS.source, "gu");
 export const BIDI_CONTROL = /\p{Bidi_Control}/u;
 export const VARIATION_SELECTOR_G = /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
 // What a channel NAME may not contain: every Bidi_Control and every default-ignorable EXCEPT
 // variation selectors (those are stripped by canonicalizeChannelName so "Pulse ❤️" still works).
-export const CHANNEL_NAME_FORBIDDEN = /(?![\uFE00-\uFE0F\u{E0100}-\u{E01EF}])[\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\u00AD]/u;
+export const CHANNEL_NAME_FORBIDDEN = new RegExp(`(?![\\uFE00-\\uFE0F\\u{E0100}-\\u{E01EF}])[${INVISIBLE_CLASS}]`, "u");
 
 export const stripInvisible = (s) => String(s ?? "").replace(NAME_INVIS_G, "");
 export const stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_SELECTOR_G, "");
@@ -37,7 +46,8 @@ export const stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_
 // quotes it, turns every control (C0, DEL, C1 U+0080–009F), U+2028/2029 and every bidi / invisible /
 // format character into a visible \u{..} escape, escapes backslash and quote, and caps it — so an
 // impostor profile name can't hide tag-character text, flip the line with RLO, or forge a new line.
-const LABEL_ESCAPE_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD]/gu;
+// v0.2.31: the same invisible set as message content (INVISIBLE_CLASS) plus C0/C1/DEL/LS/PS.
+const LABEL_ESCAPE_G = new RegExp(`[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029${INVISIBLE_CLASS}]`, "gu");
 export function quoteLabel(s, cap = 64) {
   const cps = [...String(s ?? "")];
   const body = cps.slice(0, cap).join("").replace(/[\\"]/g, (c) => "\\" + c)
@@ -107,7 +117,7 @@ export function assertPTags(tags) {
  * Only `name` / `display_name` are ever matched; a candidate a search engine returned because of
  * its bio / about / nip05 / any other field never resolves. Candidates are ranked:
  *   tier 0  exact: rawKey(field) === rawKey(query)            (NFC+trim; + lowercase if case-only allowed)
- *   tier 1  case-only: same NFC+trim ignoring case            (only when CASE_ONLY_IS_AMBIGUOUS)
+ *   tier 1  case-only: same NFC+trim ignoring case            (only when CASE_ONLY_IS_AMBIGUOUS; default false → case-only is tier 0)
  *   tier 2  lookalike: nameKey / nameKeyCased equal           (NFKC/case-fold/TR39 skeleton collision)
  * Returns { pubkey } on exactly one distinct pubkey at tier 0. Throws:
  *   >1 distinct matching pubkeys (any tier)  → ambiguous

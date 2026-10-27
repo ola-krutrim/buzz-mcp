@@ -1,0 +1,56 @@
+# release (v0.2.31): on a v* tag, re-run the tests, rebuild dist/ from the reviewed source + lockfile,
+# require it to match the committed dist/SHA256SUMS byte for byte, then publish a GitHub release
+# with the two bundles, their SHA256SUMS, and a signed SLSA build-provenance attestation
+# (actions/attest-build-provenance). install.sh verifies the sha256 of what it installs.
+# Third-party actions are pinned by full commit SHA (tag in the trailing comment).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write        # create the release
+      id-token: write        # OIDC for the provenance signature
+      attestations: write    # store the attestation
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - name: tag matches package.json version
+        run: |
+          v="v$(node -p 'require("./package.json").version')"
+          [ "$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME ≠ package.json $v"; exit 1; }
+      - run: npm ci
+      - run: npm test
+      - name: rebuild dist and verify against dist/SHA256SUMS
+        run: |
+          npm run build
+          sha256sum -c dist/SHA256SUMS
+          git diff --exit-code -- dist/
+      - name: build-provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/buzz-mcp.mjs
+            dist/wirelogin.mjs
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/buzz-mcp.mjs dist/wirelogin.mjs dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --verify-tag \
+            --notes "sha256 (dist/SHA256SUMS):
+          $(cat dist/SHA256SUMS)
+
+          Verify provenance: gh attestation verify dist/buzz-mcp.mjs --repo $GITHUB_REPOSITORY"

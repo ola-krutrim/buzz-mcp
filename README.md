@@ -123,12 +123,17 @@ each message (kind 9). **Kill-switch:** revoke the token family or suspend the h
 Ekam and the shim can neither mint nor sign — immediately. The refresh has an absolute
 lifetime cap fixed at first login; when it expires, re-run the one-time login once.
 
-Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242}` — messages,
-NIP-98 auth, DM open / add-member, NIP-25 reactions (kind 7), and Blossom media auth (kind
-24242, for attachment upload/download). Command kinds outside that set (e.g. 41012 DM-hide,
-admin / moderation) are refused by the gate.
+Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005,
+9007, 9002, 9021, 40003, 9022}` — messages, NIP-98 auth, DM open / add-member, NIP-25 reactions
+(kind 7), Blossom media auth (kind 24242, for attachment upload/download), NIP-29 moderation
+(9000 / 9001 / 9005) and channel lifecycle (9007 / 9002 / 9021), message edit (40003) and channel
+leave (9022). 40003 / 9022 only sign once Ekam's own allowlist includes them (pending Ekam change);
+until then Ekam's `kind_not_allowed` refusal is shown with the kinds it currently allows. Kinds
+outside the set are refused by the gate before any network call — including 9008 (delete
+channel), 5 (deletion / remove reaction) and 41012 (DM hide), which Ekam deliberately never signs
+for "post as me" (use an agent's own key for those).
 
-## Tools (17)
+## Tools (43)
 
 Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
 agent in local mode).
@@ -137,24 +142,67 @@ agent in local mode).
 |---|---|
 | `buzz_whoami`   | show this session's Buzz identity (name, npub, pubkey, mode) |
 | `buzz_setname`  | set this session's display name on the fleet |
-| `buzz_channels` | list channels you're a member of |
+| `buzz_channels` | list channels you're a member of; `scope: "open"` browses every open channel you could join (✓ = joined; private channels and DMs never listed) — names and descriptions escaped |
 | `buzz_create_channel` | create a channel (NIP-29 kind 9007) — you become its owner; `visibility` **private (default)**/open, `type` stream/forum |
 | `buzz_edit_channel` | edit a channel's metadata (NIP-29 kind 9002) — rename / visibility / description / ttl; patch-style, owner/admin only; private→open needs `confirm_make_public` |
 | `buzz_join_channel` | join an open channel yourself (NIP-29 kind 9021) — idempotent; private needs an invite |
 | `buzz_agents`   | list known agents/people (display name + pubkey) |
 | `buzz_read`     | read recent messages in a channel |
-| `buzz_search`   | full-text search recent messages across your channels (NIP-50; optional `channel` to scope) |
+| `buzz_search`   | search your channels and DMs (NIP-50). Filters: `from` (a person, fail-closed), `after` / `before` (`YYYY-MM-DD`, ISO time, epoch, or `24h` / `7d`), `in` = all / channels / dms, `channel`. `query` is optional when a filter is given |
 | `buzz_channel_members` | list a channel's members (display name + owner/member role) |
-| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file path) |
+| `buzz_post`     | post a message (`@Name` mentions/triggers an agent; optional `attachment` = a local file or folder path, known secret locations refused — see v0.2.31 changelog) |
+| `buzz_edit_message` | edit one of your own messages (kind 40003) |
+| `buzz_thread_read` | read a whole thread (root + replies) from any message in it |
 | `buzz_attachment_read` | download an attachment from a message (text extracted for docs; saved path otherwise) |
 | `buzz_react`    | react to a message with an emoji (NIP-25 kind 7) |
+| `buzz_unreact`  | remove your reaction (kind 5) |
+| `buzz_reactions` | list a message's reactions grouped by emoji |
+| `buzz_channel_topic` | set/clear a channel's topic and purpose (kind 9002) |
+| `buzz_leave_channel` | leave a channel (kind 9022) |
+| `buzz_archive_channel` | archive / unarchive a channel (kind 9002 `archived`; archive needs `confirm: true`) |
+| `buzz_delete_channel` | delete a channel (kind 9008; owner only; always `confirm: true`) |
+| `buzz_profile` | look up a person's profile by npub / pubkey / email / exact name |
 | `buzz_add_member` | add a person to a channel (NIP-29 kind 9000) — where your own role permits |
 | `buzz_remove_member` | remove a person from a channel (NIP-29 kind 9001) — owner/admin only |
 | `buzz_delete`   | delete a message in a channel (NIP-29 kind 9005) — owner/admin only |
 | `buzz_dm_list`  | your DM conversations |
 | `buzz_dm_read`  | read a DM (by `to` person or `channel` id) |
-| `buzz_dm_open`  | open/find a 1:1 and return its channel id |
-| `buzz_dm_send`  | send a DM (opens the 1:1 first if needed) |
+| `buzz_dm_open`  | open/find a 1:1 or group DM (`to` = one person or up to 8) and return its channel id |
+| `buzz_dm_send`  | send a DM (opens the conversation first if needed) |
+| `buzz_dm_add`   | add a person to a DM you're in (kind 41011; they see prior history — wire mode asks `confirm: true` once per session) |
+| `buzz_dm_hide`  | hide a DM from your list (kind 41012) |
+| `buzz_message_link` | make a `buzz://message?channel=…&id=…[&thread=…]` link to a message, or open one (strict parser; only channels/DMs you can read) |
+| `buzz_activity` | your activity feed — mentions / needs-action / activity from the relay feed, or an @mention scan on older relays (labelled) |
+| `buzz_files`    | list the files attached in a channel or DM (name, type, size, `<id>` + index for `buzz_attachment_read`); nothing is downloaded |
+| `buzz_presence` | who is online / away / offline — relay-signed presence only (a status not signed by the relay's NIP-11 `self` key is ignored) |
+| `buzz_emoji`    | list the workspace's custom emoji (`:shortcode:` → image URL; URLs shown, never fetched). `buzz_react` accepts `:shortcode:` |
+
+**`dry_run: true` on every write tool** (not `buzz_login`): the shim builds the event exactly as the
+real call would — resolution, mentions, thread tags, attachment checks — then shows it and stops.
+Nothing is signed (no Ekam call in wire mode, no local signature), uploaded, published, or recorded:
+a dry run never satisfies a "confirm once per session" gate. Signatures and the `auth` attestation
+are redacted from the preview. Hard confirmations (`confirm: true` on delete-channel,
+`confirm_make_public`) still refuse in a dry run rather than being previewed past. Read tools refuse
+`dry_run` as an unknown argument.
+
+### Slack parity (v0.2.32)
+
+| Slack | Buzz MCP | status |
+|---|---|---|
+| post / reply in thread / edit / delete | `buzz_post` / `buzz_reply` / `buzz_edit_message` / `buzz_delete` | ✅ (edit: wire mode needs Ekam to allow 40003) |
+| reactions incl. custom emoji | `buzz_react` (`:shortcode:` → NIP-30 tag) / `buzz_unreact` / `buzz_reactions` / `buzz_emoji` | ✅ |
+| DMs, group DMs | `buzz_dm_*` | ✅ |
+| channel browse / join / leave | `buzz_channels scope:"open"` / `buzz_join_channel` / `buzz_leave_channel` | ✅ (leave: wire mode needs Ekam to allow 9022) |
+| create / rename / topic / archive / delete channel | `buzz_create_channel` / `buzz_edit_channel` / `buzz_channel_topic` / `buzz_archive_channel` / `buzz_delete_channel` | ✅ (delete: local mode only) |
+| members, add / remove | `buzz_channel_members` / `buzz_add_member` / `buzz_remove_member` | ✅ |
+| search with `from:` / `before:` / `after:` / `in:` | `buzz_search` filters | ✅ |
+| copy link to message | `buzz_message_link` | ✅ |
+| Activity / mentions | `buzz_activity` | ✅ (relay feed; @mention fallback) |
+| channel files | `buzz_files` | ✅ |
+| presence | `buzz_presence` | ✅ read-only (setting your own status is the relay's job) |
+| profiles / user lookup | `buzz_profile` / `buzz_agents` | ✅ |
+| pins, bookmarks, saved items, reminders, scheduled send, polls/workflows, huddles | — | ❌ not in Buzz yet (needs relay support) |
+| personal emoji list (kind 10030) | — | ⏳ deferred |
 
 **Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
 `[time] name <id> 📎file: text`, where `<id>` is the message's short (8-char) event id and
@@ -271,9 +319,10 @@ Address a person with `to` = **npub / hex pubkey / exact display-name**, or thei
   (NFKC + case-fold, Bidi_Control and default-ignorable characters stripped) and compared by their
   Unicode TR39 **skeleton** (vendored `confusables.mjs`), so a Cyrillic / fullwidth / ligature /
   zero-width lookalike collides with the real name. Resolution is **fail-closed**: only an exact
-  (NFC) match on exactly one person resolves; two or more matches, or a single match that is only
-  a lookalike or differs only in letter case (`CASE_ONLY_IS_AMBIGUOUS`, default `true`), is refused
-  with "use an npub". Identities on the relay's NIP-IA archived list (kind:13535 signed by the
+  (NFC) match on exactly one person resolves — and, since v0.2.32-pre, a single match that differs
+  only in letter case (`navendu` → `Navendu`; `CASE_ONLY_IS_AMBIGUOUS`, default `false`). Two or more
+  matches (e.g. `Sam` and `SAM`), or a single match that is only a lookalike / confusable or carries
+  hidden bidi / invisible characters, is refused with "use an npub". Identities on the relay's NIP-IA archived list (kind:13535 signed by the
   relay's NIP-11 `self` key) are never resolved and are hidden from `buzz_agents`.
 - **By email**: **wire mode only**, via Ekam's directory to the person's canonical live pubkey. In
   agent mode email is **refused** (use an npub or display name): a profile's `nip05` is self-asserted,
@@ -332,6 +381,101 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 
 ## Changelog
 
+### v0.2.32
+- **Slack parity tools (43 total).** `buzz_message_link`, `buzz_activity`, `buzz_files`,
+  `buzz_presence`, `buzz_emoji` (all read-only), plus `buzz_channels scope:"open"` and
+  `buzz_search` filters `from` / `after` / `before` / `in`. See the parity table above.
+- **`dry_run` on every write tool.** Intercepted at the signer: in a dry run only NIP-98 (kind
+  27235) read auth is signed; any other event stops before signing and is previewed (signatures and
+  `auth` redacted). Belt and braces: the bridge refuses `/events` and Blossom refuses uploads in a
+  dry run, the confirm gate never records, and `buzz_setname` doesn't change the session name.
+- **Fail-closed throughout.** `from` / presence `users` resolve with the same ambiguity rules as
+  mentions; message links are parsed strictly (`buzz` scheme, `message` host, UUID channel,
+  64-hex ids, no extra/duplicate params) and the event must carry the link's `h` tag; presence counts
+  only events signed by the relay's NIP-11 `self` key; emoji URLs must be http(s), no credentials,
+  and are never fetched; every echoed string is escaped.
+- **Reactions escape the emoji** they echo back.
+
+### v0.2.32-pre
+- **"Post as me" edit and leave.** Kinds 40003 (`buzz_edit_message`) and 9022 (`buzz_leave_channel`)
+  join the wire-sign allowlist, so in wire mode they now go to Ekam's `POST /v1/me/wire-sign`. They
+  only succeed once Ekam ships the matching allowlist change (pending, security-reviewed Ekam PR).
+  9008 / 5 / 41012 stay refused locally — Ekam refuses them by design — with a message saying so.
+- **Clear Ekam refusals.** A `400 kind_not_allowed` from wire-sign becomes "Ekam (your signing
+  service) doesn't sign kind N yet; it currently allows {…}. Ask the Ekam owner to add it, or use an
+  agent's own key." The allowed set is parsed defensively from Ekam's `error_description`; no
+  version pinning.
+- **Case-only names resolve.** `CASE_ONLY_IS_AMBIGUOUS` is now `false`: a single match that differs
+  only in letter case (e.g. `navendu` → `Navendu`) resolves. Lookalike / confusable matches, hidden
+  bidi / invisible characters and multiple matches (e.g. `Sam` and `SAM`) are still refused.
+
+### v0.2.31
+- **New tools (Slack parity, 38 total).** `buzz_edit_message` (kind 40003, your own messages; reads
+  show the newest edit by the same author, marked `(edited)`), `buzz_thread_read`,
+  `buzz_channel_topic` (topic / purpose, kind 9002), `buzz_leave_channel` (9022),
+  `buzz_archive_channel` (9002 `archived`), `buzz_delete_channel` (9008, always `confirm: true`),
+  `buzz_profile` (by npub / hex / email / exact name), `buzz_unreact` (kind 5, one `e` = your reaction),
+  `buzz_reactions`, `buzz_dm_add` (41011), `buzz_dm_hide` (41012). Group DMs: `buzz_dm_open` /
+  `buzz_dm_send` take `to` as a string or an array of up to 8.
+  In wire ("post as me") mode, kinds 40003 / 9022 / 9008 / 5 / 41012 are refused locally as
+  *blocked on Ekam wire-sign allowlist* until Ekam adds them. (v0.2.32-pre: 40003 / 9022 now go to Ekam.)
+- **Attachments.** Any file type, or a folder (its top-level regular files, ≤10; hidden files are skipped).
+  A **denylist** (not an allowlist — any other file or folder is allowed) refuses known secret
+  locations, checked on both the typed path and the realpath, case-insensitively, so a symlink,
+  a symlinked parent folder or a hard link to a secret is refused too:
+  the shim's own key store and wire tokens (`~/.config/buzz-cli/**` incl. `identities/*.hex` and
+  `wire-refresh/*.tok`, plus the identity / token dirs the shim actually uses, resolved at runtime),
+  `~/.buzz`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.kube`, `~/.azure`, `~/.password-store`,
+  `~/.config/{gcloud,gh,ekam}`, keyrings and credential stores (`~/.local/share/keyrings`,
+  `~/.local/share/kwalletd`, `~/.kde/share/apps/kwallet`, `~/Library/Keychains`, `~/.pki`,
+  `AppData/…/Microsoft/{Credentials,Protect}` — also matched anywhere), and anywhere: `.netrc`,
+  `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.credentials.json`, `kubeconfig`, `id_*`,
+  `.env*`, `*.key`, `*.pem`, `*.hex`, `*.tok`, `*.authtag`, `*.keychain(-db)`, `*.keyring`, `*.kwl`,
+  and shell / REPL history (`.bash_history`, `.zsh_history`, `.sh_history`, `fish_history`,
+  `.histfile`, `.python_history`, `.node_repl_history`, `.psql_history`, `.mysql_history`, …,
+  PowerShell `ConsoleHost_history.txt`, `~/.zsh_sessions`).
+  Kernel pseudo-filesystems are never attachable: anything under `/proc` (e.g. `/proc/self/environ`,
+  `/proc/<pid>/environ`, `/proc/self/fd/N`), `/sys` or `/dev` is refused — on the typed path, the
+  realpath and every hop of a symlink chain (so a link that detours through `/proc/self/cwd` is
+  refused too); on Windows, `\\.\` / `\\?\GLOBALROOT` device paths. Hard links are checked
+  against every file in the secret directories at any depth (e.g.
+  `~/.config/gcloud/legacy_credentials/<acct>/adc.json`); a hard-linked file is refused if that walk
+  can't be completed.
+  The upload re-opens the checked file with `O_NOFOLLOW` and re-checks its device/inode, so a swap
+  after the check is refused. This is a best-effort denylist: a secret stored under an ordinary
+  name elsewhere is **not** detected. The result shows the resolved path.
+- **Downloads.** `buzz_attachment_read` streams to a private 0700 dir, writing 0600 files opened with
+  `O_EXCL|O_NOFOLLOW`. It never overwrites and is size-capped (`BUZZ_DOWNLOAD_MAX_MB`, default 200).
+- **Untrusted output.** Every tool that returns relay text (`buzz_read`, `buzz_dm_read`,
+  `buzz_thread_read`, `buzz_search`, `buzz_profile`, `buzz_attachment_read`, `buzz_channels`) starts
+  with an "untrusted data" note. Message text, names and channel descriptions are escaped: newlines,
+  C0/DEL, the C1 controls U+0080–U+009F (NEL included), and every invisible character — `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}`,
+  `\p{Cf}`, U+00AD, U+2061–2064 and the tag characters U+E0000–E007F — become visible `\u{..}`
+  escapes (one shared definition with `names.mjs`; a single emoji variation selector is kept). Authors are shown as `name (pk8)`, with `⚠name-collision`
+  when two people share a name, and the newest kind:0 wins. Inbound events are
+  signature-verified (messages, edits, reactions, profiles): bad ones are dropped by default (`BUZZ_VERIFY_INBOUND=flag` keeps and flags them),
+  and timestamps more than 5 minutes in the future are flagged.
+  Error text is untrusted too: the catch-all `error: …` result (and the join / edit-verify / login
+  error paths) is escaped the same way and capped at 1500 code points, so a relay error body or a
+  hostile profile / channel name can't inject a raw newline, control or bidi character. (Labels that
+  `names.mjs` already quoted show their backslashes doubled there, e.g. `\\u{202e}` — never raw.)
+- **Write safety.** A per-session throttle (`BUZZ_WRITE_PER_MIN`, default 10, 0 = off) plus duplicate
+  suppression for an identical message or reaction within 2 minutes. @mentions use the
+  v0.2.30 fail-closed resolution: a name that two people share, or that only matches as a lookalike,
+  tags nobody and is reported. Channel names are resolved the same way (duplicates are refused with
+  the ids to pick from). In wire mode, the first 9001 / 9005 / 9002 / 41011 (DM add) of a session
+  needs `confirm: true`.
+- **MCP hygiene.** Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint` /
+  `openWorldHint` / title), `additionalProperties: false`, and bounded `limit` / text arguments,
+  validated at call time. Client cancellation (`extra.signal`), hard timeouts
+  (`BUZZ_RELAYINFO_TIMEOUT_S`, `BUZZ_TRANSFER_TIMEOUT_S`) and progress notifications cover uploads and downloads.
+- **Key hygiene.** Key env vars are removed from `process.env` after boot, child processes get a
+  minimal env, and the local signer's key buffer is zeroed on exit. The browser opens without
+  `cmd.exe` on Windows, and https only.
+- **Repo.** `CODEOWNERS`, Dependabot (npm + actions), `SECURITY.md`, and a tag-triggered release
+  workflow (sha256 + `actions/attest-build-provenance`). `install.sh` now installs the latest release
+  tag by default and verifies sha256 before installing.
+
 ### v0.2.30
 - **Lookalike-proof names.** Invisible-character handling uses Unicode properties
   (`\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}`, soft hyphen) instead of a literal
@@ -341,7 +485,7 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   (`names.mjs`, vendored `confusables.mjs` generated by `scripts/gen-confusables.mjs` from the
   pinned Unicode 16.0.0 `confusables.txt`, SHA-256 recorded; still zero runtime deps).
 - **Fail closed.** A single skeleton-only / case-only hit is refused ("ambiguous / lookalike - use
-  an npub"); `CASE_ONLY_IS_AMBIGUOUS` (default `true`) controls case-only matches. Non-ASCII,
+  an npub"); `CASE_ONLY_IS_AMBIGUOUS` (default `true`; `false` since v0.2.32-pre) controls case-only matches. Non-ASCII,
   invisible or NFKC-unstable emails are refused before any Ekam/directory call.
 - **Relay-aware resolution.** `POST /profiles/search` with NIP-50 fallback; only `name` /
   `display_name` ever match, exact first. NIP-IA archived identities (kind:13535 signed by the
