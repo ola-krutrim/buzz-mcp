@@ -198,7 +198,7 @@ console.log("\ncase A: tools/list — v0.2.33 tools, annotations, dry_run on wri
   r.close();
   const tools = (res[0] && res[0].tools) || [];
   const T = (n) => tools.find((t) => t.name === n);
-  ok(tools.length === 48, `48 tools listed (43 + 5) → ${tools.length}`);
+  ok(tools.length === 55, `55 tools listed (43 + 5 + 7 in v0.2.34) → ${tools.length}`);
   for (const n of NEW_TOOLS) ok(!!T(n) && T(n).inputSchema.additionalProperties === false, `${n} listed, schema closed`);
   ok(T("buzz_saved").annotations.readOnlyHint === true && !T("buzz_saved").inputSchema.properties.dry_run, "buzz_saved read-only, no dry_run");
   for (const n of ["buzz_profile_set", "buzz_mark_read", "buzz_save", "buzz_post_diff"]) ok(T(n).inputSchema.properties.dry_run && T(n).annotations.readOnlyHint === false, `${n}: write tool with dry_run`);
@@ -232,7 +232,7 @@ console.log("\ncase B: buzz_profile_set (agent) — merge keeps picture/about; v
   ok(bootP && !("junk" in bootP) && bootP.picture !== "https://evil/x.png", "unknown fields dropped; forged-signature kind 0 ignored");
   ok(!res[1].isError && has(res[1].text, /profile updated: about/), `about set → ${res[1].text}`);
   const p2 = k0[1];
-  ok(p2 && p2.about === "new bio\nline 2" && p2.picture === "https://cdn.example/me.png" && p2.client_version === "0.2.33", "about replaced, picture kept, client_version 0.2.33");
+  ok(p2 && p2.about === "new bio\nline 2" && p2.picture === "https://cdn.example/me.png" && p2.client_version === "0.2.34", "about replaced, picture kept, client_version 0.2.34");
   ok(res[2].isError && has(res[2].text, /https/), "http picture refused");
   ok(res[3].isError && has(res[3].text, /bidi|control/), "bidi name refused");
   ok(res[4].isError && has(res[4].text, /at least one/), "empty patch refused");
