@@ -2485,6 +2485,42 @@ function wireNameSet(id, name) {
 }
 var MEDIA_MB = 1024 * 1024;
 var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
+function parseAllowedKinds(body) {
+  try {
+    const pick = (arr) => {
+      const ks = [...new Set(arr.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 65535))].sort((a, b) => a - b);
+      return ks.length ? ks : null;
+    };
+    if (body && typeof body === "object") {
+      for (const f of ["allowed_kinds", "allowed"]) if (Array.isArray(body[f])) {
+        const r = pick(body[f]);
+        if (r) return r;
+      }
+    }
+    const desc = typeof body === "string" ? body : body && typeof body.error_description === "string" ? body.error_description : "";
+    if (!desc) return null;
+    const d = desc.slice(0, 4e3);
+    const ints = (t) => t.match(/\d+/g) || [];
+    for (const m of d.matchAll(/[{[(]([^{}[\]()]*)[}\])]/g)) {
+      if (/^[\s\d,;|]+$/.test(m[1]) && ints(m[1]).length) return pick(ints(m[1]));
+    }
+    for (const at of [...d.matchAll(/allow\w*/gi)].reverse()) {
+      const tail = d.slice(at.index + at[0].length).split(/[.;\n(]/, 1)[0];
+      const r = /^[\s\w:=,|]*$/.test(tail) ? pick(ints(tail)) : null;
+      if (r) return r;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+var echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+function kindNotAllowedMessage(kind, body) {
+  const allowed = parseAllowedKinds(body);
+  const desc = body && typeof body === "object" ? body.error_description : body;
+  const what = allowed ? `it currently allows {${allowed.join(", ")}}` : `it didn't say which kinds it allows${desc ? ` (Ekam said: "${echo(desc)}")` : ""}`;
+  return `Ekam (your signing service) doesn't sign kind ${kind} yet; ${what}. Ask the Ekam owner to add it, or use an agent's own key. (wire-sign HTTP 400 kind_not_allowed)`;
+}
 async function wireSign(base, token, template, fetchFn = fetch) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
@@ -2495,11 +2531,18 @@ async function wireSign(base, token, template, fetchFn = fetch) {
   });
   const text = await res.text();
   if (!res.ok) {
-    let detail = text.slice(0, 200);
+    let detail = text.slice(0, 200), j = null;
     try {
-      const j = JSON.parse(text);
+      j = JSON.parse(text);
       detail = j.error_description || j.error || detail;
     } catch {
+    }
+    if (res.status === 400 && j && typeof j === "object" && j.error === "kind_not_allowed") {
+      const err = new Error(kindNotAllowedMessage(template.kind, j));
+      err.code = "kind_not_allowed";
+      err.kind = template.kind;
+      err.allowedKinds = parseAllowedKinds(j);
+      throw err;
     }
     const hint = res.status === 403 ? " (token likely missing the wire:sign scope, or human suspended)" : res.status === 401 ? " (token revoked/expired, or wrong audience \u2014 must be minted resource=ISSUER)" : res.status === 503 ? " (escrow/Vault unavailable \u2014 transient)" : "";
     throw new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);

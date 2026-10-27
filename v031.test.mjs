@@ -36,15 +36,19 @@ function match(f, e) {
   if (f.until && e.created_at > f.until) return false;
   return true;
 }
-async function mockRelay(seed, { wireSk, eventsError } = {}) {
+async function mockRelay(seed, { wireSk, eventsError, ekamAllowed } = {}) {
   const store = [...seed];
   const published = [];
+  const wireSigned = [];
   const srv = createServer((rq, rs) => {
     let body = ""; rq.on("data", (c) => (body += c));
     rq.on("end", () => {
       const reply = (obj, code = 200) => { rs.writeHead(code, { "Content-Type": "application/json" }); rs.end(JSON.stringify(obj)); };
       if (rq.url === "/v1/me/wire-sign" && wireSk) {
         const { event } = JSON.parse(body);
+        wireSigned.push(event.kind);
+        if (ekamAllowed && !ekamAllowed.includes(event.kind))
+          return reply({ error: "kind_not_allowed", error_description: `kind ${event.kind} is not signable; allowed kinds: ${ekamAllowed.join(", ")}` }, 400);
         const ev = finalizeEvent({ ...event, created_at: now() }, hex(wireSk));
         return reply({ event: ev, pubkey: ev.pubkey });
       }
@@ -70,7 +74,7 @@ async function mockRelay(seed, { wireSk, eventsError } = {}) {
     });
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  return { port: srv.address().port, published, store, close: () => srv.close() };
+  return { port: srv.address().port, published, wireSigned, store, close: () => srv.close() };
 }
 
 // ---- one shim session, several sequential calls; resolves each reply by id ----
@@ -145,7 +149,7 @@ console.log("\ncase A: tools/list — annotations + additionalProperties:false +
   r.close();
   const tools = (res[0] && res[0].tools) || [];
   const by = Object.fromEntries(tools.map((t) => [t.name, t]));
-  ok(tools.length === 38, `tools/list returned ${tools.length} tools`);
+  ok(tools.length === 43, `tools/list returned ${tools.length} tools`);
   ok(tools.every((t) => t.annotations && typeof t.annotations.readOnlyHint === "boolean" && typeof t.annotations.destructiveHint === "boolean" && typeof t.annotations.idempotentHint === "boolean" && t.annotations.openWorldHint === true && t.annotations.title), "every tool carries title/readOnly/destructive/idempotent/openWorld annotations");
   ok(tools.every((t) => t.inputSchema.additionalProperties === false), "every inputSchema has additionalProperties:false");
   for (const n of ["buzz_edit_message", "buzz_thread_read", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_profile", "buzz_unreact", "buzz_reactions", "buzz_dm_add", "buzz_dm_hide"])
@@ -268,8 +272,12 @@ console.log("\ncase E: wire mode — blocked kinds + confirm-once gate");
     { name: "buzz_delete", args: { channel: "general", event: W.mine.id } },
   ], { perCallMs: 6000 });
   r.close();
-  for (const [i, k] of [[0, 40003], [1, 9022], [2, 9008], [3, 5], [4, 41012]])
-    ok(res[i].isError && /blocked on Ekam wire-sign allowlist/.test(res[i].text || "") && !r.published.some((e) => e.kind === k), `kind ${k} refused in wire mode, nothing sent`);
+  // v0.2.32-pre: 40003 / 9022 now go to Ekam's wire-sign (the mock Ekam signs them) and reach the relay.
+  ok(!res[0].isError && r.wireSigned.includes(40003) && r.published.some((e) => e.kind === 40003), "kind 40003 (edit) reaches Ekam's wire-sign in wire mode and is published");
+  ok(!res[1].isError && r.wireSigned.includes(9022) && r.published.some((e) => e.kind === 9022), "kind 9022 (leave) reaches Ekam's wire-sign in wire mode and is published");
+  for (const [i, k] of [[2, 9008], [3, 5], [4, 41012]])
+    ok(res[i].isError && /blocked on Ekam wire-sign allowlist/.test(res[i].text || "") && /deliberately/.test(res[i].text || "") && /agent/.test(res[i].text || "")
+       && !r.published.some((e) => e.kind === k) && !r.wireSigned.includes(k), `kind ${k} refused locally in wire mode (Ekam refuses it by design), nothing sent to Ekam or the relay`);
   ok(res[5].isError && /confirm: true/.test(res[5].text || ""), "first 9002 in a wire session needs confirm:true");
   ok(!res[6].isError && !res[7].isError && r.published.filter((e) => e.kind === 9002).length === 2, "after one confirm, later 9002s in the same session go through");
   ok(res[8].isError && /confirm: true/.test(res[8].text || ""), "9005 has its own first-time confirm");
@@ -312,6 +320,22 @@ console.log("\ncase E2: wire dm_add confirm-once + buzz_channels escaping + dupl
   ok(c.split("\n").length === 1 + 5 && c.split("\n").slice(1).every((l) => l.startsWith("#")), "one line per channel (+ the note), every line a real #channel row");
   ok(res[4].isError && /ambiguous/.test(res[4].text || "") && /dupA/.test(res[4].text || "") && /dupB/.test(res[4].text || "") && !r.published.some((e) => e.kind === 9 && e.content.includes("to which ops")), "two channels named 'ops': refused, both ids listed, nothing posted");
   ok(!res[5].isError && r.published.some((e) => e.kind === 9 && e.tags.some((x) => x[0] === "h" && x[1] === "dupB")), "the channel id still selects one of them");
+}
+
+// ---- case E3 (v0.2.32-pre): today's Ekam refuses 40003/9022 → the tool shows Ekam's refusal clearly ----
+console.log("\ncase E3: wire mode — Ekam without 40003/9022 → clear kind_not_allowed error");
+{
+  const EKAM_NOW = [22242, 9, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021];
+  const W = world(); const r = await mockRelay(W.seed, { wireSk: SK_ME, ekamAllowed: EKAM_NOW });
+  const { res } = await session(wireEnv(r.port), [
+    { name: "buzz_edit_message", args: { channel: "general", event: W.mine.id, text: "x" } },
+    { name: "buzz_leave_channel", args: { channel: "general" } },
+  ], { perCallMs: 6000 });
+  r.close();
+  for (const [i, k] of [[0, 40003], [1, 9022]])
+    ok(res[i].isError && new RegExp(`Ekam \\(your signing service\\) doesn't sign kind ${k} yet; it currently allows \\{7, 9, `).test(res[i].text || "")
+       && /agent's own key/.test(res[i].text || "") && r.wireSigned.includes(k) && !r.published.some((e) => e.kind === k),
+       `kind ${k}: reached Ekam, refused, tool shows the refused kind + Ekam's allowed set, nothing published`);
 }
 
 // ---- case F: write throttle + duplicate suppression ----

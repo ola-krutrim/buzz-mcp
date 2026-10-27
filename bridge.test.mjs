@@ -347,7 +347,7 @@ console.log("\ncase 7: buzz_login + buzz_doctor registered + tool count is 38 (s
     ok(names.includes("buzz_create_channel"), "buzz_create_channel is registered in tools/list");
     ok(names.includes("buzz_edit_channel"), "buzz_edit_channel is registered in tools/list");
     ok(names.includes("buzz_join_channel"), "buzz_join_channel is registered in tools/list");
-    ok(names.length === 38, `total tool count is 38 (got ${names.length})`);
+    ok(names.length === 43, `total tool count is 43 (got ${names.length})`);
   }
 }
 
@@ -742,7 +742,7 @@ console.log("\ncase 17: B — slow undici attempt aborts on BUZZ_HTTP_TIMEOUT_S 
 // The handshake used to advertise a HARDCODED serverInfo.version "0.1.0" for every release. It must
 // now report the real SHIM_VERSION so a client/agent can read what's actually running. Fully static
 // (handshake is answered in-process; the black-hole relay is never dialed for initialize).
-console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.31), not 0.1.0");
+console.log("\ncase 18: MCP initialize serverInfo.version reports the shim version (0.2.32), not 0.1.0");
 {
   const AGENT = { BUZZ_PRIVATE_KEY: "55".repeat(32), BUZZ_NAME: "bridge-test", BUZZ_AUTH_TAG: "",
     BUZZ_WIRE_SIGN: "", BUZZ_EKAM_CLIENT_ID: "",
@@ -753,7 +753,7 @@ console.log("\ncase 18: MCP initialize serverInfo.version reports the shim versi
     const si = res.serverInfo || {};
     console.log("  serverInfo: " + JSON.stringify(si));
     ok(si.name === "buzz", "serverInfo.name is still 'buzz'");
-    ok(si.version === "0.2.31", `serverInfo.version === '0.2.31' (got '${si.version}')`);
+    ok(si.version === "0.2.32", `serverInfo.version === '0.2.32' (got '${si.version}')`);
     ok(si.version !== "0.1.0", "serverInfo.version is NOT the old hardcoded '0.1.0'");
     ok(res.protocolVersion === "2024-11-05", "protocolVersion is untouched ('2024-11-05')");
   }
@@ -771,7 +771,7 @@ console.log("\ncase 19: buzz_whoami output contains the shim version string");
   if (text == null) skipped("no reply for buzz_whoami version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.31/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.31'");
+    ok(/@ola\/buzz-mcp v0\.2\.32/.test(text), "buzz_whoami → reports 'shim: @ola/buzz-mcp v0.2.32'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_whoami → structured result, no crash");
   }
 }
@@ -788,7 +788,7 @@ console.log("\ncase 20: buzz_doctor output contains the shim version string");
   if (text == null) skipped("no reply for buzz_doctor version case");
   else {
     console.log("  client sees: " + text.replace(/\\n/g, " | ").slice(0, 200));
-    ok(/@ola\/buzz-mcp v0\.2\.31/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.31'");
+    ok(/@ola\/buzz-mcp v0\.2\.32/.test(text), "buzz_doctor → reports 'shim: @ola/buzz-mcp v0.2.32'");
     ok(!/reading '|TypeError|is not a function|Cannot read/.test(text), "buzz_doctor → structured result, no crash");
   }
 }
@@ -1503,7 +1503,9 @@ console.log("\ncase 34: resolveRecipient → name search (both fields, NFKC+fold
     { name: "single skeleton-only hit (Cyrillic twin) for the Latin name → refused", profiles: DIR.cyrOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
     { name: "fullwidth NFKC collision → refused", profiles: DIR.fullwidthOnly, to: "Anirban Das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
     { name: "ligature 'ﬁnance-bot' NFKC collision with 'finance-bot' → refused", profiles: DIR.ligOnly, to: "finance-bot", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
-    { name: "case-only difference → refused (CASE_ONLY_IS_AMBIGUOUS default true)", profiles: DIR.anirban, to: "anirban das", wantRefused: true, wantErr: /letter case/ },
+    { name: "case-only difference → resolves (CASE_ONLY_IS_AMBIGUOUS default false, v0.2.32-pre)", profiles: DIR.anirban, to: "anirban das", wantPk: ANI },
+    { name: "case-only + Cyrillic lookalike → still refused", profiles: DIR.anirban.slice(0, 1).map((p) => ({ ...p, display_name: "" })), to: "\u0430nirban das", wantRefused: true, wantErr: /ambiguous \/ lookalike - use an npub/ },
+    { name: "case-only vs two people (dupe) → still ambiguous, refused", profiles: DIR.dupe, to: "sam roy", wantRefused: true, wantErr: /ambiguous/ },
     { name: "invisible LRM inside the typed name vs real → lookalike, refused", profiles: DIR.anirban, to: "Anirban\u200E Das", wantRefused: true, wantErr: /lookalike/ },
     // ---- v0.2.30 (B): only name/display_name ever match; exact first ----
     { name: "(B) bio/nip05-only search hit → NOT resolved", profiles: DIR.bioOnly, to: "Anirban Das", wantRefused: true, wantErr: /can't resolve recipient/ },

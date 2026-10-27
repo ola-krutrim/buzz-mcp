@@ -19550,7 +19550,8 @@ function makeWireTokenProvider(env, fetchFn) {
     // for clean shutdown/tests
   };
 }
-var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005, 9007, 9002, 9021]);
+var WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005, 9007, 9002, 9021, 40003, 9022]);
+var EKAM_REFUSED_BY_DESIGN = /* @__PURE__ */ new Map([[9008, "delete channel"], [5, "deletion / remove reaction"], [41012, "hide a DM"]]);
 var HEX64 = /^[0-9a-f]{64}$/;
 function addMemberTemplate({ channelId, targetPubkey, role } = {}) {
   const chan = String(channelId || "").trim();
@@ -19676,6 +19677,42 @@ function normalizePubkey(v) {
   }
   return null;
 }
+function parseAllowedKinds(body) {
+  try {
+    const pick2 = (arr) => {
+      const ks = [...new Set(arr.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 65535))].sort((a, b) => a - b);
+      return ks.length ? ks : null;
+    };
+    if (body && typeof body === "object") {
+      for (const f of ["allowed_kinds", "allowed"]) if (Array.isArray(body[f])) {
+        const r = pick2(body[f]);
+        if (r) return r;
+      }
+    }
+    const desc = typeof body === "string" ? body : body && typeof body.error_description === "string" ? body.error_description : "";
+    if (!desc) return null;
+    const d = desc.slice(0, 4e3);
+    const ints = (t) => t.match(/\d+/g) || [];
+    for (const m of d.matchAll(/[{[(]([^{}[\]()]*)[}\])]/g)) {
+      if (/^[\s\d,;|]+$/.test(m[1]) && ints(m[1]).length) return pick2(ints(m[1]));
+    }
+    for (const at of [...d.matchAll(/allow\w*/gi)].reverse()) {
+      const tail = d.slice(at.index + at[0].length).split(/[.;\n(]/, 1)[0];
+      const r = /^[\s\w:=,|]*$/.test(tail) ? pick2(ints(tail)) : null;
+      if (r) return r;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+var echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+function kindNotAllowedMessage(kind, body) {
+  const allowed = parseAllowedKinds(body);
+  const desc = body && typeof body === "object" ? body.error_description : body;
+  const what = allowed ? `it currently allows {${allowed.join(", ")}}` : `it didn't say which kinds it allows${desc ? ` (Ekam said: "${echo(desc)}")` : ""}`;
+  return `Ekam (your signing service) doesn't sign kind ${kind} yet; ${what}. Ask the Ekam owner to add it, or use an agent's own key. (wire-sign HTTP 400 kind_not_allowed)`;
+}
 async function wireSign(base, token, template, fetchFn = fetch) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
@@ -19686,11 +19723,18 @@ async function wireSign(base, token, template, fetchFn = fetch) {
   });
   const text = await res.text();
   if (!res.ok) {
-    let detail = text.slice(0, 200);
+    let detail = text.slice(0, 200), j = null;
     try {
-      const j = JSON.parse(text);
+      j = JSON.parse(text);
       detail = j.error_description || j.error || detail;
     } catch {
+    }
+    if (res.status === 400 && j && typeof j === "object" && j.error === "kind_not_allowed") {
+      const err = new Error(kindNotAllowedMessage(template.kind, j));
+      err.code = "kind_not_allowed";
+      err.kind = template.kind;
+      err.allowedKinds = parseAllowedKinds(j);
+      throw err;
     }
     const hint = res.status === 403 ? " (token likely missing the wire:sign scope, or human suspended)" : res.status === 401 ? " (token revoked/expired, or wrong audience \u2014 must be minted resource=ISSUER)" : res.status === 503 ? " (escrow/Vault unavailable \u2014 transient)" : "";
     throw new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);
@@ -19834,7 +19878,7 @@ var CONFUSABLES = new Map(DATA.split(",").map((e) => {
 }));
 
 // names.mjs
-var CASE_ONLY_IS_AMBIGUOUS = true;
+var CASE_ONLY_IS_AMBIGUOUS = false;
 var INVISIBLE_CLASS = String.raw`\p{Bidi_Control}\p{Default_Ignorable_Code_Point}\p{Cf}\u00AD\u2061-\u2064\u{E0000}-\u{E007F}`;
 var INVISIBLE = new RegExp(`[${INVISIBLE_CLASS}]`, "u");
 var INVISIBLE_G = new RegExp(`[${INVISIBLE_CLASS}]`, "gu");
@@ -20558,6 +20602,216 @@ function screenInbound(events, verify, { mode = "drop", nowS = Math.floor(Date.n
 // buzz-mcp.mjs
 import { AsyncLocalStorage } from "node:async_hooks";
 
+// parity32.mjs
+var HEX642 = /^[0-9a-f]{64}$/i;
+var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function buildMessageLink({ channel, id, thread } = {}) {
+  const ch = String(channel || "").toLowerCase(), ev = String(id || "").toLowerCase();
+  if (!UUID.test(ch)) throw new Error("message link: channel must be a UUID");
+  if (!HEX642.test(ev)) throw new Error("message link: id must be a 64-hex event id");
+  let s = `buzz://message?channel=${ch}&id=${ev}`;
+  if (thread != null && thread !== "") {
+    const th = String(thread).toLowerCase();
+    if (!HEX642.test(th)) throw new Error("message link: thread must be a 64-hex event id");
+    if (th !== ev) s += `&thread=${th}`;
+  }
+  return s;
+}
+function parseMessageLink(input) {
+  const raw = String(input ?? "").trim();
+  if (!raw) throw new Error("message link is empty");
+  if (raw.length > 512) throw new Error("message link is too long");
+  if (/[\s\u0000-\u001f\u007f-\u009f]/.test(raw)) throw new Error("message link contains whitespace or control characters");
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("not a valid buzz:// message link");
+  }
+  if (u.protocol !== "buzz:") throw new Error("not a buzz:// link");
+  if (u.username || u.password) throw new Error("message link must not carry user info");
+  if (u.hash || raw.includes("#")) throw new Error("message link must not carry a fragment");
+  if (u.host !== "message") throw new Error('message link host must be "message"');
+  if (u.pathname && u.pathname !== "" && u.pathname !== "/") throw new Error("message link must have an empty path");
+  if (u.pathname === "/") throw new Error("message link must have an empty path");
+  const seen = {};
+  for (const [k, v] of u.searchParams) {
+    if (!["channel", "id", "thread"].includes(k)) throw new Error(`message link: unknown parameter "${escapeContent(k, { cap: 32 })}"`);
+    if (k in seen) throw new Error(`message link: duplicate "${k}"`);
+    if (!v) throw new Error(`message link: empty "${k}"`);
+    seen[k] = v;
+  }
+  if (!seen.channel) throw new Error('message link: missing "channel"');
+  if (!seen.id) throw new Error('message link: missing "id"');
+  if (!UUID.test(seen.channel)) throw new Error("message link: channel must be a UUID");
+  if (!HEX642.test(seen.id)) throw new Error("message link: id must be a 64-hex event id");
+  if (seen.thread != null && !HEX642.test(seen.thread)) throw new Error("message link: thread must be a 64-hex event id");
+  return { channel: seen.channel.toLowerCase(), id: seen.id.toLowerCase(), thread: seen.thread ? seen.thread.toLowerCase() : null };
+}
+function parseWhen(input, { end = false, now: now2 = Math.floor(Date.now() / 1e3) } = {}) {
+  if (input == null || input === "") return null;
+  if (typeof input === "number") {
+    if (!Number.isFinite(input) || input < 0 || input > 1e10) throw new Error(`bad time ${input} \u2014 epoch seconds expected`);
+    return Math.floor(input);
+  }
+  const s = String(input).trim();
+  if (/^\d{9,10}$/.test(s)) return Number(s);
+  const rel = /^(\d{1,5})\s*(m|h|d|w)$/i.exec(s);
+  if (rel) return now2 - Number(rel[1]) * { m: 60, h: 3600, d: 86400, w: 604800 }[rel[2].toLowerCase()];
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (day) {
+    const t = Date.UTC(+day[1], +day[2] - 1, +day[3]);
+    const d = new Date(t);
+    if (d.getUTCFullYear() !== +day[1] || d.getUTCMonth() !== +day[2] - 1 || d.getUTCDate() !== +day[3]) throw new Error(`bad date ${escapeContent(s, { cap: 40 })}`);
+    return Math.floor(t / 1e3) + (end ? 86399 : 0);
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/i.test(s)) {
+    const t = Date.parse(s);
+    if (Number.isFinite(t)) return Math.floor(t / 1e3);
+  }
+  throw new Error(`can't read the time ${escapeContent(s, { cap: 40 })} \u2014 use YYYY-MM-DD, an ISO datetime with a zone (\u2026Z or \u2026-07:00), epoch seconds, or an age like 24h / 7d`);
+}
+var DryRunStop = class extends Error {
+  constructor(template) {
+    super("dry run \u2014 stopped before signing");
+    this.name = "DryRunStop";
+    this.template = template;
+  }
+};
+var REDACT_TAGS = /* @__PURE__ */ new Set(["auth", "picker-owner"]);
+function redactTags(tags) {
+  return (tags || []).map((t) => Array.isArray(t) && REDACT_TAGS.has(t[0]) ? [t[0], "\u2039redacted\u203A"] : t);
+}
+var KIND_LABELS = {
+  0: "profile",
+  5: "deletion",
+  7: "reaction",
+  9: "chat message",
+  9e3: "add member",
+  9001: "remove member",
+  9002: "edit channel metadata",
+  9005: "delete message",
+  9007: "create channel",
+  9008: "delete channel",
+  9021: "join channel",
+  9022: "leave channel",
+  20001: "presence",
+  30315: "user status",
+  40003: "edit message",
+  41010: "open DM",
+  41011: "add to DM",
+  41012: "hide DM",
+  24242: "blossom upload auth"
+};
+function dryRunPreview(tool, template, { notes = [] } = {}) {
+  const t = template || {};
+  const tags = redactTags(t.tags);
+  const lines = [
+    `DRY RUN \u2014 ${tool}: nothing was signed or sent.`,
+    `would sign: kind ${t.kind}${KIND_LABELS[t.kind] ? ` (${KIND_LABELS[t.kind]})` : ""}`,
+    `tags (${tags.length}):`,
+    ...tags.map((x) => "  " + escapeContent(JSON.stringify(x), { cap: 300 })),
+    `content: ${t.content ? escapeContent(t.content, { cap: 2e3 }) : "(empty)"}`,
+    ...notes.map((n) => "note: " + n)
+  ];
+  return lines.join("\n");
+}
+function openChannelsFromMeta(evs) {
+  const byId = /* @__PURE__ */ new Map();
+  for (const e of evs || []) {
+    if (!e || e.kind !== 39e3) continue;
+    const d = ((e.tags || []).find((t) => t[0] === "d") || [])[1];
+    if (!d) continue;
+    const prev = byId.get(d);
+    if (!prev || (e.created_at || 0) > (prev.created_at || 0)) byId.set(d, e);
+  }
+  const out = [];
+  for (const [id, e] of byId) {
+    const tags = e.tags || [];
+    if (tags.some((t) => t[0] === "private" || t[0] === "hidden")) continue;
+    if (tags.some((t) => t[0] === "t" && t[1] === "dm")) continue;
+    const g = (k) => (tags.find((t) => t[0] === k) || [])[1] || "";
+    out.push({ id, name: g("name") || "(unnamed)", about: g("about"), archived: tags.some((t) => t[0] === "archived"), at: e.created_at || 0 });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+function filesFromEvents(evs, { chId } = {}) {
+  const out = [];
+  for (const e of evs || []) {
+    if (!e || e.kind !== 9) continue;
+    if (chId && !(e.tags || []).some((t) => t[0] === "h" && t[1] === chId)) continue;
+    const atts = (e.tags || []).filter((t) => Array.isArray(t) && t[0] === "imeta").map(parseImeta).filter(Boolean);
+    atts.forEach((a, i2) => out.push({ event: e, index: i2, ...a }));
+  }
+  return out.sort((a, b) => (b.event.created_at || 0) - (a.event.created_at || 0));
+}
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return "?";
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
+}
+var PRESENCE_STATUSES = /* @__PURE__ */ new Set(["online", "away", "offline"]);
+function presenceFromEvents(evs, relaySelf, verify, wanted) {
+  const want = new Set(wanted || []);
+  const m = /* @__PURE__ */ new Map();
+  if (!relaySelf) return m;
+  for (const e of evs || []) {
+    if (!e || e.kind !== 20001 && e.kind !== 40902) continue;
+    if (e.pubkey !== relaySelf) continue;
+    if (verify) {
+      let v = false;
+      try {
+        v = !!verify(JSON.parse(JSON.stringify(e)));
+      } catch {
+        v = false;
+      }
+      if (!v) continue;
+    }
+    const subj = ((e.tags || []).find((t) => t[0] === "p" && /^[0-9a-f]{64}$/.test(t[1] || "")) || [])[1];
+    if (!subj || want.size && !want.has(subj)) continue;
+    const st = String(e.content || "").trim().toLowerCase();
+    const status = PRESENCE_STATUSES.has(st) ? st : "unknown";
+    const prev = m.get(subj);
+    if (!prev || (e.created_at || 0) > prev.at) m.set(subj, { status, at: e.created_at || 0, raw: st });
+  }
+  return m;
+}
+var CUSTOM_EMOJI_D = "buzz:custom-emoji";
+function normalizeShortcode(raw) {
+  const s = String(raw ?? "").trim().replace(/^:+/, "").replace(/:+$/, "").toLowerCase();
+  return s.length && s.length <= 64 && /^[a-z0-9_-]+$/.test(s) ? s : null;
+}
+var okUrl = (u) => {
+  try {
+    const x = new URL(String(u));
+    return (x.protocol === "https:" || x.protocol === "http:") && !x.username && !x.password;
+  } catch {
+    return false;
+  }
+};
+function emojiFromTags(tags) {
+  const seen = /* @__PURE__ */ new Set(), out = [];
+  for (const t of tags || []) {
+    if (!Array.isArray(t) || t[0] !== "emoji" || !t[1] || !t[2]) continue;
+    const sc = normalizeShortcode(t[1]);
+    if (!sc || seen.has(sc) || !okUrl(t[2]) || String(t[2]).length > 2048) continue;
+    seen.add(sc);
+    out.push({ shortcode: sc, url: String(t[2]) });
+  }
+  return out;
+}
+function emojiPalette(evs) {
+  const by = /* @__PURE__ */ new Map();
+  for (const e of evs || []) {
+    if (!e || e.kind !== 30030) continue;
+    if (!(e.tags || []).some((t) => t[0] === "d" && t[1] === CUSTOM_EMOJI_D)) continue;
+    for (const { shortcode, url } of emojiFromTags(e.tags)) {
+      const w = by.get(shortcode), at = e.created_at || 0;
+      if (!w || at > w.at || at === w.at && url < w.url) by.set(shortcode, { url, at, pubkey: e.pubkey });
+    }
+  }
+  return [...by].map(([shortcode, v]) => ({ shortcode, url: v.url, pubkey: v.pubkey })).sort((a, b) => a.shortcode.localeCompare(b.shortcode));
+}
+
 // wirelogin.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -20854,7 +21108,7 @@ async function nip98(url, method, body) {
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.31";
+var SHIM_VERSION = "0.2.32";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -20948,6 +21202,18 @@ function ageStr(ms) {
 var TRANSPORT_WEDGED = false;
 var REQ_CTX = new AsyncLocalStorage();
 var reqSignal = () => REQ_CTX.getStore()?.signal;
+var isDryRun = () => REQ_CTX.getStore()?.dryRun === true;
+{
+  const realSign = signer.sign.bind(signer);
+  signer.sign = async (template) => {
+    const c = REQ_CTX.getStore();
+    if (c && c.dryRun === true && !(template && template.kind === 27235)) {
+      if (!c.dryStop) c.dryStop = template;
+      throw new DryRunStop(template);
+    }
+    return realSign(template);
+  };
+}
 function withCancel(signal) {
   const s = reqSignal();
   return s && typeof AbortSignal.any === "function" ? AbortSignal.any([signal, s]) : signal;
@@ -21027,6 +21293,7 @@ function rawGet(urlStr, headers, timeoutMs) {
   });
 }
 async function bridgeCore(path, bodyObj) {
+  if (path === "/events" && isDryRun()) throw new Error("dry run: refusing to send an event");
   const dialUrl = `${RELAY}${path}`;
   const signUrl = `${SIGN_BASE}${path}`;
   const body = JSON.stringify(bodyObj);
@@ -21121,6 +21388,7 @@ async function blossomAuthHeader(verb, sha) {
 }
 var DOWNLOAD_CHUNK = 16 * MB;
 async function blossomUpload(filePath, expectId) {
+  if (isDryRun()) throw new Error("dry run: refusing to upload");
   const { fd, size } = openCheckedAttachment(filePath, expectId);
   const st = { size };
   let src, mime, sha;
@@ -21244,7 +21512,7 @@ var AGENT_HARNESS = process.env.BUZZ_HARNESS || "claude-code";
 var AGENT_INTERFACE = process.env.BUZZ_INTERFACE || "terminal";
 var KIND_AGENT_PROFILE = 10100;
 async function publishProfile(name) {
-  MY_NAME = name;
+  if (!isDryRun()) MY_NAME = name;
   const host = hostname().split(".")[0];
   const profile = {
     display_name: name,
@@ -21608,11 +21876,27 @@ function channelAboutError(about) {
   return null;
 }
 var CONFIRM = createConfirmGate();
-var gate = (kind, a, label) => CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: a && a.confirm, label });
-var wireBlocked = (kind, tool) => signer.canSign(kind) ? null : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist \u2014 it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`;
+var gate = (kind, a, label) => {
+  const c = REQ_CTX.getStore();
+  if (c && c.dryRun === true) {
+    const r = CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: false, label });
+    if (r) (c.dryNotes || (c.dryNotes = [])).push(`the real run needs confirm: true (${label}, kind ${kind}, signed as you)`);
+    return null;
+  }
+  return CONFIRM.check(kind, { wire: signer.mode === "wire", confirm: a && a.confirm, label });
+};
+var wireBlocked = (kind, tool) => signer.canSign(kind) ? null : EKAM_REFUSED_BY_DESIGN.has(kind) ? `${tool}: kind ${kind} (${EKAM_REFUSED_BY_DESIGN.get(kind)}) is blocked on Ekam wire-sign allowlist \u2014 Ekam deliberately doesn't sign it "as you" ("post as me"), so nothing was sent. Use an agent-mode session (an agent's own key) for this.` : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist \u2014 it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`;
 async function uploadAttachments(input) {
   const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR2, IDENTITY_DIR, WIRE_REFRESH_DIR] });
   const ups = [];
+  if (isDryRun()) {
+    for (const f of r.files) {
+      const size = statSync2(f).size;
+      const { mime } = mediaCapCheck(basename2(f), size);
+      ups.push({ dry: true, url: `(dry run \u2014 ${basename2(f)} not uploaded)`, filename: basename2(f), size, mime });
+    }
+    return { r, ups };
+  }
   for (const f of r.files) {
     throwIfCancelled();
     ups.push(await blossomUpload(f, r.ids && r.ids[f]));
@@ -21856,12 +22140,12 @@ var EV = { type: "string", description: "the target message's <id> (from buzz_re
 var TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
   { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "buzz_channels", description: "List channels in the Buzz workspace.", inputSchema: { type: "object", properties: {} } },
+  { name: "buzz_channels", description: "List channels. Default `scope: \"member\"` = the channels you're in. `scope: \"open\"` browses the workspace's OPEN channels (like Slack's channel browser) \u2014 private and DM channels are never listed; ones you've joined are marked \u2713, others can be joined by id with buzz_join_channel.", inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["member", "open"], description: '"member" (default) or "open"' } } } },
   { name: "buzz_create_channel", description: 'Create a new channel (NIP-29 kind 9007), as you \u2014 you become its owner. `name` is required. `visibility`: "private" (invite-only; the DEFAULT \u2014 fail-closed) or "open" (searchable, anyone self-joins). `type`: "stream" (default) or "forum". Optional `description`, and `ttl` (seconds \u2014 an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.', inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; \u226480 chars, no control characters)" }, visibility: { type: "string", description: '"private" (default) or "open"' }, type: { type: "string", description: '"stream" (default) or "forum"' }, description: { type: "string", description: "optional channel description/about (\u2264500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
   { name: "buzz_edit_channel", description: 'Edit a channel\'s metadata (NIP-29 kind 9002), as you \u2014 owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` ("open"/"private"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.', inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (\u226480 chars, no control characters)" }, visibility: { type: "string", description: '"open" or "private"' }, description: { type: "string", description: "new about/description (empty string clears it; \u2264500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
   { name: "buzz_join_channel", description: "Join an OPEN channel yourself (NIP-29 kind 9021). Idempotent \u2014 a no-op if you're already a member. Private channels can't be self-joined (an owner/admin must invite you via buzz_add_member) \u2014 the shim refuses a private target client-side when it can tell, rather than signing a request the relay bounces. `channel` = a channel name (if you can already see it) or its id (UUID \u2014 needed for an open channel you're not in yet).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name or id (UUID)" } }, required: ["channel"] } },
   { name: "buzz_agents", description: "List known agents/people (display name + pubkey) on the relay.", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_search", description: "Full-text search recent messages across your channels (NIP-50). Optional `channel` to scope, `limit` (default 20).", inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
+  { name: "buzz_search", description: 'Search recent messages across your channels and DMs (NIP-50 full text), with Slack-style filters: `from` (a person \u2014 npub / hex / email in wire mode / exact display name, or "me"; resolved fail-closed), `after` / `before` (YYYY-MM-DD, an ISO datetime with a zone, epoch seconds, or an age like 24h / 7d), `in` ("all" default, "channels", or "dms"), `channel` to scope to one channel, `limit` (default 20, max 100). `query` may be empty when a filter is given.', inputSchema: { type: "object", properties: { query: { type: "string" }, channel: { type: "string" }, from: { type: "string", description: 'only messages by this person (npub / hex / email / exact display name / "me")' }, after: { type: "string", description: "only messages at/after this time (YYYY-MM-DD, ISO datetime with zone, epoch seconds, or 24h / 7d)" }, before: { type: "string", description: "only messages at/before this time (YYYY-MM-DD = through the end of that UTC day)" }, in: { type: "string", enum: ["all", "channels", "dms"], description: '"all" (default), "channels" or "dms"' }, limit: { type: "number" } } } },
   { name: "buzz_channel_members", description: "List the members of a channel (display name + owner/member role).", inputSchema: { type: "object", properties: { channel: { type: "string" } }, required: ["channel"] } },
   { name: "buzz_read", description: "Read recent messages in a channel (by name or id).", inputSchema: { type: "object", properties: { channel: { type: "string" }, limit: { type: "number" } }, required: ["channel"] } },
   { name: "buzz_post", description: "Post a message to a channel. The body goes in `text` (its alias `message` is also accepted). Use @Name to mention an agent (resolved to a p-tag so the agent is triggered). Optional `attachment` = a local file path to upload and attach.", inputSchema: { type: "object", properties: { channel: { type: "string" }, text: { type: "string" }, message: { type: "string", description: "alias for `text` (accepted if `text` is omitted)" }, attachment: { type: "string", description: "local file path to upload + attach (image/doc/video, per-type size caps apply)" } }, required: ["channel"] } },
@@ -21882,20 +22166,26 @@ var TOOLS = [
   { name: "buzz_login", description: "Sign in as YOURSELF for \"post as me\" (Ekam wire-sign OAuth) WITHOUT a terminal \u2014 for GUI/desktop (Claude Desktop/MCPB) clients that can't run the buzz-mcp-login CLI. NON-BLOCKING: the first call returns a URL to approve in your browser (it also tries to open it) and returns immediately; after you approve, call buzz_login again \u2014 or buzz_whoami \u2014 to confirm. Idempotent: if you're already connected it says so. Optional `client_id` (else env BUZZ_EKAM_CLIENT_ID).", inputSchema: { type: "object", properties: { client_id: { type: "string", description: "Ekam OAuth client id (from DCR); falls back to env BUZZ_EKAM_CLIENT_ID" } } } },
   { name: "buzz_doctor", description: "Diagnose why Buzz reads/posts are failing, WITHOUT using the shim's normal (possibly-wedged) transport \u2014 it probes the relay over a brand-new node:https socket. Read-only; no writes. Returns a structured diagnosis: (1) relay answers but your normal client is stuck \u2192 WEDGED CLIENT POOL \u2192 restart your MCP client; (2) the relay does not answer \u2192 RELAY UNREACHABLE \u2192 wait / check status; (3) an authed probe is rejected \u2192 LAPSED GRANT \u2192 re-run buzz_login; (4) reads/auth are healthy but your recent posts have been failing \u2192 POSTS FAILING (READS OK) \u2192 retry / report in #buzz-help. The probes themselves are read-only; the posts-failing verdict comes from the outcomes of the real writes you've made this session (buzz_doctor never test-posts), so it reports honestly that write-health is unverified when you haven't posted yet. Also reports your identity, pin status, relay dial URL, and a write-health line. Connector-side probe only \u2014 not the authoritative relay health signal. Optional `timeout_s` (default 5).", inputSchema: { type: "object", properties: { timeout_s: { type: "number", description: "per-probe timeout in seconds (default 5, max 30)" } } } },
   // ---- v0.2.31 Slack-parity tools ----
-  { name: "buzz_edit_message", description: "Edit one of YOUR OWN messages (kind 40003, h + e tags; new text \u2264 64 KB). Clients show the edited text marked (edited). Not available in wire / post-as-me mode yet (kind 40003 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, event: EV, text: { type: "string", description: "the replacement text" }, message: { type: "string", description: "alias for `text`" } }, required: ["channel", "event"] } },
+  { name: "buzz_edit_message", description: "Edit one of YOUR OWN messages (kind 40003, h + e tags; new text \u2264 64 KB). Clients show the edited text marked (edited). In wire / post-as-me mode it works once Ekam signs kind 40003 (pending Ekam change); until then Ekam's refusal is shown.", inputSchema: { type: "object", properties: { channel: CH, event: EV, text: { type: "string", description: "the replacement text" }, message: { type: "string", description: "alias for `text`" } }, required: ["channel", "event"] } },
   { name: "buzz_thread_read", description: "Read a whole thread: the root message plus every reply (NIP-10). `event` may be the root or any reply in it.", inputSchema: { type: "object", properties: { channel: CH, event: EV, limit: { type: "number", description: "max replies (default 50, max 200)" } }, required: ["channel", "event"] } },
   { name: "buzz_channel_topic", description: "Set or clear a channel's topic and/or purpose (kind 9002, owner/admin only \u2014 relay-enforced). Empty string clears.", inputSchema: { type: "object", properties: { channel: CH, topic: { type: "string", description: "new topic (\u2264500 chars; empty clears)" }, purpose: { type: "string", description: "new purpose (\u2264500 chars; empty clears)" }, confirm: CONFIRM_PROP }, required: ["channel"] } },
-  { name: "buzz_leave_channel", description: "Leave a channel you're in (kind 9022). Not available in wire / post-as-me mode yet (kind 9022 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH }, required: ["channel"] } },
+  { name: "buzz_leave_channel", description: "Leave a channel you're in (kind 9022). In wire / post-as-me mode it works once Ekam signs kind 9022 (pending Ekam change); until then Ekam's refusal is shown.", inputSchema: { type: "object", properties: { channel: CH }, required: ["channel"] } },
   { name: "buzz_archive_channel", description: "Archive (read-only for everyone) or unarchive a channel (kind 9002 archived tag; owner/admin only). Archiving needs `confirm: true`. `archived` defaults to true; pass false to unarchive.", inputSchema: { type: "object", properties: { channel: CH, archived: { type: "boolean", description: "true = archive (default), false = unarchive" }, confirm: CONFIRM_PROP }, required: ["channel"] } },
-  { name: "buzz_delete_channel", description: "Permanently delete a channel (kind 9008; owner only \u2014 relay-enforced). Always needs `confirm: true`. Not available in wire / post-as-me mode yet (kind 9008 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, confirm: CONFIRM_PROP }, required: ["channel"] } },
+  { name: "buzz_delete_channel", description: "Permanently delete a channel (kind 9008; owner only \u2014 relay-enforced). Always needs `confirm: true`. Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 9008) \u2014 agent key only.", inputSchema: { type: "object", properties: { channel: CH, confirm: CONFIRM_PROP }, required: ["channel"] } },
   { name: "buzz_profile", description: "Look up a person's profile (kind 0) by npub / hex pubkey / email (wire mode) / exact display name. Read-only; profile fields are shown escaped as untrusted text.", inputSchema: { type: "object", properties: { user: { type: "string", description: "npub / hex pubkey / email / exact display name" } }, required: ["user"] } },
-  { name: "buzz_unreact", description: "Remove YOUR reaction from a message (kind 5 deletion with one e tag = your reaction's id). Optional `emoji` removes only that one; otherwise all of yours on the message. Not available in wire / post-as-me mode yet (kind 5 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, event: EV, emoji: { type: "string", description: "only remove this emoji (default: all of yours on the message)" } }, required: ["channel", "event"] } },
+  { name: "buzz_unreact", description: "Remove YOUR reaction from a message (kind 5 deletion with one e tag = your reaction's id). Optional `emoji` removes only that one; otherwise all of yours on the message. Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 5) \u2014 agent key only.", inputSchema: { type: "object", properties: { channel: CH, event: EV, emoji: { type: "string", description: "only remove this emoji (default: all of yours on the message)" } }, required: ["channel", "event"] } },
   { name: "buzz_reactions", description: "List the reactions on a message, grouped by emoji, with who reacted. Read-only; reactions their author removed (kind 5) are left out.", inputSchema: { type: "object", properties: { channel: CH, event: EV }, required: ["channel", "event"] } },
   { name: "buzz_dm_add", description: "Add a person to an existing DM conversation you're in (kind 41011; at most 9 people total). They can see its prior history, so in wire / post-as-me mode the first add of the session needs `confirm: true`.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id (from buzz_dm_list)" }, user: { type: "string", description: "npub / hex pubkey / email / exact display name" }, confirm: CONFIRM_PROP }, required: ["channel", "user"] } },
-  { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode yet (kind 41012 is not on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } }
+  // ---- v0.2.32 Slack-parity tools (read-only) ----
+  { name: "buzz_message_link", description: "Get a shareable link to a message, or open one. With `channel` + `event` (the <id> from buzz_read) \u2192 the canonical buzz://message?channel=\u2026&id=\u2026[&thread=\u2026] link (thread = the root when it's a reply). With `link` \u2192 the message it points to, shown only if you can read that channel and the message really belongs to it (fail-closed; malformed links are refused).", inputSchema: { type: "object", properties: { channel: CH, event: EV, link: { type: "string", description: "a buzz://message?\u2026 link to open" } } } },
+  { name: "buzz_activity", description: "Your activity feed (like Slack's Activity / Mentions): @mentions of you, items needing your action, and activity in your channels, from the relay's feed (feed_types). Falls back to an @mention scan when the relay has no feed support. `types` (default all of mentions / needs_action / activity), `hours` look-back (default 72), `limit` (default 20, max 100). Read-only; feed text is untrusted.", inputSchema: { type: "object", properties: { types: { type: "array", items: { type: "string", enum: ["mentions", "needs_action", "activity"] }, description: "which feed types (default all)" }, hours: { type: "number", description: "look-back window in hours (default 72)" }, limit: { type: "number" } } } },
+  { name: "buzz_files", description: "List the files shared in a channel (or DM): filename, type, size, who shared it, when, and the message <id> + `index` to pass to buzz_attachment_read. Read-only; nothing is downloaded. `limit` = messages scanned (default 200, max 500).", inputSchema: { type: "object", properties: { channel: CH, limit: { type: "number", description: "messages to scan (default 200, max 500)" } }, required: ["channel"] } },
+  { name: "buzz_presence", description: "Who's online: presence for one or more people (`users`: npub / hex / email in wire mode / exact display name), or for a channel's members (`channel`). Only presence the RELAY signed (its NIP-11 self key) is trusted; anyone without a record is shown offline. Read-only.", inputSchema: { type: "object", properties: { users: { type: "array", items: { type: "string" }, maxItems: 50, description: "people to look up" }, channel: CH } } },
+  { name: "buzz_emoji", description: "List the workspace's custom emoji (the union of every member's NIP-30 kind:30030 set): :shortcode: and image URL. Optional `query` filters by shortcode substring. Read-only; the URLs are listed as text and never fetched.", inputSchema: { type: "object", properties: { query: { type: "string", description: "only shortcodes containing this" } } } },
+  { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 41012) \u2014 agent key only.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } }
 ];
 var ANNOTATIONS = {
-  readOnly: ["buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
+  readOnly: ["buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
   destructive: ["buzz_remove_member", "buzz_delete", "buzz_edit_channel", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_unreact", "buzz_edit_message", "buzz_status_clear", "buzz_dm_hide"],
   idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel"]
 };
@@ -21922,8 +22212,16 @@ var ARG_BOUNDS = {
   name: { maxLength: 400 },
   description: { maxLength: 2e3 },
   topic: { maxLength: 2e3 },
-  purpose: { maxLength: 2e3 }
+  purpose: { maxLength: 2e3 },
+  from: { maxLength: 320 },
+  after: { maxLength: 40 },
+  before: { maxLength: 40 },
+  link: { maxLength: 512 },
+  scope: { maxLength: 16 },
+  in: { maxLength: 16 }
 };
+var DRY_RUN_PROP = { type: "boolean", description: "preview only: resolve everything and show the exact event that would be signed (auth tags redacted) \u2014 nothing is signed, uploaded or sent" };
+var DRY_RUN_TOOLS = new Set(TOOLS.map((t) => t.name).filter((n) => !ANNOTATIONS.readOnly.includes(n) && n !== "buzz_login"));
 for (const t of TOOLS) {
   const sc = t.inputSchema;
   sc.additionalProperties = false;
@@ -21937,6 +22235,9 @@ for (const t of TOOLS) {
     }
   }
   if (["buzz_remove_member", "buzz_delete", "buzz_edit_channel"].includes(t.name)) sc.properties.confirm = CONFIRM_PROP;
+  if (DRY_RUN_TOOLS.has(t.name)) sc.properties.dry_run = DRY_RUN_PROP;
+  if (t.name === "buzz_files" && sc.properties.limit) sc.properties.limit.maximum = 500;
+  if (t.name === "buzz_activity" && sc.properties.limit) sc.properties.limit.maximum = 100;
   if (t.name === "buzz_search" && sc.properties.limit) sc.properties.limit.maximum = 100;
   const ro = ANNOTATIONS.readOnly.includes(t.name);
   t.annotations = {
@@ -21986,7 +22287,18 @@ var keyProvenance = () => {
 var pendingLogin = null;
 server.setRequestHandler(CallToolRequestSchema, async (req, extra = {}) => {
   const store = { signal: extra.signal, sendNotification: extra.sendNotification, progressToken: req.params && req.params._meta && req.params._meta.progressToken };
-  return REQ_CTX.run(store, () => callTool(req));
+  const nm = req.params && req.params.name, args = req.params && req.params.arguments || {};
+  if (args.dry_run === true && DRY_RUN_TOOLS.has(nm)) store.dryRun = true;
+  const res = await REQ_CTX.run(store, () => callTool(req));
+  if (store.dryRun) {
+    if (store.dryStop) return { content: [{ type: "text", text: dryRunPreview(nm, store.dryStop, { notes: store.dryNotes || [] }) }] };
+    if (res && !res.isError) {
+      const txt = ((res.content || [])[0] || {}).text || "";
+      return { content: [{ type: "text", text: `DRY RUN \u2014 ${nm}: nothing was signed or sent (this call would not have signed anything).
+${txt}` }] };
+    }
+  }
+  return res;
 });
 async function callTool(req) {
   const { name, arguments: a = {} } = req.params;
@@ -22026,6 +22338,20 @@ async function callTool(req) {
       return ok(`renamed this session to "${a.name}" on the fleet.`);
     }
     if (name === "buzz_channels") {
+      const scopeArg = a.scope == null ? "member" : String(a.scope);
+      if (!["member", "open"].includes(scopeArg)) return fail(`buzz_channels: scope must be "member" or "open"`);
+      if (scopeArg === "open") {
+        const open2 = openChannelsFromMeta(screen(await query([{ kinds: [39e3], limit: 500 }])).events);
+        let mine = /* @__PURE__ */ new Set();
+        try {
+          mine = new Set((await channels()).map((c) => c.id));
+        } catch {
+        }
+        const lines = open2.map((c) => `${mine.has(c.id) ? "\u2713" : " "} #${escapeName(c.name)}  [${escapeName(c.id)}]${c.archived ? "  (archived)" : ""}${c.about ? `  ${escapeContent(c.about, { cap: 300 })}` : ""}`);
+        return ok(`Open channels \u2014 ${open2.length} (\u2713 = you're a member; join others by id with buzz_join_channel):
+${UNTRUSTED_NOTE}
+` + (lines.join("\n") || "(none visible)") + (open2.length >= 500 ? "\n(the directory read is capped at 500 channels)" : ""));
+      }
       const cs = await channels();
       return ok(`${UNTRUSTED_NOTE}
 ` + (cs.length ? cs.map((c) => `#${escapeName(c.name)}  [${escapeName(c.id)}]${c.about ? `  ${escapeContent(c.about, { cap: 500 })}` : ""}`).join("\n") : "(no channels)"));
@@ -22051,25 +22377,66 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
     }
     if (name === "buzz_search") {
       const q = String(a.query || "").trim();
-      if (!q) throw new Error("buzz_search needs a `query` string");
+      const inArg = a.in == null ? "all" : String(a.in);
+      if (!["all", "channels", "dms"].includes(inArg)) return fail(`buzz_search: \`in\` must be "all", "channels" or "dms"`);
+      const hasFilter = a.from != null || a.after != null || a.before != null || a.channel != null || inArg !== "all";
+      if (!q && !hasFilter) throw new Error("buzz_search needs a `query` string (or a filter: from / after / before / in / channel)");
       const names = await profiles();
       const cs = await channels();
-      const chById = Object.fromEntries(cs.map((c) => [c.id, c.name]));
-      const filt = { kinds: [9], search: q, limit: clampLimit(a.limit, 20, 100) };
-      let scope = "";
+      let dms = [];
+      try {
+        dms = await dmChannels();
+      } catch {
+        dms = [];
+      }
+      const dmIds = new Set(dms.map((d) => d.id));
+      const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+      for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+      const filt = { kinds: [9], limit: clampLimit(a.limit, 20, 100) };
+      if (q) filt.search = q;
+      const scopeBits = [];
       if (a.channel) {
         const ch = await resolveChannel(a.channel);
         filt["#h"] = [ch.id];
-        scope = ` in #${escapeName(ch.name)}`;
+        scopeBits.push(`in #${escapeName(ch.name)}`);
+      } else if (inArg === "channels") {
+        const ids = cs.map((c) => c.id).filter((id) => !dmIds.has(id));
+        if (!ids.length) return ok("search: you're not in any channels.");
+        filt["#h"] = ids;
+        scopeBits.push("in channels");
+      } else if (inArg === "dms") {
+        if (!dms.length) return ok("search: you have no DM conversations.");
+        filt["#h"] = [...dmIds];
+        scopeBits.push("in DMs");
       }
+      let fromPk = null;
+      if (a.from != null) {
+        const f = String(a.from).trim();
+        fromPk = /^me$/i.test(f) ? PK : await resolveRecipient(f);
+        filt.authors = [fromPk];
+        scopeBits.push(`from ${who(fromPk)}`);
+      }
+      const since = a.after != null ? parseWhen(a.after) : null;
+      const until = a.before != null ? parseWhen(a.before, { end: true }) : null;
+      if (since != null) {
+        filt.since = since;
+        scopeBits.push(`after ${fmtTime(since, true)}`);
+      }
+      if (until != null) {
+        filt.until = until;
+        scopeBits.push(`before ${fmtTime(until, true)}`);
+      }
+      if (since != null && until != null && since > until) return fail("buzz_search: `after` is later than `before` \u2014 nothing can match");
       void names;
       const scr = screen(await query([filt]));
-      const rows = scr.events.sort((x, y) => y.created_at - x.created_at).map((e) => {
+      const hits = scr.events.filter((e) => (!fromPk || e.pubkey === fromPk) && (since == null || e.created_at >= since) && (until == null || e.created_at <= until));
+      const rows = hits.sort((x, y) => y.created_at - x.created_at).map((e) => {
         const hTag = (e.tags || []).find((t) => t[0] === "h");
-        const chan = hTag ? chById[hTag[1]] || hTag[1].slice(0, 8) : "?";
-        return `#${escapeName(chan)} ${row(e, { withDate: true, flagOf: scr.flagOf })}`;
+        const chan = hTag ? labelOf.get(hTag[1]) || `#${escapeName(hTag[1].slice(0, 8))}` : "?";
+        return `${chan} ${row(e, { withDate: true, flagOf: scr.flagOf })}`;
       });
-      return ok(`search "${escapeContent(q)}"${scope} \u2192 ${rows.length} result(s):
+      const scope = scopeBits.length ? " " + scopeBits.join(", ") : "";
+      return ok(`search ${q ? `"${escapeContent(q)}"` : "(no text)"}${scope} \u2192 ${rows.length} result(s):
 ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
 ` + (rows.join("\n") || "(none)"));
     }
@@ -22098,7 +22465,7 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
       if (a.attachment) {
         attached = await uploadAttachments(a.attachment);
         for (const up of attached.ups) {
-          tags.push(buildImeta(up));
+          if (!up.dry) tags.push(buildImeta(up));
           content = content ? `${content}
 ${up.url}` : up.url;
         }
@@ -22180,12 +22547,25 @@ ${fence.replace("BEGIN", "END")}`);
       const author = hit.pubkey || "", tkind = hit.kind || 9;
       const emoji2 = a.emoji && String(a.emoji).trim() || "\u{1F44D}";
       const tmpl = reactionTemplate({ targetId, targetAuthor: author, targetKind: tkind, channelId: ch.id, emoji: emoji2 });
+      let customNote = "";
+      if (/^:[A-Za-z0-9_-]{1,64}:$/.test(emoji2)) {
+        try {
+          const sc = emoji2.slice(1, -1).toLowerCase();
+          const hitE = emojiPalette(screen(await query([{ kinds: [30030], "#d": [CUSTOM_EMOJI_D], limit: 500 }])).events).find((x) => x.shortcode === sc);
+          if (hitE) {
+            tmpl.content = `:${sc}:`;
+            tmpl.tags.push(["emoji", sc, hitE.url]);
+          } else customNote = ` (no custom emoji :${escapeName(sc)}: in the workspace palette \u2014 sent as text)`;
+        } catch {
+          customNote = " (custom emoji palette unavailable \u2014 sent as text)";
+        }
+      }
       if (AUTH_TAG) tmpl.tags.push(AUTH_TAG);
       const ev = await signer.sign(tmpl);
       await bridge("/events", ev);
       if (author) await profiles();
       const whoL = author ? who(author) : "";
-      return ok(`reacted ${emoji2} to ${whoL ? `${whoL}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}`);
+      return ok(`reacted ${escapeName(emoji2)} to ${whoL ? `${whoL}'s ` : ""}message <${String(targetId).slice(0, 8)}> in #${escapeName(ch.name)}${customNote}`);
     }
     if (name === "buzz_reply") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not replying as the wrong identity.` }], isError: true };
@@ -22218,7 +22598,7 @@ ${fence.replace("BEGIN", "END")}`);
       if (a.attachment) {
         attached = await uploadAttachments(a.attachment);
         for (const up of attached.ups) {
-          tags.push(buildImeta(up));
+          if (!up.dry) tags.push(buildImeta(up));
           content = content ? `${content}
 ${up.url}` : up.url;
         }
@@ -22784,6 +23164,134 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         `  auth tag (config): ${authTagLine}`,
         `  writes: ${writeLine}`
       ].join("\n"));
+    }
+    if (name === "buzz_message_link") {
+      if (a.link != null) {
+        if (a.channel != null || a.event != null) return fail("buzz_message_link: pass either `link`, or `channel` + `event` \u2014 not both");
+        const L = parseMessageLink(a.link);
+        const ch2 = await resolveChannel(L.channel).catch(() => null) || (await dmChannels().catch(() => [])).find((d) => d.id === L.channel);
+        if (!ch2) return fail(`buzz_message_link: that link is for a channel you can't read (${escapeName(L.channel)}) \u2014 join it first (buzz_channels scope:"open")`);
+        await profiles();
+        const hit2 = screen(await query([{ ids: [L.id], "#h": [ch2.id], limit: 1 }])).events[0];
+        if (!hit2 || !(hit2.tags || []).some((t) => t[0] === "h" && t[1] === ch2.id))
+          return fail(`buzz_message_link: message ${L.id.slice(0, 8)}\u2026 isn't in that channel (or was deleted / its signature didn't verify)`);
+        const edits = await latestEdits(ch2.id, [hit2]);
+        const root2 = threadRootOf(hit2);
+        const label = ch2.name ? `#${escapeName(ch2.name)}` : "DM";
+        return ok(`${UNTRUSTED_NOTE}
+${label}${root2 !== hit2.id ? ` (reply in thread <${root2.slice(0, 8)}>)` : ""}
+${renderMsg(hit2, { edits, withDate: true })}`);
+      }
+      if (!a.channel || !a.event) return fail("buzz_message_link needs `channel` + `event` (to make a link) or `link` (to open one)");
+      const ch = await resolveChannel(a.channel);
+      const hit = await resolveEventInChannel(ch.id, ch.name, a.event);
+      const root = threadRootOf(hit);
+      const link = buildMessageLink({ channel: ch.id, id: hit.id, thread: root !== hit.id ? root : null });
+      return ok(`${link}
+(message <${String(hit.id).slice(0, 8)}> in #${escapeName(ch.name)}${root !== hit.id ? `, a reply in thread <${root.slice(0, 8)}>` : ""} \u2014 open it with buzz_message_link { link })`);
+    }
+    if (name === "buzz_activity") {
+      const TYPES = ["mentions", "needs_action", "activity"];
+      let types = TYPES;
+      if (a.types != null) {
+        if (!Array.isArray(a.types) || !a.types.length || a.types.some((t) => !TYPES.includes(t))) return fail(`buzz_activity: \`types\` must be a non-empty list of ${TYPES.join(" / ")}`);
+        types = [...new Set(a.types)];
+      }
+      const hours = Number.isFinite(a.hours) && a.hours > 0 ? Math.min(a.hours, 720) : 72;
+      const since = Math.floor(Date.now() / 1e3) - Math.floor(hours * 3600);
+      const limit = clampLimit(a.limit, 20, 100);
+      await profiles();
+      let cs = [], dms = [];
+      try {
+        cs = await channels();
+      } catch {
+      }
+      try {
+        dms = await dmChannels();
+      } catch {
+      }
+      const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+      for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+      let evs = null, source = "relay feed";
+      try {
+        evs = await query([{ feed_types: types, "#p": [PK], since, limit }]);
+      } catch (e) {
+        evs = null;
+        source = `@mention scan (relay feed unavailable: ${escapeContent(e && e.message, { cap: 120 })})`;
+      }
+      if (!Array.isArray(evs)) {
+        evs = await query([{ kinds: [9], "#p": [PK], since, limit }]);
+        if (source === "relay feed") source = "@mention scan";
+      }
+      const scr = screen(evs);
+      const isMeta = (k) => k === 0 || k === 3 || k >= 1e4 && k < 2e4 || k >= 3e4 && k < 4e4;
+      const items = scr.events.filter((e) => e.pubkey !== PK && !isMeta(e.kind)).sort((x, y) => y.created_at - x.created_at).slice(0, limit);
+      const rows = items.map((e) => {
+        const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+        const chan = h ? labelOf.get(h) || `#${escapeName(h.slice(0, 8))}` : "";
+        const mention = (e.tags || []).some((t) => t[0] === "p" && t[1] === PK) ? "@you " : "";
+        return `${mention}${chan ? chan + " " : ""}${e.kind === 9 ? renderMsg(e, { withDate: true, flagOf: scr.flagOf }) : `kind ${e.kind} ` + row(e, { withDate: true, flagOf: scr.flagOf })}`;
+      });
+      return ok(`Activity (last ${hours}h, ${types.join(" + ")}; source: ${source}) \u2014 ${rows.length} item(s):
+${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
+` + (rows.join("\n") || "(nothing new)"));
+    }
+    if (name === "buzz_files") {
+      let ch = null;
+      try {
+        ch = await resolveChannel(a.channel);
+      } catch (e) {
+        if (e instanceof ChannelAmbiguousError) throw e;
+        const dm = (await dmChannels().catch(() => [])).find((d) => d.id === String(a.channel || "").trim());
+        if (!dm) throw e;
+        ch = { id: dm.id, name: null, dm };
+      }
+      const label = ch.name ? `#${escapeName(ch.name)}` : `DM ${ch.dm.others.map((pk) => who(pk)).join(", ")}`;
+      await profiles();
+      const scanN = clampLimit(a.limit, 200, 500);
+      const scr = screen(await query([{ kinds: [9], "#h": [ch.id], limit: scanN }]));
+      const files = filesFromEvents(scr.events, { chId: ch.id });
+      const rows = files.map((f) => `[${fmtTime(f.event.created_at, true)}] ${who(f.event.pubkey)} <${String(f.event.id).slice(0, 8)}> index ${f.index}: ${escapeName(f.filename || "(unnamed)")}  ${escapeName(f.mime || "?")}  ${fmtBytes(f.size)}${f.sha256 ? `  sha256 ${f.sha256.slice(0, 12)}\u2026` : ""}`);
+      return ok(`Files in ${label} \u2014 ${files.length} (scanned the last ${scr.events.length} message(s); open one with buzz_attachment_read { channel, event, index }):
+${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
+` + (rows.join("\n") || "(no files)"));
+    }
+    if (name === "buzz_presence") {
+      let pks = [];
+      if (a.users != null) {
+        if (!Array.isArray(a.users) || !a.users.length || a.users.some((u) => typeof u !== "string")) return fail("buzz_presence: `users` must be a non-empty list of names / npubs");
+        for (const u of a.users) {
+          const pk = /^me$/i.test(u.trim()) ? PK : await resolveRecipient(u);
+          if (!pks.includes(pk)) pks.push(pk);
+        }
+      }
+      if (a.channel != null) {
+        const ch = await resolveChannel(a.channel);
+        const mem = await query([{ kinds: [39002], "#d": [ch.id], limit: 5 }]) || [];
+        for (const e of mem) for (const t of e.tags || []) if (t[0] === "p" && /^[0-9a-f]{64}$/.test(t[1] || "") && !pks.includes(t[1])) pks.push(t[1]);
+      }
+      if (!pks.length) return fail("buzz_presence needs `users` or `channel`");
+      pks = pks.slice(0, 200);
+      await profiles();
+      const info = await relayInfo();
+      if (!info || !isPubkeyHex(info.self)) return fail("buzz_presence: the relay doesn't advertise a NIP-11 `self` key, so presence can't be verified \u2014 not guessing");
+      const evs = await query([{ kinds: [20001], authors: pks, limit: pks.length }]);
+      const pres = presenceFromEvents(evs, info.self, verifyEvent, pks);
+      const order = { online: 0, away: 1, unknown: 2, offline: 3 };
+      const rows = pks.map((pk) => ({ pk, st: (pres.get(pk) || { status: "offline" }).status })).sort((x, y) => order[x.st] - order[y.st]).map(({ pk, st }) => `${st === "online" ? "\u{1F7E2}" : st === "away" ? "\u{1F319}" : st === "unknown" ? "\u2754" : "\u26AA"} ${who(pk)} \u2014 ${st}`);
+      const counted = [...pres.values()].filter((v) => v.status === "online").length;
+      return ok(`Presence (relay-signed) \u2014 ${counted} online of ${pks.length}:
+` + rows.join("\n"));
+    }
+    if (name === "buzz_emoji") {
+      const evs = screen(await query([{ kinds: [30030], "#d": [CUSTOM_EMOJI_D], limit: 500 }])).events;
+      let pal = emojiPalette(evs);
+      const qq = a.query != null ? String(a.query).trim().replace(/^:+|:+$/g, "").toLowerCase() : "";
+      if (qq) pal = pal.filter((e) => e.shortcode.includes(qq));
+      const rows = pal.slice(0, 500).map((e) => `:${escapeName(e.shortcode)}:  ${escapeContent(e.url, { cap: 300 })}`);
+      return ok(`Custom emoji${qq ? ` matching "${escapeName(qq)}"` : ""} \u2014 ${pal.length} (URLs are listed, never fetched; react with buzz_react emoji ":shortcode:"):
+${UNTRUSTED_NOTE}
+` + (rows.join("\n") || "(none)"));
     }
     const parity = await parityTool(name, a, { ok, fail });
     if (parity) return parity;

@@ -3,7 +3,7 @@
 // dependency). Integration against the LIVE endpoint is deferred until ekam ships
 // 27235 (requirement C) and confirms the contract (requirement D).
 
-import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet } from "./signer.mjs";
+import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet, EKAM_REFUSED_BY_DESIGN, parseAllowedKinds } from "./signer.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 let pass = 0, fail = 0;
@@ -227,6 +227,68 @@ console.log("user status (NIP-38 kind 30315) — v0.2.13: agent-mode only, NOT i
 ok(!WIRE_ALLOWLIST.has(30315), "kind 30315 is NOT in the wire-sign allowlist (Ekam doesn't sign it for post-as-me yet)");
 ok(wsigner.canSign(30315) === false, "wire signer canSign(30315) === false → buzz_status_set/clear must refuse in wire mode");
 ok(lsigner.canSign(30315) === true, "local signer canSign(30315) === true → status works in agent mode");
+
+console.log("v0.2.32-pre — edit (40003) / leave (9022) wire-signable; 9008/5/41012 refused by design:");
+ok(WIRE_ALLOWLIST.has(40003) && WIRE_ALLOWLIST.has(9022), "kinds 40003 (edit) and 9022 (leave) are in the wire-sign allowlist");
+ok(wsigner.canSign(40003) && wsigner.canSign(9022), "wire signer canSign(40003/9022) → the tools reach Ekam");
+for (const k of [9008, 5, 41012]) {
+  ok(!WIRE_ALLOWLIST.has(k) && wsigner.canSign(k) === false, `kind ${k} is NOT wire-signable (Ekam refuses it on purpose)`);
+  ok(EKAM_REFUSED_BY_DESIGN.has(k), `kind ${k} is listed in EKAM_REFUSED_BY_DESIGN`);
+  captured = null;
+  try { await wsigner.sign({ kind: k, tags: [["h", "c"]], content: "" }); ok(false, `kind ${k} should be refused client-side`); }
+  catch (e) { ok(/wire mode refuses kind/.test(e.message) && captured === null, `kind ${k} refused before any wire-sign call`); }
+}
+{
+  captured = null;
+  const ed = await wsigner.sign({ kind: 40003, tags: [["h", "c"], ["e", "e".repeat(64)]], content: "fixed" });
+  ok(captured && captured.tmpl.kind === 40003 && ed.kind === 40003 && verifyEvent(ed), "kind 40003 is sent to /v1/me/wire-sign and comes back signed");
+  captured = null;
+  const lv = await wsigner.sign({ kind: 9022, tags: [["h", "c"]], content: "" });
+  ok(captured && captured.tmpl.kind === 9022 && lv.kind === 9022, "kind 9022 is sent to /v1/me/wire-sign and comes back signed");
+}
+
+console.log("v0.2.32-pre — Ekam 400 kind_not_allowed → clear error with Ekam's allowed set:");
+{
+  const EKAM_NOW = [22242, 9, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021];
+  const refuse = (body, status = 400) => async () => ({ ok: false, status, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
+  const tries = async (fetchFn, kind = 40003) => { try { await wireSign("https://ekam.test", GOOD_TOKEN, { kind, tags: [], content: "" }, fetchFn); return null; } catch (e) { return e; } };
+  let e = await tries(refuse({ error: "kind_not_allowed", error_description: `kind 40003 is not signable here; allowed kinds: ${EKAM_NOW.join(", ")}` }));
+  ok(e && /^Ekam \(your signing service\) doesn't sign kind 40003 yet; it currently allows \{7, 9, 9000, 9001, 9002, 9005, 9007, 9021, 22242, 24242, 27235, 41010, 41011\}\. Ask the Ekam owner to add it, or use an agent's own key\./.test(e.message),
+     "kind_not_allowed → names the refused kind and lists Ekam's allowed kinds (sorted)");
+  ok(e && e.code === "kind_not_allowed" && e.kind === 40003 && Array.isArray(e.allowedKinds) && e.allowedKinds.length === 13, "error carries code / kind / allowedKinds");
+  ok(e && !/version/i.test(e.message), "no version pinning in the message");
+  e = await tries(refuse({ error: "kind_not_allowed", error_description: "kind 9022 not in allowlist {9, 7, 22242}" }), 9022);
+  ok(e && /kind 9022 yet; it currently allows \{7, 9, 22242\}/.test(e.message), "brace-list format parsed");
+  e = await tries(refuse({ error: "kind_not_allowed", error_description: "nope", allowed_kinds: [9, "7", -1, 70000, "x"] }));
+  ok(e && /currently allows \{7, 9\}/.test(e.message), "explicit allowed_kinds array preferred; junk entries dropped");
+  for (const [label, body] of [
+    ["free-text description", { error: "kind_not_allowed", error_description: "this kind cannot be signed" }],
+    ["missing description", { error: "kind_not_allowed" }],
+    ["non-string description", { error: "kind_not_allowed", error_description: { weird: true } }],
+    ["numeric description", { error: "kind_not_allowed", error_description: 42 }],
+  ]) {
+    e = await tries(refuse(body));
+    ok(e && /doesn't sign kind 40003 yet; it didn't say which kinds it allows/.test(e.message) && /agent's own key/.test(e.message), `${label} → still a clear error, no crash`);
+  }
+  e = await tries(refuse({ error: "kind_not_allowed", error_description: "bad\u202Eevil\nline " + "x".repeat(5000) }));
+  ok(e && !/\u202E|\n/.test(e.message) && e.message.length < 600, "echoed description is sanitized (no bidi / newline) and bounded");
+  e = await tries(refuse("<html>400 Bad Request</html>"));
+  ok(e && /HTTP 400/.test(e.message) && !/doesn't sign/.test(e.message), "non-JSON 400 → generic HTTP 400 error (unchanged)");
+  e = await tries(refuse({ error: "invalid_request", error_description: "bad tags" }));
+  ok(e && /HTTP 400: bad tags/.test(e.message), "other 400 errors keep the generic shape");
+  ok(parseAllowedKinds(null) === null && parseAllowedKinds(undefined) === null && parseAllowedKinds(7) === null && parseAllowedKinds("") === null, "parseAllowedKinds tolerates null / undefined / number / empty");
+  ok(JSON.stringify(parseAllowedKinds("allowed kinds: 9, 7; 40003 not allowed")) === "[7,9]", "parser takes the list after 'allowed', not the refused kind");
+  ok(JSON.stringify(parseAllowedKinds("allowed kinds: 9, 7 (since v302)")) === "[7,9]", "parser stops at a parenthetical");
+  // end-to-end through the signer: a kind the shim allows but Ekam doesn't (yet) → the clear error
+  const ekamOld = async (url, init) => {
+    const k = JSON.parse(init.body).event.kind;
+    if (!EKAM_NOW.includes(k)) return { ok: false, status: 400, text: async () => JSON.stringify({ error: "kind_not_allowed", error_description: `kind ${k} not allowed; allowed kinds: ${EKAM_NOW.join(", ")}` }) };
+    return mockFetch(url, init);
+  };
+  const oldSigner = await resolveSigner({ env: wireEnv, fetch: ekamOld });
+  try { await oldSigner.sign({ kind: 40003, tags: [["h", "c"]], content: "x" }); ok(false, "current Ekam should refuse 40003"); }
+  catch (err) { ok(/doesn't sign kind 40003 yet/.test(err.message) && /41011/.test(err.message), "signer on today's Ekam: 40003 → clear kind_not_allowed error listing Ekam's set"); }
+}
 
 console.log("blossom media auth (kind 24242) — fail-closed shim constraints (codex_kavach gate):");
 {
