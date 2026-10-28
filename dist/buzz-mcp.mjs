@@ -18448,11 +18448,11 @@ function numberToBytesLE(n, len) {
 function copyBytes(bytes) {
   return Uint8Array.from(bytes);
 }
-function asciiToBytes(ascii) {
-  return Uint8Array.from(ascii, (c, i2) => {
+function asciiToBytes(ascii2) {
+  return Uint8Array.from(ascii2, (c, i2) => {
     const charCode = c.charCodeAt(0);
     if (c.length !== 1 || charCode > 127) {
-      throw new Error(`string contains non-ASCII character "${ascii[i2]}" with code ${charCode} at position ${i2}`);
+      throw new Error(`string contains non-ASCII character "${ascii2[i2]}" with code ${charCode} at position ${i2}`);
     }
     return charCode;
   });
@@ -21764,19 +21764,151 @@ function buildImeta({ url, mime, sha256: sha2562, size, filename } = {}) {
   if (filename) parts.push(`filename ${filename}`);
   return ["imeta", ...parts];
 }
-function mediaMimeForPath(p) {
-  return MEDIA_MIME_BY_EXT[(String(p).match(/\.[^.\/]+$/) || [""])[0].toLowerCase()] || "application/octet-stream";
+function declined(name, why) {
+  return new Error(`buzz_post: attachment declined LOCALLY \u2014 ${name}: unsupported file type (${why}). Allowed: images (jpeg/png/gif/webp), mp4 video, and pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json (a shim pre-flight check, NOT a server verdict).`);
+}
+function localExt(name) {
+  const base = String(name).split(/[\\/]/).pop();
+  const i2 = base.lastIndexOf(".");
+  return i2 > 0 ? base.slice(i2 + 1).trim().toLowerCase() : "";
+}
+function sniffHead(b) {
+  if (startsWith(b, [255, 216, 255])) return "image/jpeg";
+  if (startsWith(b, [137, 80, 78, 71, 13, 10, 26, 10])) return "image/png";
+  if (startsWith(b, ascii("GIF87a")) || startsWith(b, ascii("GIF89a"))) return "image/gif";
+  if (startsWith(b, ascii("RIFF")) && startsWith(b, ascii("WEBP"), 8)) return "image/webp";
+  if (startsWith(b, ascii("%PDF-"))) return "application/pdf";
+  if (startsWith(b, [80, 75, 3, 4])) return "zip";
+  if (b.length >= 16 && startsWith(b, ascii("ftyp"), 4)) {
+    const brands = [];
+    const boxLen = Math.min(b.length, b.readUInt32BE(0) || b.length);
+    brands.push(b.toString("latin1", 8, 12));
+    for (let i2 = 16; i2 + 4 <= boxLen; i2 += 4) brands.push(b.toString("latin1", i2, i2 + 4));
+    return brands.some((x) => MP4_BRANDS.has(x)) ? "video/mp4" : "iso-bmff";
+  }
+  return null;
+}
+function zipCentralDirectoryNames(b) {
+  if (b.length < 22) return null;
+  let eocd = -1;
+  for (let i2 = b.length - 22; i2 >= Math.max(0, b.length - 22 - 65535); i2--) {
+    if (b[i2] === 80 && b[i2 + 1] === 75 && b[i2 + 2] === 5 && b[i2 + 3] === 6) {
+      eocd = i2;
+      break;
+    }
+  }
+  if (eocd < 0) return null;
+  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16);
+  if (count === 65535 || cdSize === 4294967295 || cdOff === 4294967295 || cdOff + cdSize > eocd) return null;
+  const names = [];
+  let at = cdOff;
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > b.length || b.readUInt32LE(at) !== 33639248) return null;
+    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32);
+    if (at + 46 + nl > b.length) return null;
+    names.push(b.toString("utf8", at + 46, at + 46 + nl));
+    at += 46 + nl + el + cl;
+  }
+  return names;
+}
+function classifyZip(b, name) {
+  const names = zipCentralDirectoryNames(b);
+  if (!names) throw declined(name, "ZIP with an unreadable directory");
+  for (const n of names) {
+    const lower = n.toLowerCase();
+    if (lower.split("/").pop().startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (lower.startsWith("basic/") || lower.startsWith("scripts/")) throw declined(name, `OpenDocument file containing macros (${n})`);
+  }
+  if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+  if (b.toString("latin1", 30, 38) === "mimetype") {
+    const m = b.toString("latin1", 38, 38 + 60);
+    for (const t of [ODT, ODS, ODP]) if (m.startsWith(t)) return t;
+  }
+  const set = new Set(names);
+  if (set.has("[Content_Types].xml") || names.some((n) => /^(word|xl|ppt)\//.test(n))) {
+    if (names.some((n) => n.startsWith("word/"))) return DOCX;
+    if (names.some((n) => n.startsWith("xl/"))) return XLSX;
+    if (names.some((n) => n.startsWith("ppt/"))) return PPTX;
+  }
+  throw declined(name, "zip archive");
+}
+function checkAttachmentText(b, ext, name = `file.${ext}`) {
+  let body = startsWith(b, [239, 187, 191]) ? b.subarray(3) : b;
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw declined(name, `.${ext} that is not valid UTF-8 text`);
+  }
+  if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(text)) throw declined(name, `.${ext} containing control characters`);
+  if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
+  if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
+  const head = body.subarray(0, 1024).toString("latin1").toLowerCase();
+  if (MARKUP_MARKERS.some((m) => head.includes(m))) throw declined(name, `.${ext} containing HTML/XML markup`);
+  if (ext === "json") {
+    try {
+      JSON.parse(text);
+    } catch {
+      throw declined(name, ".json that is not valid JSON");
+    }
+  }
+}
+function classifyAttachment({ name, size, read }) {
+  const display = String(name).split(/[\\/]/).pop();
+  const head = read(0, Math.min(size, 4096));
+  const sniffed = sniffHead(head);
+  const capped = (mime, kind) => {
+    mediaCapCheck(display, size, mime);
+    return { mime, kind };
+  };
+  if (sniffed && ATTACH_IMAGE_MIMES.includes(sniffed)) return capped(sniffed, mediaCapKind(sniffed));
+  if (sniffed === "video/mp4") return capped(sniffed, "video");
+  if (sniffed === "iso-bmff") throw declined(display, "ISO-BMFF media that is not mp4");
+  if (sniffed === "application/pdf") return capped(sniffed, "file");
+  if (size > MEDIA_CAPS.file) mediaCapCheck(display, size, OCTET_STREAM);
+  if (sniffed === "zip") return capped(classifyZip(read(0, size), display), "file");
+  const ext = localExt(display);
+  if (!TEXT_EXTS.has(ext)) throw declined(display, "unrecognised content; plain text must be .txt, .csv, .md or .json");
+  checkAttachmentText(read(0, size), ext, display);
+  return capped(OCTET_STREAM, "file");
 }
 function mediaCapKind(mime) {
   return mime === "image/gif" ? "gif" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file";
 }
-function mediaCapCheck(filename, size) {
-  const mime = mediaMimeForPath(filename);
+function mediaCapCheck(filename, size, mime = OCTET_STREAM) {
   const kind = mediaCapKind(mime);
   const cap = MEDIA_CAPS[kind];
   if (size > cap)
-    throw new Error(`buzz_post: attachment declined LOCALLY \u2014 ${String(filename).split("/").pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${cap / MEDIA_MB | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
+    throw new Error(`buzz_post: attachment declined LOCALLY \u2014 ${String(filename).split(/[\\/]/).pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${cap / MEDIA_MB | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
   return { mime, cap, kind };
+}
+function sanitizeAttachmentName(p) {
+  const base = String(p ?? "").split(/[\\/]/).pop();
+  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(/^[\s.]+|[\s.]+$/gu, "");
+  return cleaned || "file";
+}
+function attachmentDisplayName(p, mime) {
+  const name = sanitizeAttachmentName(p);
+  const i2 = name.lastIndexOf(".");
+  const stem0 = i2 > 0 ? name.slice(0, i2) : name;
+  const ext = i2 > 0 ? name.slice(i2 + 1).toLowerCase() : "";
+  let forced;
+  if (SNIFFED_EXT.has(mime)) forced = SNIFFED_EXT.get(mime);
+  else if (ATTACH_IMAGE_MIMES.includes(mime) || ATTACH_VIDEO_MIMES.includes(mime)) forced = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
+  else forced = TEXT_EXTS.has(ext) ? ext : "txt";
+  if (mime === "image/jpeg" && (ext === "jpg" || ext === "jpeg")) forced = ext;
+  let stem = stem0.replace(/^[\s.]+|[\s.]+$/gu, "") || "file";
+  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 1;
+  while (Buffer.byteLength(stem) > budget) stem = [...stem].slice(0, -1).join("");
+  return `${stem.trimEnd() || "file"}.${forced}`;
+}
+function escapeLinkLabel(s) {
+  return String(s).replace(/[\\[\]()<>]/g, (c) => `\\${c}`);
+}
+function attachmentContentLine({ url, mime, filename }) {
+  const m = String(mime || "");
+  if (m.startsWith("image/") || m.startsWith("video/")) return String(url);
+  return `[${escapeLinkLabel(filename || "file")}](${url})`;
 }
 function normalizePubkey(v) {
   const s = (v || "").trim();
@@ -22006,7 +22138,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, MEDIA_MIME_BY_EXT, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, startsWith, ascii, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22034,7 +22166,35 @@ var init_signer = __esm({
     BLOSSOM_CONTENT = { upload: "Upload buzz-media", get: "Get buzz-media" };
     MEDIA_MB = 1024 * 1024;
     MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
-    MEDIA_MIME_BY_EXT = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml", ".log": "text/plain", ".zip": "application/zip", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
+    DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    ODT = "application/vnd.oasis.opendocument.text";
+    ODS = "application/vnd.oasis.opendocument.spreadsheet";
+    ODP = "application/vnd.oasis.opendocument.presentation";
+    OCTET_STREAM = "application/octet-stream";
+    ATTACH_ALLOWED_FILE_TYPES = Object.freeze([
+      ["pdf", "application/pdf"],
+      ["docx", DOCX],
+      ["xlsx", XLSX],
+      ["pptx", PPTX],
+      ["odt", ODT],
+      ["ods", ODS],
+      ["odp", ODP],
+      ["txt", "text"],
+      ["csv", "text"],
+      ["md", "text"],
+      ["json", "text"]
+    ].map(([ext, detect]) => Object.freeze({ ext, detect })));
+    ATTACH_IMAGE_MIMES = Object.freeze(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+    ATTACH_VIDEO_MIMES = Object.freeze(["video/mp4"]);
+    ATTACH_MAX_NAME_BYTES = 120;
+    TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "text").map((t) => t.ext));
+    SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
+    MP4_BRANDS = /* @__PURE__ */ new Set(["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7", "iso8", "iso9", "mp41", "mp42", "avc1", "dash", "M4V "]);
+    MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml"];
+    startsWith = (b, sig, at = 0) => b.length >= at + sig.length && sig.every((v, i2) => b[at + i2] === v);
+    ascii = (s) => [...s].map((c) => c.charCodeAt(0));
     echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
     BUZZ_APP_SIGNIN_MESSAGE = "Open the Buzz app once and sign in with Ekam, then try again.";
     BUZZ_APP_SIGNIN_RE = /Open the Buzz app once and sign in with Ekam/;
@@ -26897,7 +27057,7 @@ ${url}
 
 // buzz-mcp.mjs
 import { createHash as createHash5, randomBytes as randomBytes6, randomUUID as randomUUID2 } from "node:crypto";
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, readSync, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
 import { Readable as Readable2 } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
@@ -27320,7 +27480,7 @@ async function createBuzzServer(opts = {}) {
     const st = { size };
     let src, mime, sha;
     try {
-      ({ mime } = mediaCapCheck(basename2(filePath), st.size));
+      ({ mime } = classifyAttachment({ name: basename2(filePath), size: st.size, read: fdReader(fd) }));
       sha = await new Promise((res2, rej) => {
         const h = createHash5("sha256");
         const r = createReadStream(null, { fd, start: 0, autoClose: false });
@@ -27360,7 +27520,19 @@ async function createBuzzServer(opts = {}) {
       d = JSON.parse(text);
     } catch {
     }
-    return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename2(filePath) };
+    return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: attachmentDisplayName(filePath, d.type || mime) };
+  }
+  function fdReader(fd) {
+    return (start, len) => {
+      const b = Buffer.alloc(len);
+      let off = 0;
+      while (off < len) {
+        const n = readSync(fd, b, off, len - off, start + off);
+        if (!n) break;
+        off += n;
+      }
+      return b.subarray(0, off);
+    };
   }
   async function blossomDownload(shaExt, { ext = "" } = {}) {
     const sha = String(shaExt).split(".")[0].toLowerCase();
@@ -27875,13 +28047,26 @@ async function createBuzzServer(opts = {}) {
   async function uploadAttachments(input) {
     if (HOSTED) throw new Error("attachments from a file path aren't available in Ola Buzz (hosted) \u2014 the connector can't see files on your computer. Post the text, or attach the file in the Buzz app.");
     const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR2, IDENTITY_DIR, WIRE_REFRESH_DIR] });
+    const pre = [];
+    for (const f of r.files) {
+      const { fd, size } = openCheckedAttachment(f, r.ids && r.ids[f]);
+      try {
+        pre.push({ f, size, ...classifyAttachment({ name: basename2(f), size, read: fdReader(fd) }) });
+      } catch (e) {
+        if (!r.isDir) throw e;
+        (r.skipped ||= []).push(`${basename2(f)} (type not allowed)`);
+      } finally {
+        try {
+          closeSync2(fd);
+        } catch {
+        }
+      }
+    }
+    if (!pre.length) throw new Error(`buzz_post: attachment declined LOCALLY \u2014 no file in ${r.typed} is an allowed type (images jpeg/png/gif/webp, mp4 video, pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json).`);
+    r.files = pre.map((p) => p.f);
     const ups = [];
     if (isDryRun()) {
-      for (const f of r.files) {
-        const size = statSync2(f).size;
-        const { mime } = mediaCapCheck(basename2(f), size);
-        ups.push({ dry: true, url: `(dry run \u2014 ${basename2(f)} not uploaded)`, filename: basename2(f), size, mime });
-      }
+      for (const { f, size, mime } of pre) ups.push({ dry: true, url: `(dry run \u2014 ${basename2(f)} not uploaded)`, filename: attachmentDisplayName(f, mime), size, mime });
       return { r, ups };
     }
     for (const f of r.files) {
@@ -28871,8 +29056,9 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
           attached = await uploadAttachments(a.attachment);
           for (const up of attached.ups) {
             if (!up.dry) tags.push(buildImeta(up));
+            const line = up.dry ? up.url : attachmentContentLine(up);
             content = content ? `${content}
-${up.url}` : up.url;
+${line}` : line;
           }
         }
         const ev = await signer.sign({ kind: 9, tags, content });
@@ -29021,8 +29207,9 @@ ${fence.replace("BEGIN", "END")}`);
           attached = await uploadAttachments(a.attachment);
           for (const up of attached.ups) {
             if (!up.dry) tags.push(buildImeta(up));
+            const line = up.dry ? up.url : attachmentContentLine(up);
             content = content ? `${content}
-${up.url}` : up.url;
+${line}` : line;
           }
         }
         const ev = await signer.sign({ kind: 9, tags, content });

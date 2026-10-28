@@ -16,8 +16,8 @@ import { createHash } from "node:crypto";
 import { foldName, nameKey, INVISIBLE_CLASS } from "./names.mjs";
 
 // ── 1. attachments ──────────────────────────────────────────────────────────────────────────────
-// Product rule: ANY file type and ANY folder may be attached; only SECRET LOCATIONS are refused.
-// So this is a denylist, applied to the path as typed AND to its realpath (every symlink — final
+// Product rule: ANY folder may be attached; only SECRET LOCATIONS are refused here. (File TYPES are
+// a separate allow-list since attach-hardening — signer.mjs classifyAttachment.) The location check is a denylist, applied to the path as typed AND to its realpath (every symlink — final
 // component or any parent — resolved), with components compared case-insensitively (macOS/Windows
 // file systems are case-insensitive, so ~/.SSH is ~/.ssh). v0.2.31 fix (buzz_security release
 // review §3.8): the old list missed this shim's OWN key store and tokens (~/.config/buzz-cli

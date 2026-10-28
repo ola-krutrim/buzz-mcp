@@ -248,7 +248,13 @@ store (BUD-01/02/11). No key handling: the shim signs a short-lived, hash-bound 
 
 - **Post one:** `buzz_post` with `attachment` = a local file path. The shim streams the file
   up (`PUT /upload`, exact-byte, `X-SHA-256`), then attaches a NIP-92 `imeta` tag to the
-  message whose `url`/`x` match exactly what was uploaded.
+  message whose `url`/`x` match exactly what was uploaded. **Allowed types** (decided from the
+  file's bytes, not its name): images jpeg/png/gif/webp (50 MB; gif 10 MB), mp4 video (500 MB), and
+  pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json (100 MB). HTML, SVG, XML, zip and other
+  archives, legacy OLE Office files, macro-enabled Office files and executables are refused locally.
+  Text must be UTF-8 with no markup. The posted name is sanitised (no bidi/format or control
+  characters, no `/` `\`) and its extension forced to the detected type; files post as a named
+  `[name](url)` link, images and video as before.
 - **Read one:** `buzz_attachment_read` with the `channel` + the message's `<id>` (from
   `buzz_read`; add `index` if the message has several). It resolves the attachment **only
   from a message you can read in that channel** (never an arbitrary URL), streams it down
@@ -499,6 +505,15 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 
 ## Changelog
 
+### Unreleased — attach-hardening (buzz_security attachment ruling)
+- **Attachment type allow-list, from the bytes.** `signer.mjs classifyAttachment` replaces the
+  extension→MIME map: images jpeg/png/gif/webp, mp4, and pdf/docx/xlsx/pptx/odt/ods/odp/txt/csv/md/json.
+  HTML/SVG/XML, zip and other archives, OLE, OOXML with `vbaProject.bin`, ODF with Basic/Scripts,
+  and executables are refused before any upload. Text must be UTF-8, no controls, no markup.
+- **Names.** Sanitised (NFC; Cf/bidi, C0/C1, `/` `\` stripped; dots/spaces trimmed; ≤120 bytes),
+  extension forced to the sniffed type; non-media files post as `[escaped name](url)`.
+- **Folders** classify every file first (no partial post); disallowed types are skipped and listed.
+
 ### v0.2.35
 - **Hosted mode (`buzz-mcp --http`)** for the "Ola Buzz" Grok Bot connector, Phase 1 — see *Hosted mode*.
   Streamable HTTP, OAuth resource server (Ekam), RFC 8693 exchange to `wire:sign`, per-session
@@ -604,7 +619,7 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   `buzz_dm_send` take `to` as a string or an array of up to 8.
   In wire ("post as me") mode, kinds 40003 / 9022 / 9008 / 5 / 41012 are refused locally as
   *blocked on Ekam wire-sign allowlist* until Ekam adds them. (v0.2.32-pre: 40003 / 9022 now go to Ekam.)
-- **Attachments.** Any file type, or a folder (its top-level regular files, ≤10; hidden files are skipped).
+- **Attachments.** A file, or a folder (its top-level regular files, ≤10; hidden files are skipped). File *types* are a narrow allow-list since attach-hardening (see *Attachments*); in a folder, other types are skipped and listed.
   A **denylist** (not an allowlist — any other file or folder is allowed) refuses known secret
   locations, checked on both the typed path and the realpath, case-insensitively, so a symlink,
   a symlinked parent folder or a hard link to a secret is refused too:

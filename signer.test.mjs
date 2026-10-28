@@ -340,14 +340,14 @@ catch (e) { ok(/url is required/.test(e.message), "buildImeta REFUSES a url-less
 
 console.log("media size caps — per-type pre-flight, distinguishable local refusal (codex gate):");
 {
-  const okImg = mediaCapCheck("pic.png", 40 * MEDIA_MB);
+  const okImg = mediaCapCheck("pic.png", 40 * MEDIA_MB, "image/png");
   ok(okImg.mime === "image/png" && okImg.kind === "image" && okImg.cap === 50 * MEDIA_MB, "image under 50 MB → ok, kind=image");
-  ok(mediaCapCheck("doc.pdf", 90 * MEDIA_MB).kind === "file" && mediaCapCheck("clip.mp4", 400 * MEDIA_MB).kind === "video", "per-type: pdf=file(100), mp4=video(500) — under cap ok");
-  ok(mediaCapCheck("a.gif", 9 * MEDIA_MB).kind === "gif", "gif under 10 MB → ok");
+  ok(mediaCapCheck("doc.pdf", 90 * MEDIA_MB, "application/pdf").kind === "file" && mediaCapCheck("clip.mp4", 400 * MEDIA_MB, "video/mp4").kind === "video", "per-type: pdf=file(100), mp4=video(500) — under cap ok");
+  ok(mediaCapCheck("a.gif", 9 * MEDIA_MB, "image/gif").kind === "gif", "gif under 10 MB → ok");
 }
-try { mediaCapCheck("pic.png", 60 * MEDIA_MB); ok(false, "51MB image should throw"); }
+try { mediaCapCheck("pic.png", 60 * MEDIA_MB, "image/png"); ok(false, "51MB image should throw"); }
 catch (e) { ok(/declined LOCALLY/.test(e.message) && /NOT a server 413/.test(e.message) && /image cap/.test(e.message), "image >50 MB → DISTINGUISHABLE local refusal (not a 413)"); }
-try { mediaCapCheck("a.gif", 11 * MEDIA_MB); ok(false, "11MB gif should throw"); }
+try { mediaCapCheck("a.gif", 11 * MEDIA_MB, "image/gif"); ok(false, "11MB gif should throw"); }
 catch (e) { ok(/gif cap/.test(e.message), "gif >10 MB → refused (tightest per-type cap)"); }
 try { mediaCapCheck("big.bin", 101 * MEDIA_MB); ok(false, "101MB file should throw"); }
 catch (e) { ok(/file cap/.test(e.message), "generic file >100 MB → refused"); }
