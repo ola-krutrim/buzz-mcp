@@ -2490,6 +2490,29 @@ function wireNameSet(id, name) {
 }
 var MEDIA_MB = 1024 * 1024;
 var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
+var DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+var XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+var PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+var ODT = "application/vnd.oasis.opendocument.text";
+var ODS = "application/vnd.oasis.opendocument.spreadsheet";
+var ODP = "application/vnd.oasis.opendocument.presentation";
+var ATTACH_ALLOWED_FILE_TYPES = Object.freeze([
+  ["pdf", "application/pdf"],
+  ["docx", DOCX],
+  ["xlsx", XLSX],
+  ["pptx", PPTX],
+  ["odt", ODT],
+  ["ods", ODS],
+  ["odp", ODP],
+  ["txt", "text"],
+  ["csv", "text"],
+  ["md", "text"],
+  ["json", "text"]
+].map(([ext, detect]) => Object.freeze({ ext, detect })));
+var ATTACH_IMAGE_MIMES = Object.freeze(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+var ATTACH_VIDEO_MIMES = Object.freeze(["video/mp4"]);
+var TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "text").map((t) => t.ext));
+var SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
 function parseAllowedKinds(body) {
   try {
     const pick = (arr) => {

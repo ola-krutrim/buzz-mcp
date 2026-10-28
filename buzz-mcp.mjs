@@ -5,7 +5,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, mediaMimeForPath, mediaCapCheck, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN } from "./signer.mjs";
+import { resolveSigner, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, classifyAttachment, attachmentDisplayName, attachmentContentLine, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN } from "./signer.mjs";
 import { IDENTITY_DIR } from "./loadkey_v2.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
 import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
@@ -30,7 +30,7 @@ import { READ_STATE_KIND, READ_STATE_T, readStateIdentity, decodeReadState, next
 // (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
 import { pkce, authorizeUrl, exchangeAuthCode, bindLoopback } from "./wirelogin.mjs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream, writeSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, createReadStream, readSync, writeSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
 import { Readable } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
@@ -561,8 +561,8 @@ async function bridge(path, bodyObj) {
 const query = (filters) => bridge("/query", filters);
 
 // ── Attachments (Blossom BUD-01/02/11). The kind-24242 auth is built ONLY via
-// blossomAuthTemplate (fail-closed). Per-type size caps (mediaCapCheck, from signer.mjs) are a
-// PRE-FLIGHT COURTESY — the relay's 413 is authoritative; the local refusal is worded so it
+// blossomAuthTemplate (fail-closed). The type allow-list and per-type size caps (classifyAttachment /
+// mediaCapCheck, from signer.mjs) are a PRE-FLIGHT check — the relay's 413 is authoritative; the local refusal is worded so it
 // can't be mistaken for a server verdict.
 const MB = MEDIA_MB;
 const TEXT_MIME = /^(text\/|application\/(json|xml|.*\+xml|x-yaml|yaml))/; // safe to return inline as text
@@ -585,7 +585,7 @@ async function blossomUpload(filePath, expectId) {
   const st = { size };
   let src, mime, sha;
   try {
-    ({ mime } = mediaCapCheck(basename(filePath), st.size)); // per-type cap; throws a distinguishable local refusal if over
+    ({ mime } = classifyAttachment({ name: basename(filePath), size: st.size, read: fdReader(fd) })); // attach-hardening: type from the BYTES (allow-list) + per-type cap; throws a distinguishable local refusal
     sha = await new Promise((res, rej) => { const h = createHash("sha256"); const r = createReadStream(null, { fd, start: 0, autoClose: false }); r.on("error", rej); r.on("data", (c) => h.update(c)); r.on("end", () => res(h.digest("hex"))); });
     throwIfCancelled();
     src = createReadStream(null, { fd, start: 0, autoClose: true });
@@ -602,7 +602,16 @@ async function blossomUpload(filePath, expectId) {
   const text = await res.text();
   if (!res.ok) throw new Error(`upload ${basename(filePath)} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
   let d = {}; try { d = JSON.parse(text); } catch {}
-  return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename(filePath) };
+  return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: attachmentDisplayName(filePath, d.type || mime) };
+}
+// Positional reads from an already-checked fd (no re-open, so no check/use swap).
+function fdReader(fd) {
+  return (start, len) => {
+    const b = Buffer.alloc(len);
+    let off = 0;
+    while (off < len) { const n = readSync(fd, b, off, len - off, start + off); if (!n) break; off += n; }
+    return b.subarray(0, off);
+  };
 }
 
 // Download a media blob (sha[.ext]) into the PRIVATE download dir (item 5): dir 0700, file created
@@ -1139,16 +1148,30 @@ const wireBlocked = (kind, tool) => (signer.canSign(kind) ? null
   : EKAM_REFUSED_BY_DESIGN.has(kind)
     ? `${tool}: kind ${kind} (${EKAM_REFUSED_BY_DESIGN.get(kind)}) is blocked on Ekam wire-sign allowlist — Ekam deliberately doesn't sign it "as you" ("post as me"), so nothing was sent. Use an agent-mode session (an agent's own key) for this.`
     : `${tool}: kind ${kind} is blocked on Ekam wire-sign allowlist — it can't be signed "as you" yet. Use an agent-mode session, or ask for kind ${kind} to be added to Ekam's allowlist.`);
-// Upload a file OR every regular file in a folder (item 1). ANY file type / folder is allowed; only
-// secret locations are refused — checked on the typed path AND the realpath (symlinks followed), incl.
+// Upload a file OR every regular file in a folder (item 1). Any folder is allowed; FILE TYPES are the
+// attach-hardening allow-list (signer.mjs classifyAttachment, decided from the bytes); secret locations are refused — checked on the typed path AND the realpath (symlinks followed), incl.
 // this shim's own key store (IDENTITY_DIR), wire-refresh tokens and ~/.config/buzz-cli (safety.mjs).
 async function uploadAttachments(input) {
   if (HOSTED) throw new Error("attachments from a file path aren't available in Ola Buzz (hosted) — the connector can't see files on your computer. Post the text, or attach the file in the Buzz app.");
   const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR, IDENTITY_DIR, WIRE_REFRESH_DIR] });
+  // attach-hardening pre-flight: classify EVERY file from its bytes before anything uploads (no partial post).
+  // A single file that fails is refused; in a folder, files outside the allow-list are skipped and
+  // listed. blossomUpload re-classifies on the fd it actually sends.
+  const pre = [];
+  for (const f of r.files) {
+    const { fd, size } = openCheckedAttachment(f, r.ids && r.ids[f]);
+    try { pre.push({ f, size, ...classifyAttachment({ name: basename(f), size, read: fdReader(fd) }) }); }
+    catch (e) {
+      if (!r.isDir) throw e;
+      (r.skipped ||= []).push(`${basename(f)} (type not allowed)`);
+    } finally { try { closeSync(fd); } catch {} }
+  }
+  if (!pre.length) throw new Error(`buzz_post: attachment declined LOCALLY — no file in ${r.typed} is an allowed type (images jpeg/png/gif/webp, mp4 video, pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json).`);
+  r.files = pre.map((p) => p.f);
   const ups = [];
   if (isDryRun()) {
-    // dry run: the secret-path refusals above and the per-type size caps still apply; nothing uploads.
-    for (const f of r.files) { const size = statSync(f).size; const { mime } = mediaCapCheck(basename(f), size); ups.push({ dry: true, url: `(dry run — ${basename(f)} not uploaded)`, filename: basename(f), size, mime }); }
+    // dry run: the secret-path refusals, the type allow-list and the per-type size caps still apply; nothing uploads.
+    for (const { f, size, mime } of pre) ups.push({ dry: true, url: `(dry run — ${basename(f)} not uploaded)`, filename: attachmentDisplayName(f, mime), size, mime });
     return { r, ups };
   }
   for (const f of r.files) { throwIfCancelled(); ups.push(await blossomUpload(f, r.ids && r.ids[f])); }
@@ -2048,7 +2071,7 @@ async function callTool(req) {
       let attached = null, content = bodyText;
       if (a.attachment) {
         attached = await uploadAttachments(a.attachment);
-        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); content = content ? `${content}\n${up.url}` : up.url; }
+        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); const line = up.dry ? up.url : attachmentContentLine(up); content = content ? `${content}\n${line}` : line; }
       }
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);
@@ -2211,7 +2234,7 @@ async function callTool(req) {
       let attached = null, content = bodyText;
       if (a.attachment) {
         attached = await uploadAttachments(a.attachment);
-        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); content = content ? `${content}\n${up.url}` : up.url; }
+        for (const up of attached.ups) { if (!up.dry) tags.push(buildImeta(up)); const line = up.dry ? up.url : attachmentContentLine(up); content = content ? `${content}\n${line}` : line; }
       }
       const ev = await signer.sign({ kind: 9, tags, content });
       await bridge("/events", ev);

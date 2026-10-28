@@ -324,22 +324,192 @@ export function buildImeta({ url, mime, sha256, size, filename } = {}) {
   return ["imeta", ...parts];
 }
 
-// ── Media size caps (mirror the relay per-type defaults: image 50 / gif 10 / file 100 /
-// video 500 MB). A PRE-FLIGHT COURTESY — the relay's 413 is authoritative; this only saves
-// a doomed upload, and its refusal is worded so it can't be mistaken for a server verdict.
+// ── Attachment policy (attach-hardening, buzz_security attachment ruling on buzz@f040819e3).
+// Agents are prompt-injectable, so the shim uploads only a NARROW ALLOW-LIST, decided from the
+// file's BYTES — never from its extension (the old MEDIA_MIME_BY_EXT map, incl. its .svg →
+// image/svg+xml entry, is gone). Same list and rules as buzz-cli's upload_policy.rs:
+//   images  jpeg/png/gif/webp (50 MB; gif 10 MB)       video  mp4 (500 MB)
+//   files   pdf, docx, xlsx, pptx, odt, ods, odp (sniffed) and txt, csv, md, json (extension +
+//           valid UTF-8, no control chars, no HTML/XML markup at the start, .json must parse) — 100 MB
+// Refused: HTML, XML/SVG, scripts, zip and other archives, legacy OLE (doc/xls/ppt/msi), executables,
+// and OOXML/ODF whose ZIP central directory lists vbaProject.bin or ODF Basic/ / Scripts/ (fail closed).
+// The posted filename is sanitised (NFC; no Cf/bidi, no C0/C1, no / \; trimmed of dots/spaces;
+// ≤120 bytes) and its extension FORCED to the sniffed type. The relay re-validates and is authoritative.
 export const MEDIA_MB = 1024 * 1024;
 export const MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
-const MEDIA_MIME_BY_EXT = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml", ".log": "text/plain", ".zip": "application/zip", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
-export function mediaMimeForPath(p) { return MEDIA_MIME_BY_EXT[(String(p).match(/\.[^.\/]+$/) || [""])[0].toLowerCase()] || "application/octet-stream"; }
+const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const ODT = "application/vnd.oasis.opendocument.text";
+const ODS = "application/vnd.oasis.opendocument.spreadsheet";
+const ODP = "application/vnd.oasis.opendocument.presentation";
+export const OCTET_STREAM = "application/octet-stream";
+// THE allow-list for generic files: [forced extension, sniffed MIME | "text"].
+export const ATTACH_ALLOWED_FILE_TYPES = Object.freeze([
+  ["pdf", "application/pdf"], ["docx", DOCX], ["xlsx", XLSX], ["pptx", PPTX],
+  ["odt", ODT], ["ods", ODS], ["odp", ODP],
+  ["txt", "text"], ["csv", "text"], ["md", "text"], ["json", "text"],
+].map(([ext, detect]) => Object.freeze({ ext, detect })));
+export const ATTACH_IMAGE_MIMES = Object.freeze(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+export const ATTACH_VIDEO_MIMES = Object.freeze(["video/mp4"]);
+export const ATTACH_MAX_NAME_BYTES = 120;
+const TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "text").map((t) => t.ext));
+const SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
+// The relay's MP4 brands (buzz-media/src/validation.rs MP4_BRANDS).
+const MP4_BRANDS = new Set(["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7", "iso8", "iso9", "mp41", "mp42", "avc1", "dash", "M4V "]);
+const MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml"];
+
+function declined(name, why) {
+  return new Error(`buzz_post: attachment declined LOCALLY — ${name}: unsupported file type (${why}). Allowed: images (jpeg/png/gif/webp), mp4 video, and pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json (a shim pre-flight check, NOT a server verdict).`);
+}
+const startsWith = (b, sig, at = 0) => b.length >= at + sig.length && sig.every((v, i) => b[at + i] === v);
+const ascii = (s) => [...s].map((c) => c.charCodeAt(0));
+function localExt(name) {
+  const base = String(name).split(/[\\/]/).pop();
+  const i = base.lastIndexOf(".");
+  return i > 0 ? base.slice(i + 1).trim().toLowerCase() : "";
+}
+
+// Image / video / PDF / ZIP by magic bytes (the subset of `infer` the allow-list needs).
+// → "image/…" | "video/mp4" | "application/pdf" | "zip" | null (no recognised magic).
+function sniffHead(b) {
+  if (startsWith(b, [0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (startsWith(b, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+  if (startsWith(b, ascii("GIF87a")) || startsWith(b, ascii("GIF89a"))) return "image/gif";
+  if (startsWith(b, ascii("RIFF")) && startsWith(b, ascii("WEBP"), 8)) return "image/webp";
+  if (startsWith(b, ascii("%PDF-"))) return "application/pdf";
+  if (startsWith(b, [0x50, 0x4b, 0x03, 0x04])) return "zip";
+  if (b.length >= 16 && startsWith(b, ascii("ftyp"), 4)) {
+    const brands = [];
+    const boxLen = Math.min(b.length, b.readUInt32BE(0) || b.length);
+    brands.push(b.toString("latin1", 8, 12));
+    for (let i = 16; i + 4 <= boxLen; i += 4) brands.push(b.toString("latin1", i, i + 4));
+    return brands.some((x) => MP4_BRANDS.has(x)) ? "video/mp4" : "iso-bmff";
+  }
+  return null;
+}
+
+// Entry names from a ZIP central directory; null if missing/truncated/ZIP64.
+export function zipCentralDirectoryNames(b) {
+  if (b.length < 22) return null;
+  let eocd = -1;
+  for (let i = b.length - 22; i >= Math.max(0, b.length - 22 - 65535); i--) {
+    if (b[i] === 0x50 && b[i + 1] === 0x4b && b[i + 2] === 0x05 && b[i + 3] === 0x06) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16);
+  if (count === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff || cdOff + cdSize > eocd) return null;
+  const names = [];
+  let at = cdOff;
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > b.length || b.readUInt32LE(at) !== 0x02014b50) return null;
+    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32);
+    if (at + 46 + nl > b.length) return null;
+    names.push(b.toString("utf8", at + 46, at + 46 + nl));
+    at += 46 + nl + el + cl;
+  }
+  return names;
+}
+
+// OOXML/ODF type of a ZIP, or throws (plain zip, macros, unreadable directory).
+function classifyZip(b, name) {
+  const names = zipCentralDirectoryNames(b);
+  if (!names) throw declined(name, "ZIP with an unreadable directory");
+  for (const n of names) {
+    const lower = n.toLowerCase();
+    if (lower.split("/").pop().startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (lower.startsWith("basic/") || lower.startsWith("scripts/")) throw declined(name, `OpenDocument file containing macros (${n})`);
+  }
+  if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+  // ODF: first local entry is a stored "mimetype" whose content names the type (what infer checks).
+  if (b.toString("latin1", 0x1e, 0x26) === "mimetype") {
+    const m = b.toString("latin1", 0x26, 0x26 + 60);
+    for (const t of [ODT, ODS, ODP]) if (m.startsWith(t)) return t;
+  }
+  const set = new Set(names);
+  if (set.has("[Content_Types].xml") || names.some((n) => /^(word|xl|ppt)\//.test(n))) {
+    if (names.some((n) => n.startsWith("word/"))) return DOCX;
+    if (names.some((n) => n.startsWith("xl/"))) return XLSX;
+    if (names.some((n) => n.startsWith("ppt/"))) return PPTX;
+  }
+  throw declined(name, "zip archive");
+}
+
+// Plain-text check for txt/csv/md/json (no magic bytes to sniff).
+export function checkAttachmentText(b, ext, name = `file.${ext}`) {
+  let body = startsWith(b, [0xef, 0xbb, 0xbf]) ? b.subarray(3) : b;
+  let text;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(body); } catch { throw declined(name, `.${ext} that is not valid UTF-8 text`); }
+  if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(text)) throw declined(name, `.${ext} containing control characters`);
+  if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
+  if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
+  const head = body.subarray(0, 1024).toString("latin1").toLowerCase();
+  if (MARKUP_MARKERS.some((m) => head.includes(m))) throw declined(name, `.${ext} containing HTML/XML markup`);
+  if (ext === "json") { try { JSON.parse(text); } catch { throw declined(name, ".json that is not valid JSON"); } }
+}
+
+// Decide from the bytes whether `name` may be uploaded. `read(start, len)` returns a Buffer of the
+// file (the caller reads from the already-checked fd). → { mime, kind } | throws a local refusal.
+// The whole file is read only for ZIP-based Office files and text (both ≤100 MB, size-checked first).
+export function classifyAttachment({ name, size, read }) {
+  const display = String(name).split(/[\\/]/).pop();
+  const head = read(0, Math.min(size, 4096));
+  const sniffed = sniffHead(head);
+  const capped = (mime, kind) => { mediaCapCheck(display, size, mime); return { mime, kind }; };
+  if (sniffed && ATTACH_IMAGE_MIMES.includes(sniffed)) return capped(sniffed, mediaCapKind(sniffed));
+  if (sniffed === "video/mp4") return capped(sniffed, "video");
+  if (sniffed === "iso-bmff") throw declined(display, "ISO-BMFF media that is not mp4");
+  if (sniffed === "application/pdf") return capped(sniffed, "file");
+  if (size > MEDIA_CAPS.file) mediaCapCheck(display, size, OCTET_STREAM); // throws before a whole-file read
+  if (sniffed === "zip") return capped(classifyZip(read(0, size), display), "file");
+  const ext = localExt(display);
+  if (!TEXT_EXTS.has(ext)) throw declined(display, "unrecognised content; plain text must be .txt, .csv, .md or .json");
+  checkAttachmentText(read(0, size), ext, display);
+  return capped(OCTET_STREAM, "file");
+}
+
 export function mediaCapKind(mime) { return mime === "image/gif" ? "gif" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file"; }
-// Throws a DISTINGUISHABLE local-refusal error if `size` exceeds the per-type cap; else returns {mime,cap,kind}.
-export function mediaCapCheck(filename, size) {
-  const mime = mediaMimeForPath(filename);
+// Throws a DISTINGUISHABLE local-refusal error if `size` exceeds the per-type cap; else returns
+// {mime,cap,kind}. `mime` is the SNIFFED type (classifyAttachment) — never derived from the extension.
+export function mediaCapCheck(filename, size, mime = OCTET_STREAM) {
   const kind = mediaCapKind(mime);
   const cap = MEDIA_CAPS[kind];
   if (size > cap)
-    throw new Error(`buzz_post: attachment declined LOCALLY — ${String(filename).split("/").pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${(cap / MEDIA_MB) | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
+    throw new Error(`buzz_post: attachment declined LOCALLY — ${String(filename).split(/[\\/]/).pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${(cap / MEDIA_MB) | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
   return { mime, cap, kind };
+}
+
+// Clean a local path into the name other people see: basename, NFC, no Cf (incl. bidi U+202A–202E,
+// U+2066–2069, U+200E/F, U+061C, zero-width, BOM), no C0/C1, no / or \, trimmed of dots/spaces.
+export function sanitizeAttachmentName(p) {
+  const base = String(p ?? "").split(/[\\/]/).pop();
+  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(/^[\s.]+|[\s.]+$/gu, "");
+  return cleaned || "file";
+}
+// The posted filename: sanitised, extension forced to the sniffed/stored type, ≤120 bytes.
+export function attachmentDisplayName(p, mime) {
+  const name = sanitizeAttachmentName(p);
+  const i = name.lastIndexOf(".");
+  const stem0 = i > 0 ? name.slice(0, i) : name;
+  const ext = i > 0 ? name.slice(i + 1).toLowerCase() : "";
+  let forced;
+  if (SNIFFED_EXT.has(mime)) forced = SNIFFED_EXT.get(mime);
+  else if (ATTACH_IMAGE_MIMES.includes(mime) || ATTACH_VIDEO_MIMES.includes(mime)) forced = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
+  else forced = TEXT_EXTS.has(ext) ? ext : "txt";
+  if (mime === "image/jpeg" && (ext === "jpg" || ext === "jpeg")) forced = ext;
+  let stem = stem0.replace(/^[\s.]+|[\s.]+$/gu, "") || "file";
+  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 1;
+  while (Buffer.byteLength(stem) > budget) stem = [...stem].slice(0, -1).join("");
+  return `${stem.trimEnd() || "file"}.${forced}`;
+}
+// Escape markdown link-label metacharacters \ [ ] ( ) < > so a name can't break out of its link.
+export function escapeLinkLabel(s) { return String(s).replace(/[\\[\]()<>]/g, (c) => `\\${c}`); }
+// The message-body line for an uploaded blob: images/video stay a bare URL (rendered from imeta);
+// every other file is a named [filename](url) link.
+export function attachmentContentLine({ url, mime, filename }) {
+  const m = String(mime || "");
+  if (m.startsWith("image/") || m.startsWith("video/")) return String(url);
+  return `[${escapeLinkLabel(filename || "file")}](${url})`;
 }
 
 function normalizePubkey(v) {
