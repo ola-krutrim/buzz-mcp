@@ -23154,6 +23154,7 @@ var init_websocket = __esm({
 });
 
 // node_modules/@hono/node-server/dist/index.mjs
+import { STATUS_CODES, ServerResponse, createServer } from "node:http";
 import { Http2ServerRequest, constants } from "node:http2";
 import { Readable } from "node:stream";
 async function readWithoutBlocking(readPromise) {
@@ -23192,7 +23193,7 @@ function writeFromReadableStream(stream, writable) {
   else if (writable.destroyed) return;
   return writeFromReadableStreamDefaultReader(stream.getReader(), writable);
 }
-var RequestError, nonJoinedHeaders, validHeaderName, isHttpWhitespace, normalizeHeaderValue, forbiddenHeaderValue, GlobalHeaders, materializeHeaders, RequestHeaders, newHeadersFromIncoming, reValidRequestUrl, reDotSegment, reValidHost, buildUrl, toRequestError, GlobalRequest, Request$1, wrapBodyStream, byteExactEncodings, isByteExactEncoding, bodyBufferedBeforeDisconnectKey, bodyBufferedLengthBeforeDisconnectKey, toBufferChunk, isRecoverableDisconnectedIncoming, recordBodyBufferedBeforeDisconnect, readBodyBufferedBeforeDisconnect, enqueueBufferedBody, newRequestFromIncoming, getRequestCache, requestCache, incomingKey, urlKey, methodKey, headersKey, abortControllerKey, getAbortController, abortRequest, bodyBufferKey, bodyReadPromiseKey, bodyConsumedDirectlyKey, bodyLockReaderKey, abortReasonKey, newBodyUnusableError, rejectBodyUnusable, textDecoder, consumeBodyDirectOnce, toArrayBuffer, contentType, methodTokenRegExp, normalizeIncomingMethod, validateDirectReadMethod, readBodyWithFastPath, readRawBodyIfAvailable, normalizeAbortError, readBodyDirect, requestPrototype, newRequest, defaultContentType, responseCache, getResponseCache, cacheKey, GlobalResponse, Response$1, validRedirectUrl, parseRedirectUrl, validRedirectStatuses, buildOutgoingHttpHeaders, outgoingEnded, incomingDraining, DRAIN_TIMEOUT_MS, MAX_DRAIN_BYTES, drainIncoming, makeCloseHandler, isImmediateCacheableResponse, handleRequestError, handleFetchError, handleResponseError, flushHeaders, responseViaCache, isPromise, responseViaResponseObject, getRequestListener, CloseEvent, ErrorEvent, generateConnectionSymbol, CONNECTION_SYMBOL_KEY, WAIT_FOR_WEBSOCKET_SYMBOL, upgradeWebSocket;
+var RequestError, nonJoinedHeaders, validHeaderName, isHttpWhitespace, normalizeHeaderValue, forbiddenHeaderValue, GlobalHeaders, materializeHeaders, RequestHeaders, newHeadersFromIncoming, reValidRequestUrl, reDotSegment, reValidHost, buildUrl, toRequestError, GlobalRequest, Request$1, wrapBodyStream, byteExactEncodings, isByteExactEncoding, bodyBufferedBeforeDisconnectKey, bodyBufferedLengthBeforeDisconnectKey, toBufferChunk, isRecoverableDisconnectedIncoming, recordBodyBufferedBeforeDisconnect, readBodyBufferedBeforeDisconnect, enqueueBufferedBody, newRequestFromIncoming, getRequestCache, requestCache, incomingKey, urlKey, methodKey, headersKey, abortControllerKey, getAbortController, abortRequest, bodyBufferKey, bodyReadPromiseKey, bodyConsumedDirectlyKey, bodyLockReaderKey, abortReasonKey, newBodyUnusableError, rejectBodyUnusable, textDecoder, consumeBodyDirectOnce, toArrayBuffer, contentType, methodTokenRegExp, normalizeIncomingMethod, validateDirectReadMethod, readBodyWithFastPath, readRawBodyIfAvailable, normalizeAbortError, readBodyDirect, requestPrototype, newRequest, defaultContentType, responseCache, getResponseCache, cacheKey, GlobalResponse, Response$1, validRedirectUrl, parseRedirectUrl, validRedirectStatuses, buildOutgoingHttpHeaders, outgoingEnded, incomingDraining, DRAIN_TIMEOUT_MS, MAX_DRAIN_BYTES, drainIncoming, makeCloseHandler, isImmediateCacheableResponse, handleRequestError, handleFetchError, handleResponseError, flushHeaders, trySetContentLength, writeDefaultHeaders, responseViaCache, isPromise, responseViaResponseObject, getRequestListener, CloseEvent, ErrorEvent, generateConnectionSymbol, CONNECTION_SYMBOL_KEY, WAIT_FOR_WEBSOCKET_SYMBOL, upgradeWebSocket;
 var init_dist = __esm({
   "node_modules/@hono/node-server/dist/index.mjs"() {
     init_constants_BLSFu_RU();
@@ -23988,7 +23989,7 @@ var init_dist = __esm({
       if (incoming.errored) {
         recordBodyBufferedBeforeDisconnect(incoming);
         req[abortRequest](incoming.errored.toString());
-      } else if (!outgoing.writableFinished) {
+      } else if (!outgoing.writableFinished || incoming instanceof Http2ServerRequest && incoming.aborted) {
         recordBodyBufferedBeforeDisconnect(incoming);
         req[abortRequest]("Client connection prematurely closed.");
       }
@@ -24010,13 +24011,31 @@ var init_dist = __esm({
       if (err.code === "ERR_STREAM_PREMATURE_CLOSE") console.info("The user aborted a request.");
       else {
         console.error(e);
-        if (!outgoing.headersSent) outgoing.writeHead(500, { "Content-Type": "text/plain" });
+        if (!outgoing.headersSent) {
+          if (outgoing instanceof ServerResponse) outgoing._contentLength = null;
+          outgoing.writeHead(500, { "Content-Type": "text/plain" });
+        }
         outgoing.end(`Error: ${err.message}`);
         outgoing.destroy(err);
       }
     };
     flushHeaders = (outgoing) => {
       if ("flushHeaders" in outgoing && outgoing.writable) outgoing.flushHeaders();
+    };
+    trySetContentLength = (outgoing, status, length) => {
+      const http1 = outgoing;
+      if (http1._contentLength === null && http1._hasBody && http1.useChunkedEncodingByDefault && !http1._removedContLen && status >= 200 && status !== 204 && status !== 304 && !outgoing.hasHeader("content-length") && !outgoing.hasHeader("transfer-encoding") && !outgoing.hasHeader("trailer")) {
+        http1._contentLength = length;
+        return true;
+      }
+      return false;
+    };
+    writeDefaultHeaders = (outgoing, status, length) => {
+      if (trySetContentLength(outgoing, status, length)) outgoing.writeHead(status, { "Content-Type": defaultContentType });
+      else outgoing.writeHead(status, {
+        "Content-Type": defaultContentType,
+        "Content-Length": length
+      });
     };
     responseViaCache = async (res, outgoing) => {
       let [status, body, header] = res[cacheKey];
@@ -24025,22 +24044,13 @@ var init_dist = __esm({
           outgoing.writeHead(status);
           outgoing.end();
         } else if (typeof body === "string") {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": Buffer.byteLength(body)
-          });
+          writeDefaultHeaders(outgoing, status, Buffer.byteLength(body));
           outgoing.end(body);
         } else if (body instanceof Uint8Array) {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": body.byteLength
-          });
+          writeDefaultHeaders(outgoing, status, body.byteLength);
           outgoing.end(body);
         } else if (body instanceof Blob) {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": body.size
-          });
+          writeDefaultHeaders(outgoing, status, body.size);
           outgoing.end(new Uint8Array(await body.arrayBuffer()));
         } else {
           outgoing.writeHead(status, { "Content-Type": defaultContentType });
@@ -24051,6 +24061,8 @@ var init_dist = __esm({
         return;
       }
       let hasContentLength = false;
+      let plainHeaders = false;
+      let canAutoLength = true;
       if (header instanceof Headers) {
         hasContentLength = header.has("content-length");
         header = buildOutgoingHttpHeaders(header, body === null ? void 0 : defaultContentType);
@@ -24058,14 +24070,25 @@ var init_dist = __esm({
         const headerObj = new Headers(header);
         hasContentLength = headerObj.has("content-length");
         header = buildOutgoingHttpHeaders(headerObj, body === null ? void 0 : defaultContentType);
-      } else for (const key in header) if (key.length === 14 && key.toLowerCase() === "content-length") {
-        hasContentLength = true;
-        break;
+      } else {
+        plainHeaders = true;
+        for (const key in header) {
+          if (key.length === 14 && key.toLowerCase() === "content-length") {
+            hasContentLength = true;
+            break;
+          }
+          if (key.length === 17 && key.toLowerCase() === "transfer-encoding" || key.length === 7 && key.toLowerCase() === "trailer") canAutoLength = false;
+        }
       }
       if (!hasContentLength) {
-        if (typeof body === "string") header["Content-Length"] = Buffer.byteLength(body);
-        else if (body instanceof Uint8Array) header["Content-Length"] = body.byteLength;
-        else if (body instanceof Blob) header["Content-Length"] = body.size;
+        let length;
+        if (typeof body === "string") length = Buffer.byteLength(body);
+        else if (body instanceof Uint8Array) length = body.byteLength;
+        else if (body instanceof Blob) length = body.size;
+        if (length !== void 0 && (!plainHeaders || !canAutoLength || !trySetContentLength(outgoing, status, length))) {
+          if (plainHeaders) header = { ...header };
+          header["Content-Length"] = length;
+        }
       }
       outgoing.writeHead(status, header);
       if (body == null) outgoing.end();
@@ -25706,7 +25729,7 @@ __export(http_server_exports, {
   scrub: () => scrub,
   startHttpServer: () => startHttpServer
 });
-import { createServer } from "node:http";
+import { createServer as createServer2 } from "node:http";
 import { randomUUID, createHash as createHash4 } from "node:crypto";
 function coreEnv(env) {
   const o = { BUZZ_HARNESS: "ola-buzz-hosted", BUZZ_INTERFACE: "mcp-http", BUZZ_WIRE_SIGN: "1" };
@@ -26028,7 +26051,7 @@ async function startHttpServer({
       if (!res.headersSent) rpcErr(res, 500, -32603, "Internal error");
     }
   }
-  const httpServer = createServer({ requestTimeout: 12e4, headersTimeout: 3e4, maxHeaderSize: 16 * 1024 }, (req, res) => {
+  const httpServer = createServer2({ requestTimeout: 12e4, headersTimeout: 3e4, maxHeaderSize: 16 * 1024 }, (req, res) => {
     handle(req, res).catch((e) => {
       log("http_error", { err: String(e && e.message) });
       if (!res.headersSent) send(res, 500, { error: "internal_error" });
