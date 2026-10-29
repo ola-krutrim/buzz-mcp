@@ -21531,7 +21531,7 @@ var init_nip44 = __esm({
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
-import { inflateRawSync } from "node:zlib";
+import { inflateRawSync, constants as zlibConstants } from "node:zlib";
 function wireRefreshGet(id) {
   try {
     const f = wireRefreshFile(id);
@@ -21862,7 +21862,40 @@ function zipEntryData(b, e) {
   }
   return null;
 }
+function execExtIn(n) {
+  for (const seg of n.toLowerCase().replace(/\\/g, "/").split("/")) {
+    const i2 = seg.lastIndexOf(".");
+    const ext = i2 >= 0 ? seg.slice(i2 + 1).trim() : "";
+    if (ext && CONTAINER_EXEC_EXTS.includes(ext)) return ext;
+  }
+  return null;
+}
+function zipEntryHead(b, e) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  if (e.method === 0) return raw.subarray(0, 8);
+  if (e.method !== 8) return null;
+  try {
+    const out = inflateRawSync(raw.subarray(0, EXEC_PREFIX_IN), { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: ZIP_PART_MAX });
+    if (out.length >= 4 || raw.length <= EXEC_PREFIX_IN) return out.subarray(0, 8);
+  } catch {
+  }
+  const full = zipEntryData(b, e);
+  return full ? full.subarray(0, 8) : null;
+}
+function checkZipExecutables(b, entries, name) {
+  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
+    const ext = execExtIn(n);
+    if (ext) throw declined(name, `document containing an executable or script (${n})`);
+  }
+  for (const e of entries) {
+    if (e.name.endsWith("/") && e.csize === 0) continue;
+    const head = zipEntryHead(b, e);
+    if (!head) throw declined(name, `document with an unreadable entry (${e.name})`);
+    for (const [what, sig] of EXEC_MAGICS) if (startsWith(head, sig)) throw declined(name, `document containing a ${what} (${e.name})`);
+  }
+}
 function checkZipActiveContent(b, entries, mime, name) {
+  checkZipExecutables(b, entries, name);
   for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
     const lower = n.toLowerCase().replace(/\\/g, "/");
     const base = lower.split("/").pop();
@@ -22244,7 +22277,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, SIG, startsWith, ascii, xmlText, EXTERNAL_REL_TYPES, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, SIG, startsWith, ascii, xmlText, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, EXEC_MAGICS, EXEC_PREFIX_IN, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22315,6 +22348,19 @@ var init_signer = __esm({
       }
     });
     EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
+    CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
+    EXEC_MAGICS = [
+      ["Windows executable (MZ)", [77, 90]],
+      ["ELF executable", [127, 69, 76, 70]],
+      ["Mach-O executable", [254, 237, 250, 206]],
+      ["Mach-O executable", [206, 250, 237, 254]],
+      ["Mach-O executable", [254, 237, 250, 207]],
+      ["Mach-O executable", [207, 250, 237, 254]],
+      ["Mach-O universal binary", [202, 254, 186, 190]],
+      ["Mach-O universal binary", [190, 186, 254, 202]],
+      ["script (#!)", [35, 33]]
+    ];
+    EXEC_PREFIX_IN = 64 * 1024;
     INVISIBLE_FILLERS = /[\u2028\u2029\u115F\u1160\u3164\uFFA0\u2800]/gu;
     WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)\s*(\.|$)/i;
     avoidReservedName = (n) => WINDOWS_RESERVED.test(n) ? `_${n}` : n;
