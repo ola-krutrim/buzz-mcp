@@ -2515,9 +2515,33 @@ var TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "te
 var SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
 var ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
 var ZIP_PART_MAX = 128 * MEDIA_MB;
+var ZIP_INFLATE_BUDGET = 256 * MEDIA_MB;
 var SIG = { lfh: Buffer.from([80, 75, 3, 4]), cdh: Buffer.from([80, 75, 1, 2]), eocd: Buffer.from([80, 75, 5, 6]) };
 var CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
-var EXEC_PREFIX_IN = 64 * 1024;
+var CONTAINER_MACRO_EXTS = Object.freeze(["docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppsm", "ppam", "sldm"]);
+var HEAD_INPUT_MAX = 64 * 1024;
+function huffman(lengths) {
+  const count = new Array(16).fill(0);
+  for (const l of lengths) count[l]++;
+  count[0] = 0;
+  let left = 1;
+  for (let len = 1; len < 16; len++) {
+    left = (left << 1) - count[len];
+    if (left < 0) throw new Error("over-subscribed code");
+  }
+  const offs = new Array(16).fill(0);
+  for (let len = 1; len < 15; len++) offs[len + 1] = offs[len] + count[len];
+  const symbol = new Array(lengths.length);
+  lengths.forEach((l, s) => {
+    if (l) symbol[offs[l]++] = s;
+  });
+  return { count, symbol };
+}
+var FIXED = (() => {
+  const l = new Array(288);
+  for (let s = 0; s < 288; s++) l[s] = s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8;
+  return { lit: huffman(l), dist: huffman(new Array(30).fill(5)) };
+})();
 var RELAY_MEDIA_EXTS = Object.freeze(["jpg", "png", "gif", "webp", "mp4", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "gz", "tar", "7z", "rar", "bz2", "xz", "zst", "mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "mov", "webm", "mkv", "json", "csv", "txt", "bin"]);
 function parseAllowedKinds(body) {
   try {
