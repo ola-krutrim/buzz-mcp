@@ -21531,6 +21531,7 @@ var init_nip44 = __esm({
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
+import { inflateRawSync } from "node:zlib";
 function wireRefreshGet(id) {
   try {
     const f = wireRefreshFile(id);
@@ -21788,49 +21789,129 @@ function sniffHead(b) {
   }
   return null;
 }
-function zipCentralDirectoryNames(b) {
-  if (b.length < 22) return null;
-  let eocd = -1;
-  for (let i2 = b.length - 22; i2 >= Math.max(0, b.length - 22 - 65535); i2--) {
-    if (b[i2] === 80 && b[i2 + 1] === 75 && b[i2 + 2] === 5 && b[i2 + 3] === 6) {
-      eocd = i2;
-      break;
-    }
-  }
-  if (eocd < 0) return null;
-  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16);
-  if (count === 65535 || cdSize === 4294967295 || cdOff === 4294967295 || cdOff + cdSize > eocd) return null;
-  const names = [];
+function zipDirectory(b) {
+  if (!Buffer.isBuffer(b) || b.length < 22) return null;
+  const windowStart = Math.max(0, b.length - 22 - 65535);
+  const hits = [];
+  for (let i2 = b.indexOf(SIG.eocd, windowStart); i2 >= 0; i2 = b.indexOf(SIG.eocd, i2 + 1)) hits.push(i2);
+  if (hits.length !== 1) return null;
+  const eocd = hits[0];
+  if (eocd + 22 > b.length) return null;
+  const disk = b.readUInt16LE(eocd + 4), cdDisk = b.readUInt16LE(eocd + 6), onDisk = b.readUInt16LE(eocd + 8);
+  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16), commentLen = b.readUInt16LE(eocd + 20);
+  if (eocd + 22 + commentLen !== b.length) return null;
+  if (disk !== 0 || cdDisk !== 0 || onDisk !== count) return null;
+  if (count === 65535 || cdSize === 4294967295 || cdOff === 4294967295 || cdOff + cdSize !== eocd) return null;
+  const entries = [];
   let at = cdOff;
   for (let n = 0; n < count; n++) {
-    if (at + 46 > b.length || b.readUInt32LE(at) !== 33639248) return null;
-    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32);
-    if (at + 46 + nl > b.length) return null;
-    names.push(b.toString("utf8", at + 46, at + 46 + nl));
+    if (at + 46 > eocd || b.readUInt32LE(at) !== 33639248) return null;
+    const flags = b.readUInt16LE(at + 8), method = b.readUInt16LE(at + 10), csize = b.readUInt32LE(at + 20), usize = b.readUInt32LE(at + 24);
+    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32), lho = b.readUInt32LE(at + 42);
+    if (at + 46 + nl + el + cl > eocd) return null;
+    entries.push({ nameBytes: b.subarray(at + 46, at + 46 + nl), name: b.toString("utf8", at + 46, at + 46 + nl), flags, method, csize, usize, lho });
     at += 46 + nl + el + cl;
   }
-  return names;
+  if (at !== eocd) return null;
+  const seen = /* @__PURE__ */ new Set();
+  for (const e of entries) {
+    const key = e.name.toLowerCase();
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const L = e.lho;
+    if (L + 30 > cdOff || b.readUInt32LE(L) !== 67324752) return null;
+    const lnl = b.readUInt16LE(L + 26), lel = b.readUInt16LE(L + 28);
+    if (b.readUInt16LE(L + 8) !== e.method || !b.subarray(L + 30, L + 30 + lnl).equals(e.nameBytes)) return null;
+    e.dataAt = L + 30 + lnl + lel;
+    let end = e.dataAt + e.csize;
+    if (end > cdOff) return null;
+    if (e.flags & 8) end += end + 4 <= cdOff && b.readUInt32LE(end) === 134695760 ? 16 : 12;
+    if (end > cdOff) return null;
+    e.end = end;
+  }
+  const order = [...entries].sort((x, y) => x.lho - y.lho);
+  let pos = 0;
+  for (const e of order) {
+    if (e.lho !== pos) return null;
+    pos = e.end;
+  }
+  if (pos !== cdOff) return null;
+  for (const e of entries) {
+    delete e.nameBytes;
+    delete e.end;
+  }
+  return entries;
 }
-function classifyZip(b, name) {
-  const names = zipCentralDirectoryNames(b);
-  if (!names) throw declined(name, "ZIP with an unreadable directory");
-  for (const n of names) {
-    const lower = n.toLowerCase();
-    if (lower.split("/").pop().startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
-    if (lower.startsWith("basic/") || lower.startsWith("scripts/")) throw declined(name, `OpenDocument file containing macros (${n})`);
+function rawHeaderNames(b) {
+  const out = [];
+  for (const [sig, nlAt, nameAt] of [[SIG.lfh, 26, 30], [SIG.cdh, 28, 46]]) {
+    for (let i2 = b.indexOf(sig); i2 >= 0; i2 = b.indexOf(sig, i2 + 1)) {
+      if (i2 + nameAt > b.length) break;
+      const nl = b.readUInt16LE(i2 + nlAt);
+      if (nl && i2 + nameAt + nl <= b.length) out.push(b.toString("latin1", i2 + nameAt, i2 + nameAt + nl));
+    }
+  }
+  return out;
+}
+function zipEntryData(b, e) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  try {
+    if (e.method === 0) return raw.length <= ZIP_PART_MAX ? raw : null;
+    if (e.method === 8) return inflateRawSync(raw, { maxOutputLength: ZIP_PART_MAX });
+  } catch {
+  }
+  return null;
+}
+function checkZipActiveContent(b, entries, mime, name) {
+  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
+    const lower = n.toLowerCase().replace(/\\/g, "/");
+    const base = lower.split("/").pop();
+    if (base.startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (/(^|\/)(basic|scripts)\//.test(lower)) throw declined(name, `OpenDocument file containing macros (${n})`);
+    if (/(^|\/)activex\//.test(lower)) throw declined(name, `Office file containing ActiveX controls (${n})`);
+    if (base.startsWith("oleobject") || /(^|\/)embeddings\/[^/]*\.bin$/.test(lower)) throw declined(name, `Office file containing an embedded OLE object (${n})`);
   }
   if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
-  if (b.toString("latin1", 30, 38) === "mimetype") {
-    const m = b.toString("latin1", 38, 38 + 60);
-    for (const t of [ODT, ODS, ODP]) if (m.startsWith(t)) return t;
+  if (ODF_MIMES.includes(mime)) {
+    for (const part of ["content.xml", "styles.xml"]) {
+      const e = entries.find((x) => x.name === part);
+      if (!e) continue;
+      const data = zipEntryData(b, e);
+      if (!data) throw declined(name, `OpenDocument file with an unreadable ${part}`);
+      const t = xmlText(data);
+      if (/<[\w.-]*:?event-listeners?\b/i.test(t)) throw declined(name, `OpenDocument file with event listeners / macro bindings (${part})`);
+      if (/vnd\.sun\.star\.script:|macro:\/\//i.test(t)) throw declined(name, `OpenDocument file referencing a macro (${part})`);
+    }
+    return;
   }
-  const set = new Set(names);
-  if (set.has("[Content_Types].xml") || names.some((n) => /^(word|xl|ppt)\//.test(n))) {
-    if (names.some((n) => n.startsWith("word/"))) return DOCX;
-    if (names.some((n) => n.startsWith("xl/"))) return XLSX;
-    if (names.some((n) => n.startsWith("ppt/"))) return PPTX;
+  for (const e of entries) {
+    if (!e.name.toLowerCase().endsWith(".rels")) continue;
+    const data = zipEntryData(b, e);
+    if (!data) throw declined(name, `Office file with an unreadable relationships part (${e.name})`);
+    for (const [tag] of xmlText(data).matchAll(/<(?:[\w.-]+:)?Relationship\b[^>]*>/gi)) {
+      if (!/\bTargetMode\s*=\s*["']\s*External\s*["']/i.test(tag)) continue;
+      const type = (tag.match(/\bType\s*=\s*["']([^"']*)["']/i) || [])[1] || "";
+      if (EXTERNAL_REL_TYPES.test(type.trim())) throw declined(name, `Office file with an external ${type.trim().split("/").pop()} reference (${e.name})`);
+    }
   }
-  throw declined(name, "zip archive");
+}
+function classifyZip(b, name = "file.zip") {
+  const entries = zipDirectory(b);
+  if (!entries) throw declined(name, "ZIP with an unreadable or inconsistent directory");
+  const has = (want) => entries.some((e) => e.name.toLowerCase() === want.toLowerCase());
+  const found = [];
+  if (has("[Content_Types].xml")) {
+    for (const [part, mime] of OOXML_MAIN_PARTS) if (has(part)) found.push(mime);
+  }
+  const mt = entries.find((e) => e.name === "mimetype");
+  if (mt && mt.method === 0 && mt.csize <= 128) {
+    const value = b.toString("latin1", mt.dataAt, mt.dataAt + mt.csize);
+    if (ODF_MIMES.includes(value) && entries.some((e) => e.name === "content.xml") && entries.some((e) => e.name === "META-INF/manifest.xml")) found.push(value);
+  }
+  if (found.length === 0) throw declined(name, "zip archive \u2014 not a Word, Excel, PowerPoint or OpenDocument file");
+  if (found.length > 1) throw declined(name, `zip archive that claims more than one document type (${found.map((m) => SNIFFED_EXT.get(m)).join(", ")})`);
+  checkZipActiveContent(b, entries, found[0], name);
+  return found[0];
 }
 function checkAttachmentText(b, ext, name = `file.${ext}`) {
   let body = startsWith(b, [239, 187, 191]) ? b.subarray(3) : b;
@@ -21843,8 +21924,9 @@ function checkAttachmentText(b, ext, name = `file.${ext}`) {
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(text)) throw declined(name, `.${ext} containing control characters`);
   if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
   if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
-  const head = body.subarray(0, 1024).toString("latin1").toLowerCase();
-  if (MARKUP_MARKERS.some((m) => head.includes(m))) throw declined(name, `.${ext} containing HTML/XML markup`);
+  const lower = text.toLowerCase();
+  const hit = MARKUP_MARKERS.find((m) => lower.includes(m));
+  if (hit) throw declined(name, `.${ext} containing HTML/XML markup (${hit})`);
   if (ext === "json") {
     try {
       JSON.parse(text);
@@ -21884,23 +21966,47 @@ function mediaCapCheck(filename, size, mime = OCTET_STREAM) {
 }
 function sanitizeAttachmentName(p) {
   const base = String(p ?? "").split(/[\\/]/).pop();
-  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(/^[\s.]+|[\s.]+$/gu, "");
-  return cleaned || "file";
+  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(INVISIBLE_FILLERS, "").replace(/^[\s.]+|[\s.]+$/gu, "");
+  return cleaned ? avoidReservedName(cleaned) : "file";
+}
+function attachmentExtFor(mime, localName = "") {
+  if (SNIFFED_EXT.has(mime)) return SNIFFED_EXT.get(mime);
+  const media = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
+  if (media) return media;
+  const ext = localExt(sanitizeAttachmentName(localName));
+  if (mime === OCTET_STREAM && TEXT_EXTS.has(ext)) return ext;
+  throw new Error(`buzz_post: no display name for ${sanitizeAttachmentName(localName)} \u2014 type ${JSON.stringify(String(mime))} is not one the shim classified (refusing rather than guessing an extension).`);
 }
 function attachmentDisplayName(p, mime) {
   const name = sanitizeAttachmentName(p);
   const i2 = name.lastIndexOf(".");
   const stem0 = i2 > 0 ? name.slice(0, i2) : name;
   const ext = i2 > 0 ? name.slice(i2 + 1).toLowerCase() : "";
-  let forced;
-  if (SNIFFED_EXT.has(mime)) forced = SNIFFED_EXT.get(mime);
-  else if (ATTACH_IMAGE_MIMES.includes(mime) || ATTACH_VIDEO_MIMES.includes(mime)) forced = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
-  else forced = TEXT_EXTS.has(ext) ? ext : "txt";
+  let forced = attachmentExtFor(mime, name);
   if (mime === "image/jpeg" && (ext === "jpg" || ext === "jpeg")) forced = ext;
   let stem = stem0.replace(/^[\s.]+|[\s.]+$/gu, "") || "file";
-  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 1;
+  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 2;
   while (Buffer.byteLength(stem) > budget) stem = [...stem].slice(0, -1).join("");
-  return `${stem.trimEnd() || "file"}.${forced}`;
+  return avoidReservedName(`${stem.trimEnd() || "file"}.${forced}`);
+}
+function checkDescriptorMime(stored, classified, name = "file") {
+  const s = String(stored ?? "");
+  if (s && (s === classified || s === ZIP_MIME && ZIP_DOCUMENT_MIMES.includes(classified))) return true;
+  throw new Error(`buzz_post: upload of ${sanitizeAttachmentName(name)} refused \u2014 the relay stored it as ${JSON.stringify(s || "(no type)")} but the shim classified it as ${JSON.stringify(String(classified))}; not posting it (the uploaded blob is left unreferenced).`);
+}
+function parseMediaShaExt(url, sha2562, { hosted = false } = {}) {
+  let path;
+  try {
+    path = new URL(String(url)).pathname;
+  } catch {
+    throw new Error("attachment url is not a URL \u2014 refusing");
+  }
+  const seg = path.split("/").pop();
+  const m = /^([0-9a-f]{64})(?:\.([a-z0-9]{1,8}))?$/.exec(seg);
+  if (!m) throw new Error("attachment url is not /media/<sha256>[.<ext>] \u2014 refusing");
+  if (m[1] !== String(sha2562 || "").toLowerCase()) throw new Error("attachment url sha256 \u2260 imeta x \u2014 refusing");
+  if (hosted && m[2] && !RELAY_MEDIA_EXTS.includes(m[2])) throw new Error(`attachment extension .${m[2]} is not one the relay issues \u2014 refusing`);
+  return seg;
 }
 function escapeLinkLabel(s) {
   return String(s).replace(/[\\[\]()<>]/g, (c) => `\\${c}`);
@@ -22138,7 +22244,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, startsWith, ascii, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, SIG, startsWith, ascii, xmlText, EXTERNAL_REL_TYPES, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22192,9 +22298,27 @@ var init_signer = __esm({
     TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "text").map((t) => t.ext));
     SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
     MP4_BRANDS = /* @__PURE__ */ new Set(["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7", "iso8", "iso9", "mp41", "mp42", "avc1", "dash", "M4V "]);
-    MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml"];
+    MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml", "<object", "<embed", "<meta", "<link", "<style", "javascript:"];
+    ZIP_MIME = "application/zip";
+    OOXML_MAIN_PARTS = [["word/document.xml", DOCX], ["xl/workbook.xml", XLSX], ["ppt/presentation.xml", PPTX]];
+    ODF_MIMES = [ODT, ODS, ODP];
+    ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
+    ZIP_PART_MAX = 128 * MEDIA_MB;
+    SIG = { lfh: Buffer.from([80, 75, 3, 4]), cdh: Buffer.from([80, 75, 1, 2]), eocd: Buffer.from([80, 75, 5, 6]) };
     startsWith = (b, sig, at = 0) => b.length >= at + sig.length && sig.every((v, i2) => b[at + i2] === v);
     ascii = (s) => [...s].map((c) => c.charCodeAt(0));
+    xmlText = (buf) => buf.toString("utf8").replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => {
+      try {
+        return String.fromCodePoint(h ? parseInt(h, 16) : Number(d));
+      } catch {
+        return "";
+      }
+    });
+    EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
+    INVISIBLE_FILLERS = /[\u2028\u2029\u115F\u1160\u3164\uFFA0\u2800]/gu;
+    WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)\s*(\.|$)/i;
+    avoidReservedName = (n) => WINDOWS_RESERVED.test(n) ? `_${n}` : n;
+    RELAY_MEDIA_EXTS = Object.freeze(["jpg", "png", "gif", "webp", "mp4", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "gz", "tar", "7z", "rar", "bz2", "xz", "zst", "mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "mov", "webm", "mkv", "json", "csv", "txt", "bin"]);
     echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
     BUZZ_APP_SIGNIN_MESSAGE = "Open the Buzz app once and sign in with Ekam, then try again.";
     BUZZ_APP_SIGNIN_RE = /Open the Buzz app once and sign in with Ekam/;
@@ -27520,7 +27644,9 @@ async function createBuzzServer(opts = {}) {
       d = JSON.parse(text);
     } catch {
     }
-    return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: attachmentDisplayName(filePath, d.type || mime) };
+    checkDescriptorMime(d.type, mime, basename2(filePath));
+    const filename = attachmentDisplayName(filePath, mime);
+    return { url: d.url || `${RELAY}/media/${sha}${extname(filename)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type, classified: mime, filename };
   }
   function fdReader(fd) {
     return (start, len) => {
@@ -29086,9 +29212,9 @@ ${line}` : line;
         const att = atts[idx];
         if (!att) throw new Error(`attachment index ${idx} out of range \u2014 message has ${atts.length} (0..${atts.length - 1})`);
         if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) \u2014 refusing to fetch an unverifiable blob`);
-        const shaExt = basename2(new URL(att.url).pathname);
-        const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
         if (!/^[0-9a-f]{64}$/.test(String(att.sha256).toLowerCase())) throw new Error("attachment sha256 is not 64-hex \u2014 refusing");
+        const shaExt = parseMediaShaExt(att.url, att.sha256, { hosted: HOSTED });
+        const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
         if (HOSTED) {
           const buf = await blossomFetchToMemory(shaExt, HOSTED_ATTACH_MAX);
           const got2 = createHash5("sha256").update(buf).digest("hex");
