@@ -22,7 +22,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { inflateRawSync } from "node:zlib";
+import { inflateRawSync, constants as zlibConstants } from "node:zlib";
 // Ola's registered PUBLIC OAuth client for "post as me" (PKCE, localhost redirect;
 // no secret). Users kept getting "set BUZZ_EKAM_CLIENT_ID" at the one-time login
 // because every install shares this one id — so it is the default; the env var
@@ -484,8 +484,54 @@ function zipEntryData(b, e) {
 const xmlText = (buf) => buf.toString("utf8").replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => { try { return String.fromCodePoint(h ? parseInt(h, 16) : Number(d)); } catch { return ""; } });
 const EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
 
+// Executables / scripts carried inside a document container: by entry name (any path segment's extension)
+// and by the entry's first (inflated) bytes — MZ (PE/DOS), ELF, Mach-O (32/64-bit either byte order, fat), "#!".
+export const CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
+const EXEC_MAGICS = [
+  ["Windows executable (MZ)", [0x4d, 0x5a]],
+  ["ELF executable", [0x7f, 0x45, 0x4c, 0x46]],
+  ["Mach-O executable", [0xfe, 0xed, 0xfa, 0xce]], ["Mach-O executable", [0xce, 0xfa, 0xed, 0xfe]],
+  ["Mach-O executable", [0xfe, 0xed, 0xfa, 0xcf]], ["Mach-O executable", [0xcf, 0xfa, 0xed, 0xfe]],
+  ["Mach-O universal binary", [0xca, 0xfe, 0xba, 0xbe]], ["Mach-O universal binary", [0xbe, 0xba, 0xfe, 0xca]],
+  ["script (#!)", [0x23, 0x21]],
+];
+const EXEC_PREFIX_IN = 64 * 1024; // compressed bytes fed to the prefix inflate
+function execExtIn(n) {
+  for (const seg of n.toLowerCase().replace(/\\/g, "/").split("/")) {
+    const i = seg.lastIndexOf(".");
+    const ext = i >= 0 ? seg.slice(i + 1).trim() : "";
+    if (ext && CONTAINER_EXEC_EXTS.includes(ext)) return ext;
+  }
+  return null;
+}
+// First bytes of an entry's content (≥ 4 when the entry has them), or null when they can't be read (fail closed).
+function zipEntryHead(b, e) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  if (e.method === 0) return raw.subarray(0, 8);
+  if (e.method !== 8) return null;
+  try {
+    const out = inflateRawSync(raw.subarray(0, EXEC_PREFIX_IN), { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: ZIP_PART_MAX });
+    if (out.length >= 4 || raw.length <= EXEC_PREFIX_IN) return out.subarray(0, 8);
+  } catch {}
+  const full = zipEntryData(b, e);
+  return full ? full.subarray(0, 8) : null;
+}
+function checkZipExecutables(b, entries, name) {
+  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
+    const ext = execExtIn(n);
+    if (ext) throw declined(name, `document containing an executable or script (${n})`);
+  }
+  for (const e of entries) {
+    if (e.name.endsWith("/") && e.csize === 0) continue; // directory entry
+    const head = zipEntryHead(b, e);
+    if (!head) throw declined(name, `document with an unreadable entry (${e.name})`);
+    for (const [what, sig] of EXEC_MAGICS) if (startsWith(head, sig)) throw declined(name, `document containing a ${what} (${e.name})`);
+  }
+}
+
 // Active-content checks on a classified OOXML/ODF ZIP. Throws a local refusal on the first hit.
 function checkZipActiveContent(b, entries, mime, name) {
+  checkZipExecutables(b, entries, name);
   for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
     const lower = n.toLowerCase().replace(/\\/g, "/");
     const base = lower.split("/").pop();
