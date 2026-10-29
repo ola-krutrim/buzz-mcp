@@ -2516,6 +2516,8 @@ var SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "
 var ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
 var ZIP_PART_MAX = 128 * MEDIA_MB;
 var SIG = { lfh: Buffer.from([80, 75, 3, 4]), cdh: Buffer.from([80, 75, 1, 2]), eocd: Buffer.from([80, 75, 5, 6]) };
+var CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
+var EXEC_PREFIX_IN = 64 * 1024;
 var RELAY_MEDIA_EXTS = Object.freeze(["jpg", "png", "gif", "webp", "mp4", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "gz", "tar", "7z", "rar", "bz2", "xz", "zst", "mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "mov", "webm", "mkv", "json", "csv", "txt", "bin"]);
 function parseAllowedKinds(body) {
   try {
