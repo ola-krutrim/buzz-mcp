@@ -22,7 +22,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { inflateRawSync, constants as zlibConstants } from "node:zlib";
+import { inflateRawSync } from "node:zlib";
 // Ola's registered PUBLIC OAuth client for "post as me" (PKCE, localhost redirect;
 // no secret). Users kept getting "set BUZZ_EKAM_CLIENT_ID" at the one-time login
 // because every install shares this one id — so it is the default; the env var
@@ -365,7 +365,14 @@ const OOXML_MAIN_PARTS = [["word/document.xml", DOCX], ["xl/workbook.xml", XLSX]
 const ODF_MIMES = [ODT, ODS, ODP];
 // The ZIP-based document types (classified from the central directory; the relay may store them as application/zip).
 export const ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
-const ZIP_PART_MAX = 128 * MEDIA_MB; // inflate cap for one inspected part (.rels, content.xml, styles.xml) — zip-bomb guard
+// Inspection limits (review round 3, should-fix S1). One upload's inspection may inflate at most
+// ZIP_INFLATE_BUDGET bytes in total — every inspected part (.rels, content.xml, styles.xml) and every embedded
+// document, at every nesting level — and no single part more than ZIP_PART_MAX. Over budget → refused (fail
+// closed; a legitimate document whose inspected XML inflates past 256 MiB is a known false positive).
+export const ZIP_PART_MAX = 128 * MEDIA_MB;
+export const ZIP_INFLATE_BUDGET = 256 * MEDIA_MB;
+export const ZIP_MAX_ENTRIES = 10_000; // ZIP entries per upload, embedded documents included
+export const ZIP_MAX_NESTING = 2; // a document may embed documents that embed documents; one more level is refused
 const SIG = { lfh: Buffer.from([0x50, 0x4b, 0x03, 0x04]), cdh: Buffer.from([0x50, 0x4b, 0x01, 0x02]), eocd: Buffer.from([0x50, 0x4b, 0x05, 0x06]) };
 
 function declined(name, why) {
@@ -471,22 +478,126 @@ function rawHeaderNames(b) {
   }
   return out;
 }
-// The (inflated) bytes of one entry; null if it can't be read within ZIP_PART_MAX (fail closed by callers).
-function zipEntryData(b, e) {
+// The (inflated) bytes of one entry, charged to the per-upload inflate budget. Throws a local refusal when
+// the entry can't be read within min(ZIP_PART_MAX, what is left of ZIP_INFLATE_BUDGET) (fail closed).
+function zipEntryData(ctx, b, e, what) {
   const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
-  try {
-    if (e.method === 0) return raw.length <= ZIP_PART_MAX ? raw : null;
-    if (e.method === 8) return inflateRawSync(raw, { maxOutputLength: ZIP_PART_MAX });
-  } catch {}
+  const cap = Math.min(ZIP_PART_MAX, ctx.left);
+  let out = null, tooBig = false;
+  if (e.method === 0) { if (raw.length <= cap) out = raw; else tooBig = true; }
+  else if (e.method === 8) {
+    try { out = inflateRawSync(raw, { maxOutputLength: cap }); } catch (err) { tooBig = err?.code === "ERR_BUFFER_TOO_LARGE" || err instanceof RangeError; }
+  }
+  if (!out) {
+    if (tooBig && cap < ZIP_PART_MAX) throw declined(ctx.name, `document that inflates past the ${ZIP_INFLATE_BUDGET / MEDIA_MB} MiB inspection budget (${e.name})`);
+    if (tooBig) throw declined(ctx.name, `document with a ${what} that inflates past the ${ZIP_PART_MAX / MEDIA_MB} MiB per-part cap (${e.name})`);
+    throw declined(ctx.name, `document with an unreadable ${what} (${e.name})`);
+  }
+  ctx.left -= out.length;
+  return out;
+}
+
+// Review round 3 (must-fix 1): an inspected XML part must be UTF-8 — no UTF-16/32 byte-order mark, no NUL
+// byte, valid UTF-8, no `encoding=` other than UTF-8 in the XML declaration, and no <!ENTITY declarations.
+// A UTF-16 part decoded as UTF-8 is garbage to the scans below, but Office/LibreOffice read it fine.
+const XML_BAD_BOMS = [["UTF-32 BE", [0x00, 0x00, 0xfe, 0xff]], ["UTF-32 LE", [0xff, 0xfe, 0x00, 0x00]], ["UTF-16 BE", [0xfe, 0xff]], ["UTF-16 LE", [0xff, 0xfe]]];
+function xmlPartText(ctx, data, part) {
+  for (const [what, bom] of XML_BAD_BOMS) if (startsWith(data, bom)) throw declined(ctx.name, `document with a non-UTF-8 (${what}) XML part (${part})`);
+  const body = startsWith(data, [0xef, 0xbb, 0xbf]) ? data.subarray(3) : data;
+  if (body.includes(0)) throw declined(ctx.name, `document with a NUL byte in an XML part — UTF-16/32? (${part})`);
+  let t;
+  try { t = new TextDecoder("utf-8", { fatal: true }).decode(body); } catch { throw declined(ctx.name, `document with an XML part that is not valid UTF-8 (${part})`); }
+  const decl = t.match(/^\s*<\?xml\b([^]*?)\?>/i);
+  const enc = decl && decl[1].match(/\bencoding\s*=\s*(["'])([^"']*)\1/i);
+  if (decl && /\bencoding\b/i.test(decl[1]) && !(enc && /^\s*utf-?8\s*$/i.test(enc[2]))) throw declined(ctx.name, `document with an XML part declared in a non-UTF-8 encoding (${part})`);
+  if (/<!ENTITY\b/i.test(t)) throw declined(ctx.name, `document with an XML entity declaration (${part})`);
+  return t;
+}
+// XML numeric character references decoded so `&#69;xternal` can't hide `External` from the ODF scans.
+const xmlText = (t) => t.replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => { try { return String.fromCodePoint(h ? parseInt(h, 16) : Number(d)); } catch { return ""; } });
+const XML_NAMED = { lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" };
+// One XML attribute value with its references decoded (numeric + the five predefined names); null for an
+// undeclared entity (a fatal XML error — callers fail closed).
+function xmlAttrValue(v) {
+  let bad = false;
+  const out = v.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][\w.-]*));/gi, (_, h, d, n) => {
+    if (n) { const c = XML_NAMED[n]; if (c === undefined) bad = true; return c ?? ""; }
+    try { return String.fromCodePoint(h ? parseInt(h, 16) : Number(d)); } catch { bad = true; return ""; }
+  });
+  if (bad || /&(?!(?:#x[0-9a-f]+|#[0-9]+|[a-z][\w.-]*);)/i.test(v)) return null; // bare '&' is malformed XML
+  return out.replace(/[\t\n\r]/g, " "); // attribute-value normalisation
+}
+// Review round 3 (must-fix 2): the start tags of a .rels part, tokenised quote-aware (a `>` inside a quoted
+// Target no longer ends the tag). Comments, CDATA and processing instructions are skipped; a DOCTYPE (OPC
+// forbids DTDs), an unterminated construct or a malformed attribute fails closed. → [{ name, attrs: [[n, v]] }]
+export function xmlStartTags(t) {
+  const tags = [];
+  const bad = (why) => { throw new Error(why); };
+  let i = 0;
+  const ws = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
+  while ((i = t.indexOf("<", i)) >= 0) {
+    if (t.startsWith("<!--", i)) { const j = t.indexOf("-->", i + 4); if (j < 0) bad("unterminated comment"); i = j + 3; continue; }
+    if (t.startsWith("<![CDATA[", i)) { const j = t.indexOf("]]>", i + 9); if (j < 0) bad("unterminated CDATA"); i = j + 3; continue; }
+    if (t.startsWith("<?", i)) { const j = t.indexOf("?>", i + 2); if (j < 0) bad("unterminated processing instruction"); i = j + 2; continue; }
+    if (t.startsWith("<!", i)) bad("DOCTYPE or markup declaration");
+    if (t.startsWith("</", i)) { const j = t.indexOf(">", i + 2); if (j < 0) bad("unterminated end tag"); i = j + 1; continue; }
+    let j = i + 1;
+    while (j < t.length && !ws(t[j]) && t[j] !== "/" && t[j] !== ">") j++;
+    const name = t.slice(i + 1, j);
+    if (!name || /["'<=]/.test(name)) bad("malformed tag name");
+    const attrs = [];
+    for (;;) {
+      while (j < t.length && ws(t[j])) j++;
+      if (j >= t.length) bad("unterminated start tag");
+      if (t[j] === ">") { j++; break; }
+      if (t[j] === "/") { if (t[j + 1] !== ">") bad("malformed empty-element tag"); j += 2; break; }
+      const a0 = j;
+      while (j < t.length && !ws(t[j]) && t[j] !== "=" && t[j] !== ">" && t[j] !== "/" && t[j] !== "<" && t[j] !== '"' && t[j] !== "'") j++;
+      const an = t.slice(a0, j);
+      if (!an) bad("malformed attribute");
+      while (j < t.length && ws(t[j])) j++;
+      if (t[j] !== "=") bad("attribute without a value");
+      j++;
+      while (j < t.length && ws(t[j])) j++;
+      const q = t[j];
+      if (q !== '"' && q !== "'") bad("unquoted attribute value");
+      const end = t.indexOf(q, j + 1);
+      if (end < 0) bad("unterminated attribute value");
+      const raw = t.slice(j + 1, end);
+      if (raw.includes("<")) bad("'<' in an attribute value");
+      const v = xmlAttrValue(raw);
+      if (v === null) bad("undeclared entity in an attribute value");
+      attrs.push([an, v]);
+      j = end + 1;
+      if (j < t.length && !ws(t[j]) && t[j] !== ">" && t[j] !== "/") bad("attributes not separated by whitespace");
+    }
+    tags.push({ name, attrs });
+    i = j;
+  }
+  return tags;
+}
+const localName = (n) => n.toLowerCase().split(":").pop();
+// The refused kind of the first External relationship of an EXTERNAL_REL_TYPES type in a .rels text, or null.
+// Every TargetMode / Type attribute counts (a duplicate is malformed XML; fail closed on any of them).
+export function externalRelationship(t) {
+  for (const tag of xmlStartTags(t)) {
+    if (localName(tag.name) !== "relationship") continue;
+    const vals = (n) => tag.attrs.filter(([a]) => localName(a) === n).map(([, v]) => v.trim());
+    if (!vals("targetmode").some((m) => m.toLowerCase() === "external")) continue;
+    for (const ty of vals("type")) { const m = ty.match(EXTERNAL_REL_TYPES); if (m) return m[1]; }
+  }
   return null;
 }
-// XML numeric character references decoded so `&#69;xternal` can't hide `External` from the scan.
-const xmlText = (buf) => buf.toString("utf8").replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => { try { return String.fromCodePoint(h ? parseInt(h, 16) : Number(d)); } catch { return ""; } });
 const EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
 
 // Executables / scripts carried inside a document container: by entry name (any path segment's extension)
-// and by the entry's first (inflated) bytes — MZ (PE/DOS), ELF, Mach-O (32/64-bit either byte order, fat), "#!".
+// and by the entry's first (inflated) bytes — MZ (PE/DOS), ELF, Mach-O (32/64-bit either byte order, fat), "#!",
+// and (round 3) an OLE compound file (legacy .doc/.xls/.ppt or an embedded OLE object).
 export const CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
+// Macro-enabled Office formats, refused as embedded parts (review round 3).
+export const CONTAINER_MACRO_EXTS = Object.freeze(["docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppsm", "ppam", "sldm"]);
+// Embedded parts that are (or claim to be) ZIP packages — inspected recursively as OOXML/ODF.
+const NESTED_ZIP_EXTS = ["docx", "dotx", "xlsx", "xltx", "pptx", "potx", "ppsx", "odt", "ods", "odp", "odg", "odf", "odc", "ott", "ots", "otp", "zip"];
 const EXEC_MAGICS = [
   ["Windows executable (MZ)", [0x4d, 0x5a]],
   ["ELF executable", [0x7f, 0x45, 0x4c, 0x46]],
@@ -494,84 +605,188 @@ const EXEC_MAGICS = [
   ["Mach-O executable", [0xfe, 0xed, 0xfa, 0xcf]], ["Mach-O executable", [0xcf, 0xfa, 0xed, 0xfe]],
   ["Mach-O universal binary", [0xca, 0xfe, 0xba, 0xbe]], ["Mach-O universal binary", [0xbe, 0xba, 0xfe, 0xca]],
   ["script (#!)", [0x23, 0x21]],
+  ["legacy OLE compound file / embedded OLE object", [0xd0, 0xcf, 0x11, 0xe0]],
 ];
-const EXEC_PREFIX_IN = 64 * 1024; // compressed bytes fed to the prefix inflate
-function execExtIn(n) {
+function segExtIn(n, list) {
   for (const seg of n.toLowerCase().replace(/\\/g, "/").split("/")) {
     const i = seg.lastIndexOf(".");
     const ext = i >= 0 ? seg.slice(i + 1).trim() : "";
-    if (ext && CONTAINER_EXEC_EXTS.includes(ext)) return ext;
+    if (ext && list.includes(ext)) return ext;
   }
   return null;
 }
-// First bytes of an entry's content (≥ 4 when the entry has them), or null when they can't be read (fail closed).
+
+// Review round 3 (should-fix S1b): a streaming raw-DEFLATE decoder that stops after `want` output bytes, so
+// reading an entry's magic costs a few hundred input bytes instead of inflating up to ZIP_PART_MAX. It reads
+// at most HEAD_INPUT_MAX compressed bytes; → Buffer (shorter only when the stream itself ends) | null when
+// the stream is malformed, truncated, or needs more input than that (callers fail closed).
+const HEAD_INPUT_MAX = 64 * 1024;
+const LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CLORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+function huffman(lengths) {
+  const count = new Array(16).fill(0);
+  for (const l of lengths) count[l]++;
+  count[0] = 0;
+  let left = 1;
+  for (let len = 1; len < 16; len++) { left = (left << 1) - count[len]; if (left < 0) throw new Error("over-subscribed code"); }
+  const offs = new Array(16).fill(0);
+  for (let len = 1; len < 15; len++) offs[len + 1] = offs[len] + count[len];
+  const symbol = new Array(lengths.length);
+  lengths.forEach((l, s) => { if (l) symbol[offs[l]++] = s; });
+  return { count, symbol };
+}
+const FIXED = (() => {
+  const l = new Array(288);
+  for (let s = 0; s < 288; s++) l[s] = s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8;
+  return { lit: huffman(l), dist: huffman(new Array(30).fill(5)) };
+})();
+export function inflateHead(src, want = 8) {
+  const limit = Math.min(src.length, HEAD_INPUT_MAX);
+  let pos = 0, bitbuf = 0, bitcnt = 0;
+  const out = [];
+  const bits = (n) => {
+    while (bitcnt < n) { if (pos >= limit) throw new Error("out of input"); bitbuf |= src[pos++] << bitcnt; bitcnt += 8; }
+    const v = bitbuf & ((1 << n) - 1);
+    bitbuf >>>= n; bitcnt -= n;
+    return v;
+  };
+  const decode = (h) => {
+    let code = 0, first = 0, index = 0;
+    for (let len = 1; len < 16; len++) {
+      code |= bits(1);
+      const c = h.count[len];
+      if (code - c < first) return h.symbol[index + (code - first)];
+      index += c; first += c; first <<= 1; code <<= 1;
+    }
+    throw new Error("bad code");
+  };
+  try {
+    let last = 0;
+    while (!last && out.length < want) {
+      last = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        bitbuf = 0; bitcnt = 0;
+        if (pos + 4 > limit) throw new Error("out of input");
+        const len = src[pos] | (src[pos + 1] << 8), nlen = src[pos + 2] | (src[pos + 3] << 8);
+        if ((len ^ 0xffff) !== nlen) throw new Error("bad stored block");
+        pos += 4;
+        for (let k = 0; k < len && out.length < want; k++) { if (pos >= limit) throw new Error("out of input"); out.push(src[pos++]); }
+        continue;
+      }
+      let lit, dist;
+      if (type === 1) ({ lit, dist } = FIXED);
+      else if (type === 2) {
+        const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+        if (nlen > 286 || ndist > 30) throw new Error("bad counts");
+        const cl = new Array(19).fill(0);
+        for (let k = 0; k < ncode; k++) cl[CLORDER[k]] = bits(3);
+        const clh = huffman(cl);
+        const lens = [];
+        while (lens.length < nlen + ndist) {
+          const sym = decode(clh);
+          if (sym < 16) lens.push(sym);
+          else {
+            let rep, val = 0;
+            if (sym === 16) { if (!lens.length) throw new Error("repeat with no length"); val = lens[lens.length - 1]; rep = 3 + bits(2); }
+            else if (sym === 17) rep = 3 + bits(3);
+            else rep = 11 + bits(7);
+            if (lens.length + rep > nlen + ndist) throw new Error("too many lengths");
+            for (let k = 0; k < rep; k++) lens.push(val);
+          }
+        }
+        if (!lens[256]) throw new Error("no end-of-block code");
+        lit = huffman(lens.slice(0, nlen)); dist = huffman(lens.slice(nlen));
+      } else throw new Error("bad block type");
+      for (;;) {
+        const sym = decode(lit);
+        if (sym < 256) { out.push(sym); if (out.length >= want) break; continue; }
+        if (sym === 256) break;
+        const li = sym - 257;
+        if (li >= 29) throw new Error("bad length");
+        const len = LBASE[li] + bits(LEXT[li]);
+        const di = decode(dist);
+        if (di >= 30) throw new Error("bad distance");
+        const d = DBASE[di] + bits(DEXT[di]);
+        if (d > out.length) throw new Error("distance too far");
+        for (let k = 0; k < len && out.length < want; k++) out.push(out[out.length - d]);
+        if (out.length >= want) break;
+      }
+    }
+  } catch { return null; }
+  return Buffer.from(out.slice(0, want));
+}
+// First bytes of an entry's content (up to 8), or null when they can't be read (fail closed).
 function zipEntryHead(b, e) {
   const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
   if (e.method === 0) return raw.subarray(0, 8);
   if (e.method !== 8) return null;
-  try {
-    const out = inflateRawSync(raw.subarray(0, EXEC_PREFIX_IN), { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: ZIP_PART_MAX });
-    if (out.length >= 4 || raw.length <= EXEC_PREFIX_IN) return out.subarray(0, 8);
-  } catch {}
-  const full = zipEntryData(b, e);
-  return full ? full.subarray(0, 8) : null;
+  return inflateHead(raw, 8);
 }
-function checkZipExecutables(b, entries, name) {
+
+// Active-content checks on a classified OOXML/ODF ZIP (ctx: { name, left, entries, depth }). Throws a local
+// refusal on the first hit. Embedded ZIP packages are classified and checked the same way, recursively,
+// up to ZIP_MAX_NESTING levels, all sharing one ZIP_INFLATE_BUDGET and one ZIP_MAX_ENTRIES count.
+function checkZipActiveContent(b, entries, mime, ctx) {
+  const name = ctx.name;
+  ctx.entries += entries.length;
+  if (ctx.entries > ZIP_MAX_ENTRIES) throw declined(name, `document with more than ${ZIP_MAX_ENTRIES} ZIP entries`);
   for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
-    const ext = execExtIn(n);
+    const ext = segExtIn(n, CONTAINER_EXEC_EXTS);
     if (ext) throw declined(name, `document containing an executable or script (${n})`);
+    const lower = n.toLowerCase().replace(/\\/g, "/");
+    const base = lower.split("/").pop();
+    if (base.startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (segExtIn(n, CONTAINER_MACRO_EXTS)) throw declined(name, `Office file containing a macro-enabled document (${n})`);
+    if (/(^|\/)(basic|scripts)\//.test(lower)) throw declined(name, `OpenDocument file containing macros (${n})`);
+    if (/(^|\/)(macrosheets|dialogsheets)\//.test(lower)) throw declined(name, `Office file containing Excel 4.0 macro sheets (${n})`);
+    if (/(^|\/)activex\//.test(lower)) throw declined(name, `Office file containing ActiveX controls (${n})`);
+    if (base.startsWith("oleobject") || /(^|\/)embeddings\/[^/]*\.bin$/.test(lower)) throw declined(name, `Office file containing an embedded OLE object (${n})`);
   }
+  if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+  const nested = [];
   for (const e of entries) {
     if (e.name.endsWith("/") && e.csize === 0) continue; // directory entry
     const head = zipEntryHead(b, e);
     if (!head) throw declined(name, `document with an unreadable entry (${e.name})`);
     for (const [what, sig] of EXEC_MAGICS) if (startsWith(head, sig)) throw declined(name, `document containing a ${what} (${e.name})`);
+    const zipHead = startsWith(head, SIG.lfh) || startsWith(head, SIG.eocd);
+    if (zipHead || segExtIn(e.name, NESTED_ZIP_EXTS)) nested.push(e);
   }
-}
-
-// Active-content checks on a classified OOXML/ODF ZIP. Throws a local refusal on the first hit.
-function checkZipActiveContent(b, entries, mime, name) {
-  checkZipExecutables(b, entries, name);
-  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
-    const lower = n.toLowerCase().replace(/\\/g, "/");
-    const base = lower.split("/").pop();
-    if (base.startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
-    if (/(^|\/)(basic|scripts)\//.test(lower)) throw declined(name, `OpenDocument file containing macros (${n})`);
-    if (/(^|\/)activex\//.test(lower)) throw declined(name, `Office file containing ActiveX controls (${n})`);
-    if (base.startsWith("oleobject") || /(^|\/)embeddings\/[^/]*\.bin$/.test(lower)) throw declined(name, `Office file containing an embedded OLE object (${n})`);
+  for (const e of nested) {
+    if (ctx.depth >= ZIP_MAX_NESTING) throw declined(name, `document with embedded documents nested more than ${ZIP_MAX_NESTING} deep (${e.name})`);
+    const inner = zipEntryData(ctx, b, e, "embedded document");
+    const child = { ...ctx, depth: ctx.depth + 1 };
+    try { classifyZipIn(inner, child, `embedded ${e.name}`); } finally { ctx.left = child.left; ctx.entries = child.entries; }
   }
-  if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
   if (ODF_MIMES.includes(mime)) {
-    for (const part of ["content.xml", "styles.xml"]) {
-      const e = entries.find((x) => x.name === part);
-      if (!e) continue; // content.xml is required by classifyZip
-      const data = zipEntryData(b, e);
-      if (!data) throw declined(name, `OpenDocument file with an unreadable ${part}`);
-      const t = xmlText(data);
-      if (/<[\w.-]*:?event-listeners?\b/i.test(t)) throw declined(name, `OpenDocument file with event listeners / macro bindings (${part})`);
-      if (/vnd\.sun\.star\.script:|macro:\/\//i.test(t)) throw declined(name, `OpenDocument file referencing a macro (${part})`);
+    // Every content.xml / styles.xml, in any folder ("Object 1/content.xml" for embedded objects too).
+    for (const e of entries) {
+      const base = e.name.toLowerCase().replace(/\\/g, "/").split("/").pop();
+      if (base !== "content.xml" && base !== "styles.xml") continue;
+      const t = xmlText(xmlPartText(ctx, zipEntryData(ctx, b, e, "XML part"), e.name));
+      if (/<[\w.-]*:?event-listeners?\b/i.test(t)) throw declined(name, `OpenDocument file with event listeners / macro bindings (${e.name})`);
+      if (/vnd\.sun\.star\.script:|macro:\/\//i.test(t)) throw declined(name, `OpenDocument file referencing a macro (${e.name})`);
     }
     return;
   }
   for (const e of entries) {
     if (!e.name.toLowerCase().endsWith(".rels")) continue;
-    const data = zipEntryData(b, e);
-    if (!data) throw declined(name, `Office file with an unreadable relationships part (${e.name})`);
-    for (const [tag] of xmlText(data).matchAll(/<(?:[\w.-]+:)?Relationship\b[^>]*>/gi)) {
-      if (!/\bTargetMode\s*=\s*["']\s*External\s*["']/i.test(tag)) continue;
-      const type = (tag.match(/\bType\s*=\s*["']([^"']*)["']/i) || [])[1] || "";
-      if (EXTERNAL_REL_TYPES.test(type.trim())) throw declined(name, `Office file with an external ${type.trim().split("/").pop()} reference (${e.name})`);
-    }
+    const t = xmlPartText(ctx, zipEntryData(ctx, b, e, "relationships part"), e.name);
+    let kind;
+    try { kind = externalRelationship(t); } catch (err) { throw declined(name, `Office file with a malformed relationships part — ${err.message} (${e.name})`); }
+    if (kind) throw declined(name, `Office file with an external ${kind} reference (${e.name})`);
   }
 }
 
-// OOXML/ODF type of a ZIP, decided from its central directory, or throws (plain/ambiguous zip, macros,
-// active content, unreadable or inconsistent directory). Mirrors buzz-cli classify_zip_container:
-//  - OOXML: [Content_Types].xml plus exactly one of word/document.xml, xl/workbook.xml, ppt/presentation.xml;
-//  - ODF: a stored `mimetype` entry holding exactly the odt/ods/odp type, plus content.xml and META-INF/manifest.xml.
-export function classifyZip(b, name = "file.zip") {
+// The OOXML/ODF type of ZIP bytes b (strict directory + exactly one type), then the active-content checks.
+function classifyZipIn(b, ctx, what = "") {
+  const name = ctx.name, inner = what ? `${what}: ` : "";
   const entries = zipDirectory(b);
-  if (!entries) throw declined(name, "ZIP with an unreadable or inconsistent directory");
+  if (!entries) throw declined(name, `${inner}ZIP with an unreadable or inconsistent directory`);
   const has = (want) => entries.some((e) => e.name.toLowerCase() === want.toLowerCase());
   const found = [];
   if (has("[Content_Types].xml")) for (const [part, mime] of OOXML_MAIN_PARTS) if (has(part)) found.push(mime);
@@ -580,12 +795,62 @@ export function classifyZip(b, name = "file.zip") {
     const value = b.toString("latin1", mt.dataAt, mt.dataAt + mt.csize);
     if (ODF_MIMES.includes(value) && entries.some((e) => e.name === "content.xml") && entries.some((e) => e.name === "META-INF/manifest.xml")) found.push(value);
   }
-  if (found.length === 0) throw declined(name, "zip archive — not a Word, Excel, PowerPoint or OpenDocument file");
-  if (found.length > 1) throw declined(name, `zip archive that claims more than one document type (${found.map((m) => SNIFFED_EXT.get(m)).join(", ")})`);
-  checkZipActiveContent(b, entries, found[0], name);
+  if (found.length === 0) throw declined(name, `${inner}zip archive — not a Word, Excel, PowerPoint or OpenDocument file`);
+  if (found.length > 1) throw declined(name, `${inner}zip archive that claims more than one document type (${found.map((m) => SNIFFED_EXT.get(m)).join(", ")})`);
+  checkZipActiveContent(b, entries, found[0], ctx);
   return found[0];
 }
 
+// OOXML/ODF type of a ZIP, decided from its central directory, or throws (plain/ambiguous zip, macros,
+// active content, unreadable or inconsistent directory). Mirrors buzz-cli classify_zip_container:
+//  - OOXML: [Content_Types].xml plus exactly one of word/document.xml, xl/workbook.xml, ppt/presentation.xml;
+//  - ODF: a stored `mimetype` entry holding exactly the odt/ods/odp type, plus content.xml and META-INF/manifest.xml.
+// Embedded OOXML/ODF packages must pass the same test (review round 3); ODF embedded objects are any of
+// odt/ods/odp or chart/formula/drawing objects — nested, so classified loosely as "any ZIP document type".
+export function classifyZip(b, name = "file.zip") {
+  return classifyZipIn(b, { name, left: ZIP_INFLATE_BUDGET, entries: 0, depth: 0 });
+}
+
+// Review round 3 (S3): more element names (matched as `<name` not followed by a name character), schemes
+// matched after HTML-entity decoding, and any `on…=` attribute inside a `<tag …>`.
+const MARKUP_TAGS = ["form", "base", "input", "math", "frame", "frameset", "applet", "portal"];
+const MARKUP_SCHEMES = ["javascript:", "vbscript:", "data:text/html", "data:image/svg", "data:application/xhtml"];
+const HTML_NAMED = { colon: ":", tab: "\t", newline: "\n", sol: "/", lpar: "(", rpar: ")", period: ".", comma: ",", excl: "!", quest: "?", num: "#", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", equals: "=", semi: ";", bsol: "\\" };
+// HTML character references decoded the way a browser would in an attribute: decimal/hex with or without
+// the trailing ';', and the named references that matter for a scheme (unknown names are left as-is).
+export function decodeHtmlEntities(t) {
+  return t.replace(/&#x([0-9a-f]+);?|&#([0-9]+);?|&([a-z]+);?/gi, (m, h, d, n) => {
+    if (n) return HTML_NAMED[n.toLowerCase()] ?? m;
+    const cp = h ? parseInt(h, 16) : Number(d);
+    return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
+  });
+}
+// The first `on<name>=` inside something tag-like, or null. A tag starts at `<name` followed by whitespace or
+// '/' and ends at the first `>` outside a quoted attribute value (`<p title="a>b" onclick=x>` is one tag), or
+// at the end of the text. The WHOLE tag is searched — quoted values included (fail closed). One linear pass:
+// the scan resumes after each tag's end.
+export function markupEventHandler(lower) {
+  const n = lower.length;
+  const start = /<[a-z][a-z0-9-]*[\s/]/y;
+  const ws = (c) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  for (let i = lower.indexOf("<"); i >= 0 && i < n; i = lower.indexOf("<", i)) {
+    start.lastIndex = i;
+    if (!start.test(lower)) { i++; continue; }
+    let end = n;
+    for (let j = start.lastIndex - 1; j < n; j++) {
+      const c = lower[j];
+      if (c === ">") { end = j; break; }
+      if (c !== "=") continue;
+      let k = j + 1;
+      while (k < n && ws(lower[k])) k++;
+      if (lower[k] === '"' || lower[k] === "'") { const q = lower.indexOf(lower[k], k + 1); j = q < 0 ? n : q; } else j = k - 1;
+    }
+    const h = /[\s/"'](on[a-z]+)\s*=/.exec(lower.slice(i, end));
+    if (h) return h[1];
+    i = end + 1;
+  }
+  return null;
+}
 // Plain-text check for txt/csv/md/json (no magic bytes to sniff). The WHOLE file is scanned for markup.
 export function checkAttachmentText(b, ext, name = `file.${ext}`) {
   let body = startsWith(b, [0xef, 0xbb, 0xbf]) ? b.subarray(3) : b;
@@ -595,8 +860,13 @@ export function checkAttachmentText(b, ext, name = `file.${ext}`) {
   if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
   if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
   const lower = text.toLowerCase();
-  const hit = MARKUP_MARKERS.find((m) => lower.includes(m));
-  if (hit) throw declined(name, `.${ext} containing HTML/XML markup (${hit})`);
+  const hit = MARKUP_MARKERS.find((m) => lower.includes(m)) || MARKUP_TAGS.find((t) => new RegExp(`<${t}(?![a-z0-9-])`).test(lower));
+  if (hit) throw declined(name, `.${ext} containing HTML/XML markup (${hit.startsWith("<") || hit.includes(":") ? hit : `<${hit}`})`);
+  const handler = markupEventHandler(lower);
+  if (handler) throw declined(name, `.${ext} containing an HTML event-handler attribute (${handler}=)`);
+  const decoded = decodeHtmlEntities(lower).replace(/[\t\n\r]/g, "").toLowerCase();
+  const scheme = MARKUP_SCHEMES.find((m) => decoded.includes(m));
+  if (scheme) throw declined(name, `.${ext} containing a script URL (${scheme}, after decoding HTML entities)`);
   if (ext === "json") { try { JSON.parse(text); } catch { throw declined(name, ".json that is not valid JSON"); } }
 }
 

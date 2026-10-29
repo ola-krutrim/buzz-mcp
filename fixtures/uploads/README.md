@@ -14,5 +14,8 @@ OOXML from ZIP entry order, so several of these sniff as plain
 | `openpyxl.xlsx` | openpyxl 3.1.5 | `docProps/…`, `xl/…` | xlsx |
 | `libreoffice.xlsx` | LibreOffice 25.2 `--convert-to xlsx` | `xl/…` first | xlsx |
 | `libreoffice.odt` | LibreOffice 25.2 `--convert-to odt` | `mimetype` first | odt |
+| `python-pptx-chart.pptx` | python-pptx 1.0.2 `add_chart` (round 3) | embeds `ppt/embeddings/Microsoft_Excel_Sheet1.xlsx` (a nested OOXML package) | application/zip |
+| `libreoffice-chart.odp` | `python-pptx-chart.pptx` → LibreOffice `--convert-to odp` (round 3) | `mimetype` first; chart in `Object 1/content.xml` / `Object 1/styles.xml` | odp |
+| `libreoffice-chart.ods` | openpyxl BarChart → LibreOffice `--convert-to ods` (round 3) | `mimetype` first; `Object 1/…`, `ObjectReplacements/Object 1` (VCLMTF) | ods |
 
 No genuine Microsoft Office output is included (none available on the build box).

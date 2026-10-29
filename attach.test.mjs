@@ -202,7 +202,8 @@ expectRefused("ax.docx", ooxml("word", [["word/activeX/activeX1.xml", "<ax/>"]])
 expectRefused("ax.xlsx", ooxml("xl", [["xl/activeX/activeX1.bin", "x"]]), /ActiveX/, "xl/activeX/activeX1.bin");
 expectRefused("ole.docx", ooxml("word", [["word/embeddings/oleObject1.bin", "x"]]), /embedded OLE object/, "word/embeddings/oleObject1.bin");
 expectRefused("ole.pptx", ooxml("ppt", [["ppt/embeddings/Microsoft_Word_97.bin", "x"]]), /embedded OLE object/, "ppt/embeddings/*.bin");
-expectOk("emb.docx", ooxml("word", [["word/embeddings/chart.xlsx", "x"], ["word/media/image1.png", "x"]]), DOCX, "embedded .xlsx/media (not .bin, not oleObject) still allowed");
+expectOk("emb.docx", ooxml("word", [["word/embeddings/chart.xlsx", ooxml("xl"), { deflate: true }], ["word/media/image1.png", "x"]]), DOCX, "embedded (well-formed, deflated) .xlsx/media (not .bin, not oleObject) still allowed");
+expectRefused("emb.docx", ooxml("word", [["word/embeddings/chart.xlsx", "x"]]), /embedded word\/embeddings\/chart\.xlsx: ZIP with an unreadable/, "round 3: an embedded .xlsx that is not a well-formed package");
 {
   const ATT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate";
   const rel = (attrs) => `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" ${attrs}/></Relationships>`;
@@ -304,7 +305,7 @@ console.log("should-fix — hosted attachment_read validates <sha>.<ext>:");
 console.log("real-ordered fixtures (LibreOffice / python-docx / openpyxl / python-pptx, from buzz-cli tests):");
 {
   const dir = new URL("./fixtures/uploads/", import.meta.url);
-  const want = { "docx-main-past-4k.docx": DOCX, "libreoffice.docx": DOCX, "libreoffice.odt": ODT_M, "libreoffice.xlsx": XLSX_M, "openpyxl.xlsx": XLSX_M, "python-docx.docx": DOCX, "python-pptx.pptx": PPTX_M, "xlsx-docprops-third.xlsx": XLSX_M };
+  const want = { "docx-main-past-4k.docx": DOCX, "libreoffice.docx": DOCX, "libreoffice.odt": ODT_M, "libreoffice.xlsx": XLSX_M, "openpyxl.xlsx": XLSX_M, "python-docx.docx": DOCX, "python-pptx.pptx": PPTX_M, "xlsx-docprops-third.xlsx": XLSX_M, "python-pptx-chart.pptx": PPTX_M, "libreoffice-chart.odp": "application/vnd.oasis.opendocument.presentation", "libreoffice-chart.ods": "application/vnd.oasis.opendocument.spreadsheet" };
   const files = readdirSync(dir).filter((f) => !f.endsWith(".md")).sort();
   ok(JSON.stringify(files) === JSON.stringify(Object.keys(want).sort()), `all ${Object.keys(want).length} fixtures present`);
   for (const [f, mime] of Object.entries(want)) {
