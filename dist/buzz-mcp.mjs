@@ -18448,11 +18448,11 @@ function numberToBytesLE(n, len) {
 function copyBytes(bytes) {
   return Uint8Array.from(bytes);
 }
-function asciiToBytes(ascii) {
-  return Uint8Array.from(ascii, (c, i2) => {
+function asciiToBytes(ascii2) {
+  return Uint8Array.from(ascii2, (c, i2) => {
     const charCode = c.charCodeAt(0);
     if (c.length !== 1 || charCode > 127) {
-      throw new Error(`string contains non-ASCII character "${ascii[i2]}" with code ${charCode} at position ${i2}`);
+      throw new Error(`string contains non-ASCII character "${ascii2[i2]}" with code ${charCode} at position ${i2}`);
     }
     return charCode;
   });
@@ -21531,6 +21531,7 @@ var init_nip44 = __esm({
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
+import { inflateRawSync } from "node:zlib";
 function wireRefreshGet(id) {
   try {
     const f = wireRefreshFile(id);
@@ -21764,19 +21765,592 @@ function buildImeta({ url, mime, sha256: sha2562, size, filename } = {}) {
   if (filename) parts.push(`filename ${filename}`);
   return ["imeta", ...parts];
 }
-function mediaMimeForPath(p) {
-  return MEDIA_MIME_BY_EXT[(String(p).match(/\.[^.\/]+$/) || [""])[0].toLowerCase()] || "application/octet-stream";
+function declined(name, why) {
+  return new Error(`buzz_post: attachment declined LOCALLY \u2014 ${name}: unsupported file type (${why}). Allowed: images (jpeg/png/gif/webp), mp4 video, and pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json (a shim pre-flight check, NOT a server verdict).`);
+}
+function localExt(name) {
+  const base = String(name).split(/[\\/]/).pop();
+  const i2 = base.lastIndexOf(".");
+  return i2 > 0 ? base.slice(i2 + 1).trim().toLowerCase() : "";
+}
+function sniffHead(b) {
+  if (startsWith(b, [255, 216, 255])) return "image/jpeg";
+  if (startsWith(b, [137, 80, 78, 71, 13, 10, 26, 10])) return "image/png";
+  if (startsWith(b, ascii("GIF87a")) || startsWith(b, ascii("GIF89a"))) return "image/gif";
+  if (startsWith(b, ascii("RIFF")) && startsWith(b, ascii("WEBP"), 8)) return "image/webp";
+  if (startsWith(b, ascii("%PDF-"))) return "application/pdf";
+  if (startsWith(b, [80, 75, 3, 4])) return "zip";
+  if (b.length >= 16 && startsWith(b, ascii("ftyp"), 4)) {
+    const brands = [];
+    const boxLen = Math.min(b.length, b.readUInt32BE(0) || b.length);
+    brands.push(b.toString("latin1", 8, 12));
+    for (let i2 = 16; i2 + 4 <= boxLen; i2 += 4) brands.push(b.toString("latin1", i2, i2 + 4));
+    return brands.some((x) => MP4_BRANDS.has(x)) ? "video/mp4" : "iso-bmff";
+  }
+  return null;
+}
+function zipDirectory(b) {
+  if (!Buffer.isBuffer(b) || b.length < 22) return null;
+  const windowStart = Math.max(0, b.length - 22 - 65535);
+  const hits = [];
+  for (let i2 = b.indexOf(SIG.eocd, windowStart); i2 >= 0; i2 = b.indexOf(SIG.eocd, i2 + 1)) hits.push(i2);
+  if (hits.length !== 1) return null;
+  const eocd = hits[0];
+  if (eocd + 22 > b.length) return null;
+  const disk = b.readUInt16LE(eocd + 4), cdDisk = b.readUInt16LE(eocd + 6), onDisk = b.readUInt16LE(eocd + 8);
+  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16), commentLen = b.readUInt16LE(eocd + 20);
+  if (eocd + 22 + commentLen !== b.length) return null;
+  if (disk !== 0 || cdDisk !== 0 || onDisk !== count) return null;
+  if (count === 65535 || cdSize === 4294967295 || cdOff === 4294967295 || cdOff + cdSize !== eocd) return null;
+  const entries = [];
+  let at = cdOff;
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > eocd || b.readUInt32LE(at) !== 33639248) return null;
+    const flags = b.readUInt16LE(at + 8), method = b.readUInt16LE(at + 10), csize = b.readUInt32LE(at + 20), usize = b.readUInt32LE(at + 24);
+    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32), lho = b.readUInt32LE(at + 42);
+    if (at + 46 + nl + el + cl > eocd) return null;
+    entries.push({ nameBytes: b.subarray(at + 46, at + 46 + nl), name: b.toString("utf8", at + 46, at + 46 + nl), flags, method, csize, usize, lho });
+    at += 46 + nl + el + cl;
+  }
+  if (at !== eocd) return null;
+  const seen = /* @__PURE__ */ new Set();
+  for (const e of entries) {
+    const key = e.name.toLowerCase();
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const L = e.lho;
+    if (L + 30 > cdOff || b.readUInt32LE(L) !== 67324752) return null;
+    const lnl = b.readUInt16LE(L + 26), lel = b.readUInt16LE(L + 28);
+    if (b.readUInt16LE(L + 8) !== e.method || !b.subarray(L + 30, L + 30 + lnl).equals(e.nameBytes)) return null;
+    e.dataAt = L + 30 + lnl + lel;
+    let end = e.dataAt + e.csize;
+    if (end > cdOff) return null;
+    if (e.flags & 8) end += end + 4 <= cdOff && b.readUInt32LE(end) === 134695760 ? 16 : 12;
+    if (end > cdOff) return null;
+    e.end = end;
+  }
+  const order = [...entries].sort((x, y) => x.lho - y.lho);
+  let pos = 0;
+  for (const e of order) {
+    if (e.lho !== pos) return null;
+    pos = e.end;
+  }
+  if (pos !== cdOff) return null;
+  for (const e of entries) {
+    delete e.nameBytes;
+    delete e.end;
+  }
+  return entries;
+}
+function rawHeaderNames(b) {
+  const out = [];
+  for (const [sig, nlAt, nameAt] of [[SIG.lfh, 26, 30], [SIG.cdh, 28, 46]]) {
+    for (let i2 = b.indexOf(sig); i2 >= 0; i2 = b.indexOf(sig, i2 + 1)) {
+      if (i2 + nameAt > b.length) break;
+      const nl = b.readUInt16LE(i2 + nlAt);
+      if (nl && i2 + nameAt + nl <= b.length) out.push(b.toString("latin1", i2 + nameAt, i2 + nameAt + nl));
+    }
+  }
+  return out;
+}
+function zipEntryData(ctx, b, e, what) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  const cap = Math.min(ZIP_PART_MAX, ctx.left);
+  let out = null, tooBig = false;
+  if (e.method === 0) {
+    if (raw.length <= cap) out = raw;
+    else tooBig = true;
+  } else if (e.method === 8) {
+    try {
+      out = inflateRawSync(raw, { maxOutputLength: cap });
+    } catch (err) {
+      tooBig = err?.code === "ERR_BUFFER_TOO_LARGE" || err instanceof RangeError;
+    }
+  }
+  if (!out) {
+    if (tooBig && cap < ZIP_PART_MAX) throw declined(ctx.name, `document that inflates past the ${ZIP_INFLATE_BUDGET / MEDIA_MB} MiB inspection budget (${e.name})`);
+    if (tooBig) throw declined(ctx.name, `document with a ${what} that inflates past the ${ZIP_PART_MAX / MEDIA_MB} MiB per-part cap (${e.name})`);
+    throw declined(ctx.name, `document with an unreadable ${what} (${e.name})`);
+  }
+  ctx.left -= out.length;
+  return out;
+}
+function xmlPartText(ctx, data, part) {
+  for (const [what, bom] of XML_BAD_BOMS) if (startsWith(data, bom)) throw declined(ctx.name, `document with a non-UTF-8 (${what}) XML part (${part})`);
+  const body = startsWith(data, [239, 187, 191]) ? data.subarray(3) : data;
+  if (body.includes(0)) throw declined(ctx.name, `document with a NUL byte in an XML part \u2014 UTF-16/32? (${part})`);
+  let t;
+  try {
+    t = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw declined(ctx.name, `document with an XML part that is not valid UTF-8 (${part})`);
+  }
+  const decl = t.match(/^\s*<\?xml\b([^]*?)\?>/i);
+  const enc = decl && decl[1].match(/\bencoding\s*=\s*(["'])([^"']*)\1/i);
+  if (decl && /\bencoding\b/i.test(decl[1]) && !(enc && /^\s*utf-?8\s*$/i.test(enc[2]))) throw declined(ctx.name, `document with an XML part declared in a non-UTF-8 encoding (${part})`);
+  if (/<!ENTITY\b/i.test(t)) throw declined(ctx.name, `document with an XML entity declaration (${part})`);
+  return t;
+}
+function xmlAttrValue(v) {
+  let bad = false;
+  const out = v.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][\w.-]*));/gi, (_, h, d, n) => {
+    if (n) {
+      const c = XML_NAMED[n];
+      if (c === void 0) bad = true;
+      return c ?? "";
+    }
+    try {
+      return String.fromCodePoint(h ? parseInt(h, 16) : Number(d));
+    } catch {
+      bad = true;
+      return "";
+    }
+  });
+  if (bad || /&(?!(?:#x[0-9a-f]+|#[0-9]+|[a-z][\w.-]*);)/i.test(v)) return null;
+  return out.replace(/[\t\n\r]/g, " ");
+}
+function xmlStartTags(t) {
+  const tags = [];
+  const bad = (why) => {
+    throw new Error(why);
+  };
+  let i2 = 0;
+  const ws = (c) => c === " " || c === "	" || c === "\n" || c === "\r";
+  while ((i2 = t.indexOf("<", i2)) >= 0) {
+    if (t.startsWith("<!--", i2)) {
+      const j2 = t.indexOf("-->", i2 + 4);
+      if (j2 < 0) bad("unterminated comment");
+      i2 = j2 + 3;
+      continue;
+    }
+    if (t.startsWith("<![CDATA[", i2)) {
+      const j2 = t.indexOf("]]>", i2 + 9);
+      if (j2 < 0) bad("unterminated CDATA");
+      i2 = j2 + 3;
+      continue;
+    }
+    if (t.startsWith("<?", i2)) {
+      const j2 = t.indexOf("?>", i2 + 2);
+      if (j2 < 0) bad("unterminated processing instruction");
+      i2 = j2 + 2;
+      continue;
+    }
+    if (t.startsWith("<!", i2)) bad("DOCTYPE or markup declaration");
+    if (t.startsWith("</", i2)) {
+      const j2 = t.indexOf(">", i2 + 2);
+      if (j2 < 0) bad("unterminated end tag");
+      i2 = j2 + 1;
+      continue;
+    }
+    let j = i2 + 1;
+    while (j < t.length && !ws(t[j]) && t[j] !== "/" && t[j] !== ">") j++;
+    const name = t.slice(i2 + 1, j);
+    if (!name || /["'<=]/.test(name)) bad("malformed tag name");
+    const attrs = [];
+    for (; ; ) {
+      while (j < t.length && ws(t[j])) j++;
+      if (j >= t.length) bad("unterminated start tag");
+      if (t[j] === ">") {
+        j++;
+        break;
+      }
+      if (t[j] === "/") {
+        if (t[j + 1] !== ">") bad("malformed empty-element tag");
+        j += 2;
+        break;
+      }
+      const a0 = j;
+      while (j < t.length && !ws(t[j]) && t[j] !== "=" && t[j] !== ">" && t[j] !== "/" && t[j] !== "<" && t[j] !== '"' && t[j] !== "'") j++;
+      const an = t.slice(a0, j);
+      if (!an) bad("malformed attribute");
+      while (j < t.length && ws(t[j])) j++;
+      if (t[j] !== "=") bad("attribute without a value");
+      j++;
+      while (j < t.length && ws(t[j])) j++;
+      const q = t[j];
+      if (q !== '"' && q !== "'") bad("unquoted attribute value");
+      const end = t.indexOf(q, j + 1);
+      if (end < 0) bad("unterminated attribute value");
+      const raw = t.slice(j + 1, end);
+      if (raw.includes("<")) bad("'<' in an attribute value");
+      const v = xmlAttrValue(raw);
+      if (v === null) bad("undeclared entity in an attribute value");
+      attrs.push([an, v]);
+      j = end + 1;
+      if (j < t.length && !ws(t[j]) && t[j] !== ">" && t[j] !== "/") bad("attributes not separated by whitespace");
+    }
+    tags.push({ name, attrs });
+    i2 = j;
+  }
+  return tags;
+}
+function externalRelationship(t) {
+  for (const tag of xmlStartTags(t)) {
+    if (localName(tag.name) !== "relationship") continue;
+    const vals = (n) => tag.attrs.filter(([a]) => localName(a) === n).map(([, v]) => v.trim());
+    if (!vals("targetmode").some((m) => m.toLowerCase() === "external")) continue;
+    for (const ty of vals("type")) {
+      const m = ty.match(EXTERNAL_REL_TYPES);
+      if (m) return m[1];
+    }
+  }
+  return null;
+}
+function segExtIn(n, list3) {
+  for (const seg of n.toLowerCase().replace(/\\/g, "/").split("/")) {
+    const i2 = seg.lastIndexOf(".");
+    const ext = i2 >= 0 ? seg.slice(i2 + 1).trim() : "";
+    if (ext && list3.includes(ext)) return ext;
+  }
+  return null;
+}
+function huffman(lengths) {
+  const count = new Array(16).fill(0);
+  for (const l of lengths) count[l]++;
+  count[0] = 0;
+  let left = 1;
+  for (let len = 1; len < 16; len++) {
+    left = (left << 1) - count[len];
+    if (left < 0) throw new Error("over-subscribed code");
+  }
+  const offs = new Array(16).fill(0);
+  for (let len = 1; len < 15; len++) offs[len + 1] = offs[len] + count[len];
+  const symbol = new Array(lengths.length);
+  lengths.forEach((l, s) => {
+    if (l) symbol[offs[l]++] = s;
+  });
+  return { count, symbol };
+}
+function inflateHead(src, want = 8) {
+  const limit = Math.min(src.length, HEAD_INPUT_MAX);
+  let pos = 0, bitbuf = 0, bitcnt = 0;
+  const out = [];
+  const bits = (n) => {
+    while (bitcnt < n) {
+      if (pos >= limit) throw new Error("out of input");
+      bitbuf |= src[pos++] << bitcnt;
+      bitcnt += 8;
+    }
+    const v = bitbuf & (1 << n) - 1;
+    bitbuf >>>= n;
+    bitcnt -= n;
+    return v;
+  };
+  const decode4 = (h) => {
+    let code = 0, first = 0, index = 0;
+    for (let len = 1; len < 16; len++) {
+      code |= bits(1);
+      const c = h.count[len];
+      if (code - c < first) return h.symbol[index + (code - first)];
+      index += c;
+      first += c;
+      first <<= 1;
+      code <<= 1;
+    }
+    throw new Error("bad code");
+  };
+  try {
+    let last = 0;
+    while (!last && out.length < want) {
+      last = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        bitbuf = 0;
+        bitcnt = 0;
+        if (pos + 4 > limit) throw new Error("out of input");
+        const len = src[pos] | src[pos + 1] << 8, nlen = src[pos + 2] | src[pos + 3] << 8;
+        if ((len ^ 65535) !== nlen) throw new Error("bad stored block");
+        pos += 4;
+        for (let k = 0; k < len && out.length < want; k++) {
+          if (pos >= limit) throw new Error("out of input");
+          out.push(src[pos++]);
+        }
+        continue;
+      }
+      let lit, dist;
+      if (type === 1) ({ lit, dist } = FIXED);
+      else if (type === 2) {
+        const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+        if (nlen > 286 || ndist > 30) throw new Error("bad counts");
+        const cl = new Array(19).fill(0);
+        for (let k = 0; k < ncode; k++) cl[CLORDER[k]] = bits(3);
+        const clh = huffman(cl);
+        const lens = [];
+        while (lens.length < nlen + ndist) {
+          const sym = decode4(clh);
+          if (sym < 16) lens.push(sym);
+          else {
+            let rep, val = 0;
+            if (sym === 16) {
+              if (!lens.length) throw new Error("repeat with no length");
+              val = lens[lens.length - 1];
+              rep = 3 + bits(2);
+            } else if (sym === 17) rep = 3 + bits(3);
+            else rep = 11 + bits(7);
+            if (lens.length + rep > nlen + ndist) throw new Error("too many lengths");
+            for (let k = 0; k < rep; k++) lens.push(val);
+          }
+        }
+        if (!lens[256]) throw new Error("no end-of-block code");
+        lit = huffman(lens.slice(0, nlen));
+        dist = huffman(lens.slice(nlen));
+      } else throw new Error("bad block type");
+      for (; ; ) {
+        const sym = decode4(lit);
+        if (sym < 256) {
+          out.push(sym);
+          if (out.length >= want) break;
+          continue;
+        }
+        if (sym === 256) break;
+        const li = sym - 257;
+        if (li >= 29) throw new Error("bad length");
+        const len = LBASE[li] + bits(LEXT[li]);
+        const di = decode4(dist);
+        if (di >= 30) throw new Error("bad distance");
+        const d = DBASE[di] + bits(DEXT[di]);
+        if (d > out.length) throw new Error("distance too far");
+        for (let k = 0; k < len && out.length < want; k++) out.push(out[out.length - d]);
+        if (out.length >= want) break;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return Buffer.from(out.slice(0, want));
+}
+function zipEntryHead(b, e) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  if (e.method === 0) return raw.subarray(0, 8);
+  if (e.method !== 8) return null;
+  return inflateHead(raw, 8);
+}
+function checkZipActiveContent(b, entries, mime, ctx) {
+  const name = ctx.name;
+  ctx.entries += entries.length;
+  if (ctx.entries > ZIP_MAX_ENTRIES) throw declined(name, `document with more than ${ZIP_MAX_ENTRIES} ZIP entries`);
+  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
+    const ext = segExtIn(n, CONTAINER_EXEC_EXTS);
+    if (ext) throw declined(name, `document containing an executable or script (${n})`);
+    const lower = n.toLowerCase().replace(/\\/g, "/");
+    const base = lower.split("/").pop();
+    if (base.startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (segExtIn(n, CONTAINER_MACRO_EXTS)) throw declined(name, `Office file containing a macro-enabled document (${n})`);
+    if (/(^|\/)(basic|scripts)\//.test(lower)) throw declined(name, `OpenDocument file containing macros (${n})`);
+    if (/(^|\/)(macrosheets|dialogsheets)\//.test(lower)) throw declined(name, `Office file containing Excel 4.0 macro sheets (${n})`);
+    if (/(^|\/)activex\//.test(lower)) throw declined(name, `Office file containing ActiveX controls (${n})`);
+    if (base.startsWith("oleobject") || /(^|\/)embeddings\/[^/]*\.bin$/.test(lower)) throw declined(name, `Office file containing an embedded OLE object (${n})`);
+  }
+  if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+  const nested = [];
+  for (const e of entries) {
+    if (e.name.endsWith("/") && e.csize === 0) continue;
+    const head = zipEntryHead(b, e);
+    if (!head) throw declined(name, `document with an unreadable entry (${e.name})`);
+    for (const [what, sig] of EXEC_MAGICS) if (startsWith(head, sig)) throw declined(name, `document containing a ${what} (${e.name})`);
+    const zipHead = startsWith(head, SIG.lfh) || startsWith(head, SIG.eocd);
+    if (zipHead || segExtIn(e.name, NESTED_ZIP_EXTS)) nested.push(e);
+  }
+  for (const e of nested) {
+    if (ctx.depth >= ZIP_MAX_NESTING) throw declined(name, `document with embedded documents nested more than ${ZIP_MAX_NESTING} deep (${e.name})`);
+    const inner = zipEntryData(ctx, b, e, "embedded document");
+    const child = { ...ctx, depth: ctx.depth + 1 };
+    try {
+      classifyZipIn(inner, child, `embedded ${e.name}`);
+    } finally {
+      ctx.left = child.left;
+      ctx.entries = child.entries;
+    }
+  }
+  if (ODF_MIMES.includes(mime)) {
+    for (const e of entries) {
+      const base = e.name.toLowerCase().replace(/\\/g, "/").split("/").pop();
+      if (base !== "content.xml" && base !== "styles.xml") continue;
+      const t = xmlText(xmlPartText(ctx, zipEntryData(ctx, b, e, "XML part"), e.name));
+      if (/<[\w.-]*:?event-listeners?\b/i.test(t)) throw declined(name, `OpenDocument file with event listeners / macro bindings (${e.name})`);
+      if (/vnd\.sun\.star\.script:|macro:\/\//i.test(t)) throw declined(name, `OpenDocument file referencing a macro (${e.name})`);
+    }
+    return;
+  }
+  for (const e of entries) {
+    if (!e.name.toLowerCase().endsWith(".rels")) continue;
+    const t = xmlPartText(ctx, zipEntryData(ctx, b, e, "relationships part"), e.name);
+    let kind;
+    try {
+      kind = externalRelationship(t);
+    } catch (err) {
+      throw declined(name, `Office file with a malformed relationships part \u2014 ${err.message} (${e.name})`);
+    }
+    if (kind) throw declined(name, `Office file with an external ${kind} reference (${e.name})`);
+  }
+}
+function classifyZipIn(b, ctx, what = "") {
+  const name = ctx.name, inner = what ? `${what}: ` : "";
+  const entries = zipDirectory(b);
+  if (!entries) throw declined(name, `${inner}ZIP with an unreadable or inconsistent directory`);
+  const has = (want) => entries.some((e) => e.name.toLowerCase() === want.toLowerCase());
+  const found = [];
+  if (has("[Content_Types].xml")) {
+    for (const [part, mime] of OOXML_MAIN_PARTS) if (has(part)) found.push(mime);
+  }
+  const mt = entries.find((e) => e.name === "mimetype");
+  if (mt && mt.method === 0 && mt.csize <= 128) {
+    const value = b.toString("latin1", mt.dataAt, mt.dataAt + mt.csize);
+    if (ODF_MIMES.includes(value) && entries.some((e) => e.name === "content.xml") && entries.some((e) => e.name === "META-INF/manifest.xml")) found.push(value);
+  }
+  if (found.length === 0) throw declined(name, `${inner}zip archive \u2014 not a Word, Excel, PowerPoint or OpenDocument file`);
+  if (found.length > 1) throw declined(name, `${inner}zip archive that claims more than one document type (${found.map((m) => SNIFFED_EXT.get(m)).join(", ")})`);
+  checkZipActiveContent(b, entries, found[0], ctx);
+  return found[0];
+}
+function classifyZip(b, name = "file.zip") {
+  return classifyZipIn(b, { name, left: ZIP_INFLATE_BUDGET, entries: 0, depth: 0 });
+}
+function decodeHtmlEntities(t) {
+  return t.replace(/&#x([0-9a-f]+);?|&#([0-9]+);?|&([a-z]+);?/gi, (m, h, d, n) => {
+    if (n) return HTML_NAMED[n.toLowerCase()] ?? m;
+    const cp = h ? parseInt(h, 16) : Number(d);
+    return cp > 0 && cp <= 1114111 ? String.fromCodePoint(cp) : "";
+  });
+}
+function markupEventHandler(lower) {
+  const n = lower.length;
+  const start = /<[a-z][a-z0-9-]*[\s/]/y;
+  const ws = (c) => c === " " || c === "	" || c === "\n" || c === "\r" || c === "\f";
+  for (let i2 = lower.indexOf("<"); i2 >= 0 && i2 < n; i2 = lower.indexOf("<", i2)) {
+    start.lastIndex = i2;
+    if (!start.test(lower)) {
+      i2++;
+      continue;
+    }
+    let end = n;
+    for (let j = start.lastIndex - 1; j < n; j++) {
+      const c = lower[j];
+      if (c === ">") {
+        end = j;
+        break;
+      }
+      if (c !== "=") continue;
+      let k = j + 1;
+      while (k < n && ws(lower[k])) k++;
+      if (lower[k] === '"' || lower[k] === "'") {
+        const q = lower.indexOf(lower[k], k + 1);
+        j = q < 0 ? n : q;
+      } else j = k - 1;
+    }
+    const h = /[\s/"'](on[a-z]+)\s*=/.exec(lower.slice(i2, end));
+    if (h) return h[1];
+    i2 = end + 1;
+  }
+  return null;
+}
+function checkAttachmentText(b, ext, name = `file.${ext}`) {
+  let body = startsWith(b, [239, 187, 191]) ? b.subarray(3) : b;
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw declined(name, `.${ext} that is not valid UTF-8 text`);
+  }
+  if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(text)) throw declined(name, `.${ext} containing control characters`);
+  if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
+  if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
+  const lower = text.toLowerCase();
+  const hit = MARKUP_MARKERS.find((m) => lower.includes(m)) || MARKUP_TAGS.find((t) => new RegExp(`<${t}(?![a-z0-9-])`).test(lower));
+  if (hit) throw declined(name, `.${ext} containing HTML/XML markup (${hit.startsWith("<") || hit.includes(":") ? hit : `<${hit}`})`);
+  const handler = markupEventHandler(lower);
+  if (handler) throw declined(name, `.${ext} containing an HTML event-handler attribute (${handler}=)`);
+  const decoded = decodeHtmlEntities(lower).replace(/[\t\n\r]/g, "").toLowerCase();
+  const scheme = MARKUP_SCHEMES.find((m) => decoded.includes(m));
+  if (scheme) throw declined(name, `.${ext} containing a script URL (${scheme}, after decoding HTML entities)`);
+  if (ext === "json") {
+    try {
+      JSON.parse(text);
+    } catch {
+      throw declined(name, ".json that is not valid JSON");
+    }
+  }
+}
+function classifyAttachment({ name, size, read }) {
+  const display = String(name).split(/[\\/]/).pop();
+  const head = read(0, Math.min(size, 4096));
+  const sniffed = sniffHead(head);
+  const capped = (mime, kind) => {
+    mediaCapCheck(display, size, mime);
+    return { mime, kind };
+  };
+  if (sniffed && ATTACH_IMAGE_MIMES.includes(sniffed)) return capped(sniffed, mediaCapKind(sniffed));
+  if (sniffed === "video/mp4") return capped(sniffed, "video");
+  if (sniffed === "iso-bmff") throw declined(display, "ISO-BMFF media that is not mp4");
+  if (sniffed === "application/pdf") return capped(sniffed, "file");
+  if (size > MEDIA_CAPS.file) mediaCapCheck(display, size, OCTET_STREAM);
+  if (sniffed === "zip") return capped(classifyZip(read(0, size), display), "file");
+  const ext = localExt(display);
+  if (!TEXT_EXTS.has(ext)) throw declined(display, "unrecognised content; plain text must be .txt, .csv, .md or .json");
+  checkAttachmentText(read(0, size), ext, display);
+  return capped(OCTET_STREAM, "file");
 }
 function mediaCapKind(mime) {
   return mime === "image/gif" ? "gif" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file";
 }
-function mediaCapCheck(filename, size) {
-  const mime = mediaMimeForPath(filename);
+function mediaCapCheck(filename, size, mime = OCTET_STREAM) {
   const kind = mediaCapKind(mime);
   const cap = MEDIA_CAPS[kind];
   if (size > cap)
-    throw new Error(`buzz_post: attachment declined LOCALLY \u2014 ${String(filename).split("/").pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${cap / MEDIA_MB | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
+    throw new Error(`buzz_post: attachment declined LOCALLY \u2014 ${String(filename).split(/[\\/]/).pop()} is ${(size / MEDIA_MB).toFixed(1)} MB, over the ${cap / MEDIA_MB | 0} MB ${kind} cap (a shim pre-flight limit, NOT a server 413).`);
   return { mime, cap, kind };
+}
+function sanitizeAttachmentName(p) {
+  const base = String(p ?? "").split(/[\\/]/).pop();
+  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(INVISIBLE_FILLERS, "").replace(/^[\s.]+|[\s.]+$/gu, "");
+  return cleaned ? avoidReservedName(cleaned) : "file";
+}
+function attachmentExtFor(mime, localName2 = "") {
+  if (SNIFFED_EXT.has(mime)) return SNIFFED_EXT.get(mime);
+  const media = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
+  if (media) return media;
+  const ext = localExt(sanitizeAttachmentName(localName2));
+  if (mime === OCTET_STREAM && TEXT_EXTS.has(ext)) return ext;
+  throw new Error(`buzz_post: no display name for ${sanitizeAttachmentName(localName2)} \u2014 type ${JSON.stringify(String(mime))} is not one the shim classified (refusing rather than guessing an extension).`);
+}
+function attachmentDisplayName(p, mime) {
+  const name = sanitizeAttachmentName(p);
+  const i2 = name.lastIndexOf(".");
+  const stem0 = i2 > 0 ? name.slice(0, i2) : name;
+  const ext = i2 > 0 ? name.slice(i2 + 1).toLowerCase() : "";
+  let forced = attachmentExtFor(mime, name);
+  if (mime === "image/jpeg" && (ext === "jpg" || ext === "jpeg")) forced = ext;
+  let stem = stem0.replace(/^[\s.]+|[\s.]+$/gu, "") || "file";
+  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 2;
+  while (Buffer.byteLength(stem) > budget) stem = [...stem].slice(0, -1).join("");
+  return avoidReservedName(`${stem.trimEnd() || "file"}.${forced}`);
+}
+function checkDescriptorMime(stored, classified, name = "file") {
+  const s = String(stored ?? "");
+  if (s && (s === classified || s === ZIP_MIME && ZIP_DOCUMENT_MIMES.includes(classified))) return true;
+  throw new Error(`buzz_post: upload of ${sanitizeAttachmentName(name)} refused \u2014 the relay stored it as ${JSON.stringify(s || "(no type)")} but the shim classified it as ${JSON.stringify(String(classified))}; not posting it (the uploaded blob is left unreferenced).`);
+}
+function parseMediaShaExt(url, sha2562, { hosted = false } = {}) {
+  let path;
+  try {
+    path = new URL(String(url)).pathname;
+  } catch {
+    throw new Error("attachment url is not a URL \u2014 refusing");
+  }
+  const seg = path.split("/").pop();
+  const m = /^([0-9a-f]{64})(?:\.([a-z0-9]{1,8}))?$/.exec(seg);
+  if (!m) throw new Error("attachment url is not /media/<sha256>[.<ext>] \u2014 refusing");
+  if (m[1] !== String(sha2562 || "").toLowerCase()) throw new Error("attachment url sha256 \u2260 imeta x \u2014 refusing");
+  if (hosted && m[2] && !RELAY_MEDIA_EXTS.includes(m[2])) throw new Error(`attachment extension .${m[2]} is not one the relay issues \u2014 refusing`);
+  return seg;
+}
+function escapeLinkLabel(s) {
+  return String(s).replace(/[\\[\]()<>]/g, (c) => `\\${c}`);
+}
+function attachmentContentLine({ url, mime, filename }) {
+  const m = String(mime || "");
+  if (m.startsWith("image/") || m.startsWith("video/")) return String(url);
+  return `[${escapeLinkLabel(filename || "file")}](${url})`;
 }
 function normalizePubkey(v) {
   const s = (v || "").trim();
@@ -22006,7 +22580,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, MEDIA_MIME_BY_EXT, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, ZIP_INFLATE_BUDGET, ZIP_MAX_ENTRIES, ZIP_MAX_NESTING, SIG, startsWith, ascii, XML_BAD_BOMS, xmlText, XML_NAMED, localName, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, CONTAINER_MACRO_EXTS, NESTED_ZIP_EXTS, EXEC_MAGICS, HEAD_INPUT_MAX, LBASE, LEXT, DBASE, DEXT, CLORDER, FIXED, MARKUP_TAGS, MARKUP_SCHEMES, HTML_NAMED, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22034,7 +22608,88 @@ var init_signer = __esm({
     BLOSSOM_CONTENT = { upload: "Upload buzz-media", get: "Get buzz-media" };
     MEDIA_MB = 1024 * 1024;
     MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
-    MEDIA_MIME_BY_EXT = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml", ".log": "text/plain", ".zip": "application/zip", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
+    DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    ODT = "application/vnd.oasis.opendocument.text";
+    ODS = "application/vnd.oasis.opendocument.spreadsheet";
+    ODP = "application/vnd.oasis.opendocument.presentation";
+    OCTET_STREAM = "application/octet-stream";
+    ATTACH_ALLOWED_FILE_TYPES = Object.freeze([
+      ["pdf", "application/pdf"],
+      ["docx", DOCX],
+      ["xlsx", XLSX],
+      ["pptx", PPTX],
+      ["odt", ODT],
+      ["ods", ODS],
+      ["odp", ODP],
+      ["txt", "text"],
+      ["csv", "text"],
+      ["md", "text"],
+      ["json", "text"]
+    ].map(([ext, detect]) => Object.freeze({ ext, detect })));
+    ATTACH_IMAGE_MIMES = Object.freeze(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+    ATTACH_VIDEO_MIMES = Object.freeze(["video/mp4"]);
+    ATTACH_MAX_NAME_BYTES = 120;
+    TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "text").map((t) => t.ext));
+    SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
+    MP4_BRANDS = /* @__PURE__ */ new Set(["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7", "iso8", "iso9", "mp41", "mp42", "avc1", "dash", "M4V "]);
+    MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml", "<object", "<embed", "<meta", "<link", "<style", "javascript:"];
+    ZIP_MIME = "application/zip";
+    OOXML_MAIN_PARTS = [["word/document.xml", DOCX], ["xl/workbook.xml", XLSX], ["ppt/presentation.xml", PPTX]];
+    ODF_MIMES = [ODT, ODS, ODP];
+    ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
+    ZIP_PART_MAX = 128 * MEDIA_MB;
+    ZIP_INFLATE_BUDGET = 256 * MEDIA_MB;
+    ZIP_MAX_ENTRIES = 1e4;
+    ZIP_MAX_NESTING = 2;
+    SIG = { lfh: Buffer.from([80, 75, 3, 4]), cdh: Buffer.from([80, 75, 1, 2]), eocd: Buffer.from([80, 75, 5, 6]) };
+    startsWith = (b, sig, at = 0) => b.length >= at + sig.length && sig.every((v, i2) => b[at + i2] === v);
+    ascii = (s) => [...s].map((c) => c.charCodeAt(0));
+    XML_BAD_BOMS = [["UTF-32 BE", [0, 0, 254, 255]], ["UTF-32 LE", [255, 254, 0, 0]], ["UTF-16 BE", [254, 255]], ["UTF-16 LE", [255, 254]]];
+    xmlText = (t) => t.replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => {
+      try {
+        return String.fromCodePoint(h ? parseInt(h, 16) : Number(d));
+      } catch {
+        return "";
+      }
+    });
+    XML_NAMED = { lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" };
+    localName = (n) => n.toLowerCase().split(":").pop();
+    EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
+    CONTAINER_EXEC_EXTS = Object.freeze(["exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "app", "dmg", "lnk", "hta", "cpl", "pif"]);
+    CONTAINER_MACRO_EXTS = Object.freeze(["docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppsm", "ppam", "sldm"]);
+    NESTED_ZIP_EXTS = ["docx", "dotx", "xlsx", "xltx", "pptx", "potx", "ppsx", "odt", "ods", "odp", "odg", "odf", "odc", "ott", "ots", "otp", "zip"];
+    EXEC_MAGICS = [
+      ["Windows executable (MZ)", [77, 90]],
+      ["ELF executable", [127, 69, 76, 70]],
+      ["Mach-O executable", [254, 237, 250, 206]],
+      ["Mach-O executable", [206, 250, 237, 254]],
+      ["Mach-O executable", [254, 237, 250, 207]],
+      ["Mach-O executable", [207, 250, 237, 254]],
+      ["Mach-O universal binary", [202, 254, 186, 190]],
+      ["Mach-O universal binary", [190, 186, 254, 202]],
+      ["script (#!)", [35, 33]],
+      ["legacy OLE compound file / embedded OLE object", [208, 207, 17, 224]]
+    ];
+    HEAD_INPUT_MAX = 64 * 1024;
+    LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+    DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    CLORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    FIXED = (() => {
+      const l = new Array(288);
+      for (let s = 0; s < 288; s++) l[s] = s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8;
+      return { lit: huffman(l), dist: huffman(new Array(30).fill(5)) };
+    })();
+    MARKUP_TAGS = ["form", "base", "input", "math", "frame", "frameset", "applet", "portal"];
+    MARKUP_SCHEMES = ["javascript:", "vbscript:", "data:text/html", "data:image/svg", "data:application/xhtml"];
+    HTML_NAMED = { colon: ":", tab: "	", newline: "\n", sol: "/", lpar: "(", rpar: ")", period: ".", comma: ",", excl: "!", quest: "?", num: "#", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", equals: "=", semi: ";", bsol: "\\" };
+    INVISIBLE_FILLERS = /[\u2028\u2029\u115F\u1160\u3164\uFFA0\u2800]/gu;
+    WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)\s*(\.|$)/i;
+    avoidReservedName = (n) => WINDOWS_RESERVED.test(n) ? `_${n}` : n;
+    RELAY_MEDIA_EXTS = Object.freeze(["jpg", "png", "gif", "webp", "mp4", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "gz", "tar", "7z", "rar", "bz2", "xz", "zst", "mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "mov", "webm", "mkv", "json", "csv", "txt", "bin"]);
     echo = (t) => String(t).replace(/[\p{Cc}\p{Bidi_Control}\u200B-\u200F\u2028\u2029\uFEFF]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
     BUZZ_APP_SIGNIN_MESSAGE = "Open the Buzz app once and sign in with Ekam, then try again.";
     BUZZ_APP_SIGNIN_RE = /Open the Buzz app once and sign in with Ekam/;
@@ -22824,6 +23479,7 @@ var init_websocket = __esm({
 });
 
 // node_modules/@hono/node-server/dist/index.mjs
+import { STATUS_CODES, ServerResponse, createServer } from "node:http";
 import { Http2ServerRequest, constants } from "node:http2";
 import { Readable } from "node:stream";
 async function readWithoutBlocking(readPromise) {
@@ -22862,7 +23518,7 @@ function writeFromReadableStream(stream, writable) {
   else if (writable.destroyed) return;
   return writeFromReadableStreamDefaultReader(stream.getReader(), writable);
 }
-var RequestError, nonJoinedHeaders, validHeaderName, isHttpWhitespace, normalizeHeaderValue, forbiddenHeaderValue, GlobalHeaders, materializeHeaders, RequestHeaders, newHeadersFromIncoming, reValidRequestUrl, reDotSegment, reValidHost, buildUrl, toRequestError, GlobalRequest, Request$1, wrapBodyStream, byteExactEncodings, isByteExactEncoding, bodyBufferedBeforeDisconnectKey, bodyBufferedLengthBeforeDisconnectKey, toBufferChunk, isRecoverableDisconnectedIncoming, recordBodyBufferedBeforeDisconnect, readBodyBufferedBeforeDisconnect, enqueueBufferedBody, newRequestFromIncoming, getRequestCache, requestCache, incomingKey, urlKey, methodKey, headersKey, abortControllerKey, getAbortController, abortRequest, bodyBufferKey, bodyReadPromiseKey, bodyConsumedDirectlyKey, bodyLockReaderKey, abortReasonKey, newBodyUnusableError, rejectBodyUnusable, textDecoder, consumeBodyDirectOnce, toArrayBuffer, contentType, methodTokenRegExp, normalizeIncomingMethod, validateDirectReadMethod, readBodyWithFastPath, readRawBodyIfAvailable, normalizeAbortError, readBodyDirect, requestPrototype, newRequest, defaultContentType, responseCache, getResponseCache, cacheKey, GlobalResponse, Response$1, validRedirectUrl, parseRedirectUrl, validRedirectStatuses, buildOutgoingHttpHeaders, outgoingEnded, incomingDraining, DRAIN_TIMEOUT_MS, MAX_DRAIN_BYTES, drainIncoming, makeCloseHandler, isImmediateCacheableResponse, handleRequestError, handleFetchError, handleResponseError, flushHeaders, responseViaCache, isPromise, responseViaResponseObject, getRequestListener, CloseEvent, ErrorEvent, generateConnectionSymbol, CONNECTION_SYMBOL_KEY, WAIT_FOR_WEBSOCKET_SYMBOL, upgradeWebSocket;
+var RequestError, nonJoinedHeaders, validHeaderName, isHttpWhitespace, normalizeHeaderValue, forbiddenHeaderValue, GlobalHeaders, materializeHeaders, RequestHeaders, newHeadersFromIncoming, reValidRequestUrl, reDotSegment, reValidHost, buildUrl, toRequestError, GlobalRequest, Request$1, wrapBodyStream, byteExactEncodings, isByteExactEncoding, bodyBufferedBeforeDisconnectKey, bodyBufferedLengthBeforeDisconnectKey, toBufferChunk, isRecoverableDisconnectedIncoming, recordBodyBufferedBeforeDisconnect, readBodyBufferedBeforeDisconnect, enqueueBufferedBody, newRequestFromIncoming, getRequestCache, requestCache, incomingKey, urlKey, methodKey, headersKey, abortControllerKey, getAbortController, abortRequest, bodyBufferKey, bodyReadPromiseKey, bodyConsumedDirectlyKey, bodyLockReaderKey, abortReasonKey, newBodyUnusableError, rejectBodyUnusable, textDecoder, consumeBodyDirectOnce, toArrayBuffer, contentType, methodTokenRegExp, normalizeIncomingMethod, validateDirectReadMethod, readBodyWithFastPath, readRawBodyIfAvailable, normalizeAbortError, readBodyDirect, requestPrototype, newRequest, defaultContentType, responseCache, getResponseCache, cacheKey, GlobalResponse, Response$1, validRedirectUrl, parseRedirectUrl, validRedirectStatuses, buildOutgoingHttpHeaders, outgoingEnded, incomingDraining, DRAIN_TIMEOUT_MS, MAX_DRAIN_BYTES, drainIncoming, makeCloseHandler, isImmediateCacheableResponse, handleRequestError, handleFetchError, handleResponseError, flushHeaders, trySetContentLength, writeDefaultHeaders, responseViaCache, isPromise, responseViaResponseObject, getRequestListener, CloseEvent, ErrorEvent, generateConnectionSymbol, CONNECTION_SYMBOL_KEY, WAIT_FOR_WEBSOCKET_SYMBOL, upgradeWebSocket;
 var init_dist = __esm({
   "node_modules/@hono/node-server/dist/index.mjs"() {
     init_constants_BLSFu_RU();
@@ -23658,7 +24314,7 @@ var init_dist = __esm({
       if (incoming.errored) {
         recordBodyBufferedBeforeDisconnect(incoming);
         req[abortRequest](incoming.errored.toString());
-      } else if (!outgoing.writableFinished) {
+      } else if (!outgoing.writableFinished || incoming instanceof Http2ServerRequest && incoming.aborted) {
         recordBodyBufferedBeforeDisconnect(incoming);
         req[abortRequest]("Client connection prematurely closed.");
       }
@@ -23680,13 +24336,31 @@ var init_dist = __esm({
       if (err.code === "ERR_STREAM_PREMATURE_CLOSE") console.info("The user aborted a request.");
       else {
         console.error(e);
-        if (!outgoing.headersSent) outgoing.writeHead(500, { "Content-Type": "text/plain" });
+        if (!outgoing.headersSent) {
+          if (outgoing instanceof ServerResponse) outgoing._contentLength = null;
+          outgoing.writeHead(500, { "Content-Type": "text/plain" });
+        }
         outgoing.end(`Error: ${err.message}`);
         outgoing.destroy(err);
       }
     };
     flushHeaders = (outgoing) => {
       if ("flushHeaders" in outgoing && outgoing.writable) outgoing.flushHeaders();
+    };
+    trySetContentLength = (outgoing, status, length) => {
+      const http1 = outgoing;
+      if (http1._contentLength === null && http1._hasBody && http1.useChunkedEncodingByDefault && !http1._removedContLen && status >= 200 && status !== 204 && status !== 304 && !outgoing.hasHeader("content-length") && !outgoing.hasHeader("transfer-encoding") && !outgoing.hasHeader("trailer")) {
+        http1._contentLength = length;
+        return true;
+      }
+      return false;
+    };
+    writeDefaultHeaders = (outgoing, status, length) => {
+      if (trySetContentLength(outgoing, status, length)) outgoing.writeHead(status, { "Content-Type": defaultContentType });
+      else outgoing.writeHead(status, {
+        "Content-Type": defaultContentType,
+        "Content-Length": length
+      });
     };
     responseViaCache = async (res, outgoing) => {
       let [status, body, header] = res[cacheKey];
@@ -23695,22 +24369,13 @@ var init_dist = __esm({
           outgoing.writeHead(status);
           outgoing.end();
         } else if (typeof body === "string") {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": Buffer.byteLength(body)
-          });
+          writeDefaultHeaders(outgoing, status, Buffer.byteLength(body));
           outgoing.end(body);
         } else if (body instanceof Uint8Array) {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": body.byteLength
-          });
+          writeDefaultHeaders(outgoing, status, body.byteLength);
           outgoing.end(body);
         } else if (body instanceof Blob) {
-          outgoing.writeHead(status, {
-            "Content-Type": defaultContentType,
-            "Content-Length": body.size
-          });
+          writeDefaultHeaders(outgoing, status, body.size);
           outgoing.end(new Uint8Array(await body.arrayBuffer()));
         } else {
           outgoing.writeHead(status, { "Content-Type": defaultContentType });
@@ -23721,6 +24386,8 @@ var init_dist = __esm({
         return;
       }
       let hasContentLength = false;
+      let plainHeaders = false;
+      let canAutoLength = true;
       if (header instanceof Headers) {
         hasContentLength = header.has("content-length");
         header = buildOutgoingHttpHeaders(header, body === null ? void 0 : defaultContentType);
@@ -23728,14 +24395,25 @@ var init_dist = __esm({
         const headerObj = new Headers(header);
         hasContentLength = headerObj.has("content-length");
         header = buildOutgoingHttpHeaders(headerObj, body === null ? void 0 : defaultContentType);
-      } else for (const key in header) if (key.length === 14 && key.toLowerCase() === "content-length") {
-        hasContentLength = true;
-        break;
+      } else {
+        plainHeaders = true;
+        for (const key in header) {
+          if (key.length === 14 && key.toLowerCase() === "content-length") {
+            hasContentLength = true;
+            break;
+          }
+          if (key.length === 17 && key.toLowerCase() === "transfer-encoding" || key.length === 7 && key.toLowerCase() === "trailer") canAutoLength = false;
+        }
       }
       if (!hasContentLength) {
-        if (typeof body === "string") header["Content-Length"] = Buffer.byteLength(body);
-        else if (body instanceof Uint8Array) header["Content-Length"] = body.byteLength;
-        else if (body instanceof Blob) header["Content-Length"] = body.size;
+        let length;
+        if (typeof body === "string") length = Buffer.byteLength(body);
+        else if (body instanceof Uint8Array) length = body.byteLength;
+        else if (body instanceof Blob) length = body.size;
+        if (length !== void 0 && (!plainHeaders || !canAutoLength || !trySetContentLength(outgoing, status, length))) {
+          if (plainHeaders) header = { ...header };
+          header["Content-Length"] = length;
+        }
       }
       outgoing.writeHead(status, header);
       if (body == null) outgoing.end();
@@ -25376,7 +26054,7 @@ __export(http_server_exports, {
   scrub: () => scrub,
   startHttpServer: () => startHttpServer
 });
-import { createServer } from "node:http";
+import { createServer as createServer2 } from "node:http";
 import { randomUUID, createHash as createHash4 } from "node:crypto";
 function coreEnv(env) {
   const o = { BUZZ_HARNESS: "ola-buzz-hosted", BUZZ_INTERFACE: "mcp-http", BUZZ_WIRE_SIGN: "1" };
@@ -25698,7 +26376,7 @@ async function startHttpServer({
       if (!res.headersSent) rpcErr(res, 500, -32603, "Internal error");
     }
   }
-  const httpServer = createServer({ requestTimeout: 12e4, headersTimeout: 3e4, maxHeaderSize: 16 * 1024 }, (req, res) => {
+  const httpServer = createServer2({ requestTimeout: 12e4, headersTimeout: 3e4, maxHeaderSize: 16 * 1024 }, (req, res) => {
     handle(req, res).catch((e) => {
       log("http_error", { err: String(e && e.message) });
       if (!res.headersSent) send(res, 500, { error: "internal_error" });
@@ -26897,7 +27575,7 @@ ${url}
 
 // buzz-mcp.mjs
 import { createHash as createHash5, randomBytes as randomBytes6, randomUUID as randomUUID2 } from "node:crypto";
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, readSync, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
 import { Readable as Readable2 } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
@@ -27320,7 +27998,7 @@ async function createBuzzServer(opts = {}) {
     const st = { size };
     let src, mime, sha;
     try {
-      ({ mime } = mediaCapCheck(basename2(filePath), st.size));
+      ({ mime } = classifyAttachment({ name: basename2(filePath), size: st.size, read: fdReader(fd) }));
       sha = await new Promise((res2, rej) => {
         const h = createHash5("sha256");
         const r = createReadStream(null, { fd, start: 0, autoClose: false });
@@ -27360,7 +28038,21 @@ async function createBuzzServer(opts = {}) {
       d = JSON.parse(text);
     } catch {
     }
-    return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: basename2(filePath) };
+    checkDescriptorMime(d.type, mime, basename2(filePath));
+    const filename = attachmentDisplayName(filePath, mime);
+    return { url: d.url || `${RELAY}/media/${sha}${extname(filename)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type, classified: mime, filename };
+  }
+  function fdReader(fd) {
+    return (start, len) => {
+      const b = Buffer.alloc(len);
+      let off = 0;
+      while (off < len) {
+        const n = readSync(fd, b, off, len - off, start + off);
+        if (!n) break;
+        off += n;
+      }
+      return b.subarray(0, off);
+    };
   }
   async function blossomDownload(shaExt, { ext = "" } = {}) {
     const sha = String(shaExt).split(".")[0].toLowerCase();
@@ -27875,13 +28567,26 @@ async function createBuzzServer(opts = {}) {
   async function uploadAttachments(input) {
     if (HOSTED) throw new Error("attachments from a file path aren't available in Ola Buzz (hosted) \u2014 the connector can't see files on your computer. Post the text, or attach the file in the Buzz app.");
     const r = resolveAttachment(String(input), { extraDirs: [CFG_DIR2, IDENTITY_DIR, WIRE_REFRESH_DIR] });
+    const pre = [];
+    for (const f of r.files) {
+      const { fd, size } = openCheckedAttachment(f, r.ids && r.ids[f]);
+      try {
+        pre.push({ f, size, ...classifyAttachment({ name: basename2(f), size, read: fdReader(fd) }) });
+      } catch (e) {
+        if (!r.isDir) throw e;
+        (r.skipped ||= []).push(`${basename2(f)} (type not allowed)`);
+      } finally {
+        try {
+          closeSync2(fd);
+        } catch {
+        }
+      }
+    }
+    if (!pre.length) throw new Error(`buzz_post: attachment declined LOCALLY \u2014 no file in ${r.typed} is an allowed type (images jpeg/png/gif/webp, mp4 video, pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json).`);
+    r.files = pre.map((p) => p.f);
     const ups = [];
     if (isDryRun()) {
-      for (const f of r.files) {
-        const size = statSync2(f).size;
-        const { mime } = mediaCapCheck(basename2(f), size);
-        ups.push({ dry: true, url: `(dry run \u2014 ${basename2(f)} not uploaded)`, filename: basename2(f), size, mime });
-      }
+      for (const { f, size, mime } of pre) ups.push({ dry: true, url: `(dry run \u2014 ${basename2(f)} not uploaded)`, filename: attachmentDisplayName(f, mime), size, mime });
       return { r, ups };
     }
     for (const f of r.files) {
@@ -28871,8 +29576,9 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
           attached = await uploadAttachments(a.attachment);
           for (const up of attached.ups) {
             if (!up.dry) tags.push(buildImeta(up));
+            const line = up.dry ? up.url : attachmentContentLine(up);
             content = content ? `${content}
-${up.url}` : up.url;
+${line}` : line;
           }
         }
         const ev = await signer.sign({ kind: 9, tags, content });
@@ -28900,9 +29606,9 @@ ${up.url}` : up.url;
         const att = atts[idx];
         if (!att) throw new Error(`attachment index ${idx} out of range \u2014 message has ${atts.length} (0..${atts.length - 1})`);
         if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) \u2014 refusing to fetch an unverifiable blob`);
-        const shaExt = basename2(new URL(att.url).pathname);
-        const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
         if (!/^[0-9a-f]{64}$/.test(String(att.sha256).toLowerCase())) throw new Error("attachment sha256 is not 64-hex \u2014 refusing");
+        const shaExt = parseMediaShaExt(att.url, att.sha256, { hosted: HOSTED });
+        const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
         if (HOSTED) {
           const buf = await blossomFetchToMemory(shaExt, HOSTED_ATTACH_MAX);
           const got2 = createHash5("sha256").update(buf).digest("hex");
@@ -29021,8 +29727,9 @@ ${fence.replace("BEGIN", "END")}`);
           attached = await uploadAttachments(a.attachment);
           for (const up of attached.ups) {
             if (!up.dry) tags.push(buildImeta(up));
+            const line = up.dry ? up.url : attachmentContentLine(up);
             content = content ? `${content}
-${up.url}` : up.url;
+${line}` : line;
           }
         }
         const ev = await signer.sign({ kind: 9, tags, content });
