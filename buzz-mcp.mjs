@@ -5,7 +5,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as nip19 from "nostr-tools/nip19";
-import { resolveSigner, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, classifyAttachment, attachmentDisplayName, attachmentContentLine, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN } from "./signer.mjs";
+import { resolveSigner, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, classifyAttachment, attachmentDisplayName, attachmentContentLine, checkDescriptorMime, parseMediaShaExt, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN } from "./signer.mjs";
 import { IDENTITY_DIR } from "./loadkey_v2.mjs";
 import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
 import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
@@ -602,7 +602,13 @@ async function blossomUpload(filePath, expectId) {
   const text = await res.text();
   if (!res.ok) throw new Error(`upload ${basename(filePath)} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
   let d = {}; try { d = JSON.parse(text); } catch {}
-  return { url: d.url || `${RELAY}/media/${sha}${extname(filePath)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type || mime, filename: attachmentDisplayName(filePath, d.type || mime) };
+  // Review round 1: the relay sniffs only a 4 KiB prefix and can store a real docx/xlsx/pptx as
+  // application/zip. The label, imeta filename and extension come from the shim's OWN classification;
+  // the descriptor is accepted only if its type equals it (or is application/zip for OOXML/ODF), else
+  // nothing is posted. imeta `m` stays the relay's stored type (it must match the relay's sidecar).
+  checkDescriptorMime(d.type, mime, basename(filePath));
+  const filename = attachmentDisplayName(filePath, mime);
+  return { url: d.url || `${RELAY}/media/${sha}${extname(filename)}`, sha256: String(d.sha256 || d.x || sha).toLowerCase(), size: Number(d.size || st.size), mime: d.type, classified: mime, filename };
 }
 // Positional reads from an already-checked fd (no re-open, so no check/use swap).
 function fdReader(fd) {
@@ -2102,9 +2108,11 @@ async function callTool(req) {
       const att = atts[idx];
       if (!att) throw new Error(`attachment index ${idx} out of range — message has ${atts.length} (0..${atts.length - 1})`);
       if (!att.sha256) throw new Error(`attachment has no sha256 (x tag) — refusing to fetch an unverifiable blob`);
-      const shaExt = basename(new URL(att.url).pathname); // "<sha>.<ext>"
-      const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
       if (!/^[0-9a-f]{64}$/.test(String(att.sha256).toLowerCase())) throw new Error("attachment sha256 is not 64-hex — refusing");
+      // Review round 1: the media path must be exactly "<64-hex sha>[.<ext>]", its sha the imeta x, and
+      // (hosted) its extension one the relay actually issues — never an arbitrary path or query.
+      const shaExt = parseMediaShaExt(att.url, att.sha256, { hosted: HOSTED });
+      const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
       if (HOSTED) {
         // hosted: never touch the server's disk — fetch into memory (capped), verify the sha, return
         // text inline (fenced) or describe a binary. Nothing is saved.

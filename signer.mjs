@@ -22,6 +22,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { inflateRawSync } from "node:zlib";
 // Ola's registered PUBLIC OAuth client for "post as me" (PKCE, localhost redirect;
 // no secret). Users kept getting "set BUZZ_EKAM_CLIENT_ID" at the one-time login
 // because every install shares this one id — so it is the default; the env var
@@ -357,7 +358,15 @@ const TEXT_EXTS = new Set(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect === "
 const SNIFFED_EXT = new Map(ATTACH_ALLOWED_FILE_TYPES.filter((t) => t.detect !== "text").map((t) => [t.detect, t.ext]));
 // The relay's MP4 brands (buzz-media/src/validation.rs MP4_BRANDS).
 const MP4_BRANDS = new Set(["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7", "iso8", "iso9", "mp41", "mp42", "avc1", "dash", "M4V "]);
-const MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml"];
+const MARKUP_MARKERS = ["<!doctype", "<html", "<head", "<body", "<script", "<iframe", "<svg", "<?xml", "<xml", "<object", "<embed", "<meta", "<link", "<style", "javascript:"];
+export const ZIP_MIME = "application/zip";
+// OOXML main parts that decide the type (each also needs [Content_Types].xml); OPC names are case-insensitive.
+const OOXML_MAIN_PARTS = [["word/document.xml", DOCX], ["xl/workbook.xml", XLSX], ["ppt/presentation.xml", PPTX]];
+const ODF_MIMES = [ODT, ODS, ODP];
+// The ZIP-based document types (classified from the central directory; the relay may store them as application/zip).
+export const ZIP_DOCUMENT_MIMES = Object.freeze([DOCX, XLSX, PPTX, ODT, ODS, ODP]);
+const ZIP_PART_MAX = 128 * MEDIA_MB; // inflate cap for one inspected part (.rels, content.xml, styles.xml) — zip-bomb guard
+const SIG = { lfh: Buffer.from([0x50, 0x4b, 0x03, 0x04]), cdh: Buffer.from([0x50, 0x4b, 0x01, 0x02]), eocd: Buffer.from([0x50, 0x4b, 0x05, 0x06]) };
 
 function declined(name, why) {
   return new Error(`buzz_post: attachment declined LOCALLY — ${name}: unsupported file type (${why}). Allowed: images (jpeg/png/gif/webp), mp4 video, and pdf, docx, xlsx, pptx, odt, ods, odp, txt, csv, md, json (a shim pre-flight check, NOT a server verdict).`);
@@ -389,53 +398,149 @@ function sniffHead(b) {
   return null;
 }
 
-// Entry names from a ZIP central directory; null if missing/truncated/ZIP64.
-export function zipCentralDirectoryNames(b) {
-  if (b.length < 22) return null;
-  let eocd = -1;
-  for (let i = b.length - 22; i >= Math.max(0, b.length - 22 - 65535); i--) {
-    if (b[i] === 0x50 && b[i + 1] === 0x4b && b[i + 2] === 0x05 && b[i + 3] === 0x06) { eocd = i; break; }
-  }
-  if (eocd < 0) return null;
-  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16);
-  if (count === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff || cdOff + cdSize > eocd) return null;
-  const names = [];
+// Strict ZIP directory reader (review round 1). → [{name, flags, method, csize, usize, lho, dataAt}] or
+// null (fail closed) unless ALL of these hold:
+//  - exactly one EOCD signature in the EOCD search window, and its comment ends exactly at EOF
+//    (a second "EOCD" — e.g. a fake one in the comment that re-points the directory — is refused);
+//  - single disk, no ZIP64, the central directory ends exactly at the EOCD and holds exactly `count` entries;
+//  - every entry's local header is where the directory says, with the same name and method;
+//  - the local entries tile the bytes before the directory with no gaps (no hidden, unlisted entries);
+//  - no duplicate names (case-insensitive).
+export function zipDirectory(b) {
+  if (!Buffer.isBuffer(b) || b.length < 22) return null;
+  const windowStart = Math.max(0, b.length - 22 - 65535);
+  const hits = [];
+  for (let i = b.indexOf(SIG.eocd, windowStart); i >= 0; i = b.indexOf(SIG.eocd, i + 1)) hits.push(i);
+  if (hits.length !== 1) return null;
+  const eocd = hits[0];
+  if (eocd + 22 > b.length) return null;
+  const disk = b.readUInt16LE(eocd + 4), cdDisk = b.readUInt16LE(eocd + 6), onDisk = b.readUInt16LE(eocd + 8);
+  const count = b.readUInt16LE(eocd + 10), cdSize = b.readUInt32LE(eocd + 12), cdOff = b.readUInt32LE(eocd + 16), commentLen = b.readUInt16LE(eocd + 20);
+  if (eocd + 22 + commentLen !== b.length) return null;
+  if (disk !== 0 || cdDisk !== 0 || onDisk !== count) return null;
+  if (count === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff || cdOff + cdSize !== eocd) return null;
+  const entries = [];
   let at = cdOff;
   for (let n = 0; n < count; n++) {
-    if (at + 46 > b.length || b.readUInt32LE(at) !== 0x02014b50) return null;
-    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32);
-    if (at + 46 + nl > b.length) return null;
-    names.push(b.toString("utf8", at + 46, at + 46 + nl));
+    if (at + 46 > eocd || b.readUInt32LE(at) !== 0x02014b50) return null;
+    const flags = b.readUInt16LE(at + 8), method = b.readUInt16LE(at + 10), csize = b.readUInt32LE(at + 20), usize = b.readUInt32LE(at + 24);
+    const nl = b.readUInt16LE(at + 28), el = b.readUInt16LE(at + 30), cl = b.readUInt16LE(at + 32), lho = b.readUInt32LE(at + 42);
+    if (at + 46 + nl + el + cl > eocd) return null;
+    entries.push({ nameBytes: b.subarray(at + 46, at + 46 + nl), name: b.toString("utf8", at + 46, at + 46 + nl), flags, method, csize, usize, lho });
     at += 46 + nl + el + cl;
   }
-  return names;
+  if (at !== eocd) return null;
+  const seen = new Set();
+  for (const e of entries) {
+    const key = e.name.toLowerCase();
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const L = e.lho;
+    if (L + 30 > cdOff || b.readUInt32LE(L) !== 0x04034b50) return null;
+    const lnl = b.readUInt16LE(L + 26), lel = b.readUInt16LE(L + 28);
+    if (b.readUInt16LE(L + 8) !== e.method || !b.subarray(L + 30, L + 30 + lnl).equals(e.nameBytes)) return null;
+    e.dataAt = L + 30 + lnl + lel;
+    let end = e.dataAt + e.csize;
+    if (end > cdOff) return null;
+    if (e.flags & 8) end += end + 4 <= cdOff && b.readUInt32LE(end) === 0x08074b50 ? 16 : 12; // data descriptor
+    if (end > cdOff) return null;
+    e.end = end;
+  }
+  const order = [...entries].sort((x, y) => x.lho - y.lho);
+  let pos = 0;
+  for (const e of order) { if (e.lho !== pos) return null; pos = e.end; }
+  if (pos !== cdOff) return null;
+  for (const e of entries) { delete e.nameBytes; delete e.end; }
+  return entries;
 }
+// Entry names from a ZIP central directory; null if missing/truncated/ZIP64/inconsistent (see zipDirectory).
+export function zipCentralDirectoryNames(b) {
+  const e = zipDirectory(b);
+  return e ? e.map((x) => x.name) : null;
+}
+// Every name in ANY local or central header signature found anywhere in the bytes — a raw scan that does
+// not trust the directory (backs up the directory walk the way the raw vbaProject search does).
+function rawHeaderNames(b) {
+  const out = [];
+  for (const [sig, nlAt, nameAt] of [[SIG.lfh, 26, 30], [SIG.cdh, 28, 46]]) {
+    for (let i = b.indexOf(sig); i >= 0; i = b.indexOf(sig, i + 1)) {
+      if (i + nameAt > b.length) break;
+      const nl = b.readUInt16LE(i + nlAt);
+      if (nl && i + nameAt + nl <= b.length) out.push(b.toString("latin1", i + nameAt, i + nameAt + nl));
+    }
+  }
+  return out;
+}
+// The (inflated) bytes of one entry; null if it can't be read within ZIP_PART_MAX (fail closed by callers).
+function zipEntryData(b, e) {
+  const raw = b.subarray(e.dataAt, e.dataAt + e.csize);
+  try {
+    if (e.method === 0) return raw.length <= ZIP_PART_MAX ? raw : null;
+    if (e.method === 8) return inflateRawSync(raw, { maxOutputLength: ZIP_PART_MAX });
+  } catch {}
+  return null;
+}
+// XML numeric character references decoded so `&#69;xternal` can't hide `External` from the scan.
+const xmlText = (buf) => buf.toString("utf8").replace(/&#x([0-9a-f]+);|&#([0-9]+);/gi, (_, h, d) => { try { return String.fromCodePoint(h ? parseInt(h, 16) : Number(d)); } catch { return ""; } });
+const EXTERNAL_REL_TYPES = /\/(attachedTemplate|oleObject|frame|subDocument|control|package)$/i;
 
-// OOXML/ODF type of a ZIP, or throws (plain zip, macros, unreadable directory).
-function classifyZip(b, name) {
-  const names = zipCentralDirectoryNames(b);
-  if (!names) throw declined(name, "ZIP with an unreadable directory");
-  for (const n of names) {
-    const lower = n.toLowerCase();
-    if (lower.split("/").pop().startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
-    if (lower.startsWith("basic/") || lower.startsWith("scripts/")) throw declined(name, `OpenDocument file containing macros (${n})`);
+// Active-content checks on a classified OOXML/ODF ZIP. Throws a local refusal on the first hit.
+function checkZipActiveContent(b, entries, mime, name) {
+  for (const n of [...entries.map((e) => e.name), ...rawHeaderNames(b)]) {
+    const lower = n.toLowerCase().replace(/\\/g, "/");
+    const base = lower.split("/").pop();
+    if (base.startsWith("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
+    if (/(^|\/)(basic|scripts)\//.test(lower)) throw declined(name, `OpenDocument file containing macros (${n})`);
+    if (/(^|\/)activex\//.test(lower)) throw declined(name, `Office file containing ActiveX controls (${n})`);
+    if (base.startsWith("oleobject") || /(^|\/)embeddings\/[^/]*\.bin$/.test(lower)) throw declined(name, `Office file containing an embedded OLE object (${n})`);
   }
   if (b.toString("latin1").toLowerCase().includes("vbaproject")) throw declined(name, "Office file containing macros (vbaProject.bin)");
-  // ODF: first local entry is a stored "mimetype" whose content names the type (what infer checks).
-  if (b.toString("latin1", 0x1e, 0x26) === "mimetype") {
-    const m = b.toString("latin1", 0x26, 0x26 + 60);
-    for (const t of [ODT, ODS, ODP]) if (m.startsWith(t)) return t;
+  if (ODF_MIMES.includes(mime)) {
+    for (const part of ["content.xml", "styles.xml"]) {
+      const e = entries.find((x) => x.name === part);
+      if (!e) continue; // content.xml is required by classifyZip
+      const data = zipEntryData(b, e);
+      if (!data) throw declined(name, `OpenDocument file with an unreadable ${part}`);
+      const t = xmlText(data);
+      if (/<[\w.-]*:?event-listeners?\b/i.test(t)) throw declined(name, `OpenDocument file with event listeners / macro bindings (${part})`);
+      if (/vnd\.sun\.star\.script:|macro:\/\//i.test(t)) throw declined(name, `OpenDocument file referencing a macro (${part})`);
+    }
+    return;
   }
-  const set = new Set(names);
-  if (set.has("[Content_Types].xml") || names.some((n) => /^(word|xl|ppt)\//.test(n))) {
-    if (names.some((n) => n.startsWith("word/"))) return DOCX;
-    if (names.some((n) => n.startsWith("xl/"))) return XLSX;
-    if (names.some((n) => n.startsWith("ppt/"))) return PPTX;
+  for (const e of entries) {
+    if (!e.name.toLowerCase().endsWith(".rels")) continue;
+    const data = zipEntryData(b, e);
+    if (!data) throw declined(name, `Office file with an unreadable relationships part (${e.name})`);
+    for (const [tag] of xmlText(data).matchAll(/<(?:[\w.-]+:)?Relationship\b[^>]*>/gi)) {
+      if (!/\bTargetMode\s*=\s*["']\s*External\s*["']/i.test(tag)) continue;
+      const type = (tag.match(/\bType\s*=\s*["']([^"']*)["']/i) || [])[1] || "";
+      if (EXTERNAL_REL_TYPES.test(type.trim())) throw declined(name, `Office file with an external ${type.trim().split("/").pop()} reference (${e.name})`);
+    }
   }
-  throw declined(name, "zip archive");
 }
 
-// Plain-text check for txt/csv/md/json (no magic bytes to sniff).
+// OOXML/ODF type of a ZIP, decided from its central directory, or throws (plain/ambiguous zip, macros,
+// active content, unreadable or inconsistent directory). Mirrors buzz-cli classify_zip_container:
+//  - OOXML: [Content_Types].xml plus exactly one of word/document.xml, xl/workbook.xml, ppt/presentation.xml;
+//  - ODF: a stored `mimetype` entry holding exactly the odt/ods/odp type, plus content.xml and META-INF/manifest.xml.
+export function classifyZip(b, name = "file.zip") {
+  const entries = zipDirectory(b);
+  if (!entries) throw declined(name, "ZIP with an unreadable or inconsistent directory");
+  const has = (want) => entries.some((e) => e.name.toLowerCase() === want.toLowerCase());
+  const found = [];
+  if (has("[Content_Types].xml")) for (const [part, mime] of OOXML_MAIN_PARTS) if (has(part)) found.push(mime);
+  const mt = entries.find((e) => e.name === "mimetype");
+  if (mt && mt.method === 0 && mt.csize <= 128) {
+    const value = b.toString("latin1", mt.dataAt, mt.dataAt + mt.csize);
+    if (ODF_MIMES.includes(value) && entries.some((e) => e.name === "content.xml") && entries.some((e) => e.name === "META-INF/manifest.xml")) found.push(value);
+  }
+  if (found.length === 0) throw declined(name, "zip archive — not a Word, Excel, PowerPoint or OpenDocument file");
+  if (found.length > 1) throw declined(name, `zip archive that claims more than one document type (${found.map((m) => SNIFFED_EXT.get(m)).join(", ")})`);
+  checkZipActiveContent(b, entries, found[0], name);
+  return found[0];
+}
+
+// Plain-text check for txt/csv/md/json (no magic bytes to sniff). The WHOLE file is scanned for markup.
 export function checkAttachmentText(b, ext, name = `file.${ext}`) {
   let body = startsWith(b, [0xef, 0xbb, 0xbf]) ? b.subarray(3) : b;
   let text;
@@ -443,8 +548,9 @@ export function checkAttachmentText(b, ext, name = `file.${ext}`) {
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(text)) throw declined(name, `.${ext} containing control characters`);
   if (text.trimStart().startsWith("<")) throw declined(name, `.${ext} that starts with markup`);
   if (text.startsWith("#!")) throw declined(name, `.${ext} that is a script (#!)`);
-  const head = body.subarray(0, 1024).toString("latin1").toLowerCase();
-  if (MARKUP_MARKERS.some((m) => head.includes(m))) throw declined(name, `.${ext} containing HTML/XML markup`);
+  const lower = text.toLowerCase();
+  const hit = MARKUP_MARKERS.find((m) => lower.includes(m));
+  if (hit) throw declined(name, `.${ext} containing HTML/XML markup (${hit})`);
   if (ext === "json") { try { JSON.parse(text); } catch { throw declined(name, ".json that is not valid JSON"); } }
 }
 
@@ -480,27 +586,66 @@ export function mediaCapCheck(filename, size, mime = OCTET_STREAM) {
 }
 
 // Clean a local path into the name other people see: basename, NFC, no Cf (incl. bidi U+202A–202E,
-// U+2066–2069, U+200E/F, U+061C, zero-width, BOM), no C0/C1, no / or \, trimmed of dots/spaces.
+// U+2066–2069, U+200E/F, U+061C, zero-width, BOM), no C0/C1, no / or \, no line/paragraph separators
+// (U+2028/2029) or invisible Hangul/Braille fillers (U+115F, U+1160, U+3164, U+FFA0, U+2800), trimmed of
+// dots/spaces, and a reserved Windows device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, CONIN$, CONOUT$ —
+// with or without an extension) prefixed with "_".
+const INVISIBLE_FILLERS = /[\u2028\u2029\u115F\u1160\u3164\uFFA0\u2800]/gu;
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)\s*(\.|$)/i;
+const avoidReservedName = (n) => (WINDOWS_RESERVED.test(n) ? `_${n}` : n);
 export function sanitizeAttachmentName(p) {
   const base = String(p ?? "").split(/[\\/]/).pop();
-  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(/^[\s.]+|[\s.]+$/gu, "");
-  return cleaned || "file";
+  const cleaned = base.normalize("NFC").replace(/[\p{Cc}\p{Cf}\\/]/gu, "").replace(INVISIBLE_FILLERS, "").replace(/^[\s.]+|[\s.]+$/gu, "");
+  return cleaned ? avoidReservedName(cleaned) : "file";
 }
-// The posted filename: sanitised, extension forced to the sniffed/stored type, ≤120 bytes.
+// The extension a posted file gets, from the LOCAL classification (classifyAttachment) — never the
+// relay's descriptor. Text (octet-stream) keeps its txt/csv/md/json extension; anything else throws
+// (no ".txt" fallback).
+export function attachmentExtFor(mime, localName = "") {
+  if (SNIFFED_EXT.has(mime)) return SNIFFED_EXT.get(mime);
+  const media = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
+  if (media) return media;
+  const ext = localExt(sanitizeAttachmentName(localName));
+  if (mime === OCTET_STREAM && TEXT_EXTS.has(ext)) return ext;
+  throw new Error(`buzz_post: no display name for ${sanitizeAttachmentName(localName)} — type ${JSON.stringify(String(mime))} is not one the shim classified (refusing rather than guessing an extension).`);
+}
+// The posted filename: sanitised, extension forced to the locally classified type, ≤120 bytes.
 export function attachmentDisplayName(p, mime) {
   const name = sanitizeAttachmentName(p);
   const i = name.lastIndexOf(".");
   const stem0 = i > 0 ? name.slice(0, i) : name;
   const ext = i > 0 ? name.slice(i + 1).toLowerCase() : "";
-  let forced;
-  if (SNIFFED_EXT.has(mime)) forced = SNIFFED_EXT.get(mime);
-  else if (ATTACH_IMAGE_MIMES.includes(mime) || ATTACH_VIDEO_MIMES.includes(mime)) forced = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "video/mp4": "mp4" }[mime];
-  else forced = TEXT_EXTS.has(ext) ? ext : "txt";
+  let forced = attachmentExtFor(mime, name);
   if (mime === "image/jpeg" && (ext === "jpg" || ext === "jpeg")) forced = ext;
   let stem = stem0.replace(/^[\s.]+|[\s.]+$/gu, "") || "file";
-  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 1;
+  const budget = ATTACH_MAX_NAME_BYTES - forced.length - 2; // -1 for ".", -1 for a possible "_" prefix
   while (Buffer.byteLength(stem) > budget) stem = [...stem].slice(0, -1).join("");
-  return `${stem.trimEnd() || "file"}.${forced}`;
+  return avoidReservedName(`${stem.trimEnd() || "file"}.${forced}`);
+}
+// Accept the relay's upload descriptor only if the MIME it stored equals the shim's own classification,
+// or is application/zip for a file the shim classified as OOXML/ODF (the relay sniffs only a 4 KiB
+// prefix). Anything else (including a missing type) → throws; the caller posts nothing.
+// Mirrors buzz-cli check_descriptor_mime.
+export function checkDescriptorMime(stored, classified, name = "file") {
+  const s = String(stored ?? "");
+  if (s && (s === classified || (s === ZIP_MIME && ZIP_DOCUMENT_MIMES.includes(classified)))) return true;
+  throw new Error(`buzz_post: upload of ${sanitizeAttachmentName(name)} refused — the relay stored it as ${JSON.stringify(s || "(no type)")} but the shim classified it as ${JSON.stringify(String(classified))}; not posting it (the uploaded blob is left unreferenced).`);
+}
+// Extensions the relay issues for /media/<sha>.<ext> (buzz-media validation.rs mime_to_ext +
+// file_mime_to_ext, html excluded per the ruling, plus the "bin" fallback).
+export const RELAY_MEDIA_EXTS = Object.freeze(["jpg", "png", "gif", "webp", "mp4", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "gz", "tar", "7z", "rar", "bz2", "xz", "zst", "mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "mov", "webm", "mkv", "json", "csv", "txt", "bin"]);
+// Validate an attachment URL's last path segment before it is fetched: exactly "<64 lowercase hex>"
+// optionally ".<ext>", the sha equal to the imeta x, no query/fragment-bearing or encoded tricks. In
+// hosted mode the extension must also be in RELAY_MEDIA_EXTS. → "<sha>[.<ext>]" | throws.
+export function parseMediaShaExt(url, sha256, { hosted = false } = {}) {
+  let path;
+  try { path = new URL(String(url)).pathname; } catch { throw new Error("attachment url is not a URL — refusing"); }
+  const seg = path.split("/").pop();
+  const m = /^([0-9a-f]{64})(?:\.([a-z0-9]{1,8}))?$/.exec(seg);
+  if (!m) throw new Error("attachment url is not /media/<sha256>[.<ext>] — refusing");
+  if (m[1] !== String(sha256 || "").toLowerCase()) throw new Error("attachment url sha256 ≠ imeta x — refusing");
+  if (hosted && m[2] && !RELAY_MEDIA_EXTS.includes(m[2])) throw new Error(`attachment extension .${m[2]} is not one the relay issues — refusing`);
+  return seg;
 }
 // Escape markdown link-label metacharacters \ [ ] ( ) < > so a name can't break out of its link.
 export function escapeLinkLabel(s) { return String(s).replace(/[\\[\]()<>]/g, (c) => `\\${c}`); }
