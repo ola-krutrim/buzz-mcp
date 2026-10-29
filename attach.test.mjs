@@ -217,12 +217,41 @@ expectOk("emb.docx", ooxml("word", [["word/embeddings/chart.xlsx", "x"], ["word/
   // corrupt a deflated .rels so it can't be inflated → fail closed
   const bad = zip([["[Content_Types].xml", "<Types/>"], ["word/document.xml", "<x/>"], ["word/_rels/document.xml.rels", "<Relationships/>", { deflate: true }]]);
   const relAt = bad.indexOf(Buffer.from("word/_rels/document.xml.rels")) + "word/_rels/document.xml.rels".length; bad[relAt] = 0xff; bad[relAt + 1] = 0xff;
-  expectRefused("c.docx", bad, /unreadable relationships part/, "un-inflatable .rels → fail closed");
+  expectRefused("c.docx", bad, /unreadable (relationships part|entry)/, "un-inflatable .rels → fail closed");
   ok(classify("plain.docx", broken).mime === DOCX, "(control) a stored non-XML .rels with no Relationship is fine");
 }
 expectRefused("ev.odt", odf(ODT_M, [], `<office:document-content><office:event-listeners><script:event-listener script:event-name="dom:load" xlink:href="vnd.sun.star.script:Standard.Module1.Main"/></office:event-listeners></office:document-content>`), /event listeners.*\(content\.xml\)/, "ODF office:event-listeners in content.xml");
 expectRefused("ev.odt", zip([["mimetype", ODT_M], ["content.xml", "<c/>", { deflate: true }], ["styles.xml", "<office:document-styles><office:event-listeners/></office:document-styles>", { deflate: true }], ["META-INF/manifest.xml", "<m/>"]]), /event listeners.*\(styles\.xml\)/, "ODF office:event-listeners in styles.xml (deflated)");
 expectRefused("ev.odt", odf(ODT_M, [], `<text:a xlink:href="macro:///Standard.Module1.Main">x</text:a>`), /referencing a macro/, "ODF macro:// link");
+
+console.log("round 2 — executables / scripts inside OOXML/ODF containers:");
+{
+  const MZ = Buffer.concat([Buffer.from("MZ\x90\x00", "latin1"), Buffer.alloc(60)]);
+  const ELF = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]), Buffer.alloc(56)]);
+  expectRefused("v.docx", ooxml("word", [["payload.exe", MZ]]), /executable or script \(payload\.exe\)/, "valid docx + payload.exe");
+  expectRefused("v.docx", ooxml("word", [["word/x", "hi"], ["payload.exe", "MZ"]]), /executable or script/, "valid docx + word/x + payload.exe (the review case, now with a main part)");
+  expectRefused("v.docx", ooxml("word", [["word/media/image1.png", MZ]]), /Windows executable \(MZ\).*image1\.png/, "MZ blob under a harmless name (stored)");
+  expectRefused("v.docx", ooxml("word", [["word/media/image1.png", MZ, { deflate: true }]]), /Windows executable \(MZ\)/, "MZ blob under a harmless name (deflated)");
+  expectRefused("v.xlsx", ooxml("xl", [["xl/media/blob.dat", ELF, { deflate: true }]]), /ELF executable/, "ELF blob (deflated)");
+  expectRefused("v.pptx", ooxml("ppt", [["ppt/media/x.bin2", Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1])]]), /Mach-O executable/, "Mach-O 64-bit LE (feedfacf) blob");
+  expectRefused("v.pptx", ooxml("ppt", [["ppt/media/x.bin2", Buffer.from([0xfe, 0xed, 0xfa, 0xce, 0, 0, 0, 7])]]), /Mach-O executable/, "Mach-O 32-bit BE (feedface) blob");
+  expectRefused("v.pptx", ooxml("ppt", [["ppt/media/fat", Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2])]]), /Mach-O universal/, "cafebabe (fat / class) blob");
+  expectRefused("v.odt", odf(ODT_M, [["Pictures/run", "#!/bin/sh\nrm -rf ~\n", { deflate: true }]]), /script \(#!\)/, "ODF entry starting #! (deflated)");
+  for (const ext of ["dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "msi", "jar", "sh", "dmg", "lnk", "hta", "cpl", "pif"]) {
+    expectRefused("v.docx", ooxml("word", [[`word/media/x.${ext}`, "harmless"]]), /executable or script/, `entry *.${ext}`);
+  }
+  expectRefused("v.docx", ooxml("word", [["Tool.app/Contents/Info.plist", "<plist/>"]]), /executable or script/, "*.app bundle directory");
+  expectRefused("v.docx", ooxml("word", [["WORD/MEDIA/X.EXE", "harmless"]]), /executable or script/, "upper-case .EXE");
+  expectRefused("v.odt", odf(ODT_M, [["Thumbnails/x.vbs", "MsgBox 1"]]), /executable or script/, "ODF entry *.vbs");
+  {
+    const z = ooxml("word", [["word/media/a.png", "harmless"]]);
+    const i = z.indexOf(Buffer.from("word/media/a.png")); // rename only the LOCAL header name → raw scan sees .exe
+    const z2 = Buffer.from(z); z2.write("word/media/a.exe", i, "latin1");
+    expectRefused("v.docx", z2, /executable|inconsistent/, "local-header-only .exe name");
+  }
+  expectOk("ok.docx", ooxml("word", [["word/media/image1.png", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), { deflate: true }], ["word/media/x.json", "{}"], ["word/media/m.xml", "<M/>"]]), DOCX, "(control) png / json / xml parts still allowed");
+  expectOk("ok.docx", ooxml("word", [["word/media/empty.png", ""]]), DOCX, "(control) empty entry allowed");
+}
 
 console.log("should-fix — whole-file text scan + new markers:");
 for (const mk of ["<object data=x>", "<embed src=x>", "<meta http-equiv=refresh>", "<link rel=import>", "<style>x{}</style>", "javascript:alert(1)", "<SCRIPT>"]) {
