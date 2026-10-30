@@ -22,6 +22,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // v0.2.32 Slack-parity helpers (message links, search dates, dry-run previews, open-channel
 // directory, files, presence, custom emoji) — pure, unit-tested in parity32.test.mjs.
 import { buildMessageLink, parseMessageLink, parseWhen, DryRunStop, dryRunPreview, openChannelsFromMeta, filesFromEvents, fmtBytes, presenceFromEvents, emojiPalette, CUSTOM_EMOJI_D } from "./parity32.mjs";
+import { READ_STATE_KIND, READ_STATE_T, readStateIdentity, decodeReadState, nextReadStateBlob, frontiers, unreadCounts, validateProfilePatch, mergeProfile, parseProfileContent, BOOKMARK_KIND, parseBookmarks, applyBookmark, DIFF_KIND, buildDiffTags, checkDiffContent } from "./parity33.mjs";
 // buzz_login (v0.2.15) reuses the wire-sign OAuth primitives from the login CLI. NOTE: this
 // import inlines wirelogin.mjs into the bundle — its CLI main is guarded by a basename check
 // (see wirelogin.mjs) so it does NOT run at shim boot; we only compose its exported helpers.
@@ -176,7 +177,7 @@ async function nip98(url, method, body) {
 }
 
 // Shim version for the x-buzz-client telemetry header. Keep in sync with package.json.
-const SHIM_VERSION = "0.2.32";
+const SHIM_VERSION = "0.2.33";
 
 // #243: coarse, bounded retry class from the caught NETWORK error (name/code only, never raw message).
 function retryClass(e) {
@@ -637,18 +638,31 @@ const KIND_AGENT_PROFILE = 10100; // Buzz: agent metadata (replaceable, agent-au
 // publish this session's kind:0 profile (friendly name) enriched with model/harness/
 // interface, plus a structured kind:10100 agent card, so the fleet sees what each
 // agent actually is (which model, which harness, which interface).
-async function publishProfile(name) {
+// v0.2.33: PATCH semantics — the newest own (signature-verified) kind:0 is read first so fields set
+// with buzz_profile_set (picture, a hand-written about) survive the boot republish. `patch` is a
+// validated buzz_profile_set patch. A failed read falls back to the auto profile (old behavior).
+async function ownProfile() {
+  try {
+    const evs = (await query([{ kinds: [0], authors: [PK], limit: 5 }]) || []).filter((e) => e && e.pubkey === PK && verifyEvent(e));
+    const top = evs.sort((x, y) => y.created_at - x.created_at)[0];
+    return top ? { profile: parseProfileContent(top.content), created_at: top.created_at | 0 } : null;
+  } catch { return null; }
+}
+async function publishProfile(name, patch = {}, existing = undefined) {
   if (!isDryRun()) MY_NAME = name;
   const host = hostname().split(".")[0];
-  const profile = {
+  if (existing === undefined) existing = await ownProfile();
+  const profile = mergeProfile(existing && existing.profile, {
     display_name: name, name,
     about: `${AGENT_MODEL} · ${AGENT_HARNESS} · ${AGENT_INTERFACE} · ${host}`,
     model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE,
     client_version: SHIM_VERSION,   // (C, v0.2.30) which shim build published this profile
-  };
+  }, patch);
   // The kind:0 profile is the write-health canary — record its outcome (via bridge()). In agent mode
   // this fires on boot, so even a read-only session gets a real write signal.
-  const res = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) })
+  // replaceable event: strictly newer than the one we merged from, so a same-second update always wins
+  const created_at = Math.max(Math.floor(Date.now() / 1000), ((existing && existing.created_at) | 0) + 1);
+  const res = await signer.sign({ kind: 0, created_at, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) })
     .then((ev) => bridge("/events", ev));
   // best-effort structured agent card (relay may gate the kind; the kind:0 above always applies). Its
   // failure is deliberately swallowed as non-fatal, so it must NOT feed write-health — a grant without
@@ -1116,10 +1130,161 @@ async function dmById(id) {
   return hit;
 }
 
+// ---- v0.2.33 helpers: NIP-RS read state + NIP-51 saved list (agent mode: signer.selfCipher) ----
+// Only OWN events whose signature verifies are ever used (independent of BUZZ_VERIFY_INBOUND=flag).
+const ownVerified = (evs) => (evs || []).filter((e) => e && e.pubkey === PK && verifyEvent(e));
+async function loadReadState({ ownOnly = false } = {}) {
+  if (!signer.selfCipher) throw new Error("read state needs agent mode (NIP-44 encrypt-to-self)");
+  const id = readStateIdentity(signer.selfCipher.derive);
+  const filters = [{ kinds: [READ_STATE_KIND], authors: [PK], "#d": [id.d], limit: 10 }];
+  if (!ownOnly) filters.push({ kinds: [READ_STATE_KIND], authors: [PK], "#t": [READ_STATE_T], limit: 200 });
+  const evs = ownVerified(await query(filters));
+  const seen = new Set();
+  const uniq = evs.filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)));
+  return { id, ...decodeReadState(uniq, { me: PK, decrypt: signer.selfCipher.decrypt, ownD: id.d, ownClientId: id.clientId }) };
+}
+async function loadSavedList() {
+  const evs = ownVerified(await query([{ kinds: [BOOKMARK_KIND], authors: [PK], limit: 5 }]));
+  const top = evs.sort((x, y) => y.created_at - x.created_at)[0] || null;
+  return { ev: top, list: parseBookmarks(top, signer.selfCipher ? signer.selfCipher.decrypt : null) };
+}
+
 async function parityTool(name, a, { ok, fail }) {
   const guard = (verb) => (IDENTITY_OK ? null : fail(`refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not ${verb} as the wrong identity.`));
   const withAuth = (tags) => (AUTH_TAG ? [...tags, AUTH_TAG] : tags);
   const publish = async (kind, tags, content = "") => { const ev = await signer.sign({ kind, tags: withAuth(tags), content }); await bridge("/events", ev); return ev; };
+
+  // ---- v0.2.33 parity batch 2 ----
+  if (name === "buzz_mark_read") {
+    const g = guard("writing read state"); if (g) return g;
+    if (!signer.selfCipher || !signer.canSign(READ_STATE_KIND))
+      return fail(`buzz_mark_read: read state (kind ${READ_STATE_KIND}) is agent-mode only — it must be NIP-44 encrypted with your own key, and in wire / post-as-me mode your key is escrowed at Ekam (no encrypt-to-self endpoint, and kind ${READ_STATE_KIND} is blocked on Ekam wire-sign allowlist). Nothing was sent.`);
+    const all = a.all === true;
+    if (all === (a.channel != null)) return fail("buzz_mark_read: give either `channel` (one conversation) or `all: true` (every channel and DM you're in)");
+    if (all && a.event != null) return fail("buzz_mark_read: `event` goes with a single `channel`, not `all`");
+    const nowS = Math.floor(Date.now() / 1000);
+    const targets = [];   // { id, label }
+    if (all) {
+      const byId = new Map();   // DMs also appear in channels(); the DM label wins, one entry per id
+      for (const c of await channels()) byId.set(c.id, `#${escapeName(c.name)}`);
+      await profiles();
+      for (const d of await dmChannels()) byId.set(d.id, `DM ${d.others.map((p) => who(p)).join(", ") || "(self)"}`);
+      for (const [id, label] of byId) targets.push({ id, label });
+    } else {
+      let ch = null;
+      try { ch = await resolveChannel(a.channel); }
+      catch (e) {
+        if (e instanceof ChannelAmbiguousError) throw e;
+        const dm = (await dmChannels().catch(() => [])).find((d) => d.id === String(a.channel || "").trim());
+        if (!dm) throw e;
+        await profiles();
+        ch = { id: dm.id, name: null, label: `DM ${dm.others.map((p) => who(p)).join(", ")}` };
+      }
+      targets.push({ id: ch.id, label: ch.label || `#${escapeName(ch.name)}`, name: ch.name || ch.id });
+    }
+    if (!targets.length) return ok("buzz_mark_read: no channels or DMs to mark.");
+    if (targets.length > 500) return fail("buzz_mark_read: more than 500 conversations — mark them one at a time");
+    // NIP-RS: the frontier is the created_at of the newest message read (never the wall clock), capped at now.
+    const updates = {};
+    if (a.event != null) {
+      const hit = await resolveEventInChannel(targets[0].id, targets[0].name, a.event);
+      updates[targets[0].id] = Math.min(hit.created_at | 0, nowS);
+    } else {
+      const evs = await query(targets.map((t) => ({ kinds: [9], "#h": [t.id], limit: 1 }))) || [];
+      for (const e of screen(evs).events) {
+        const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+        if (!h || !targets.some((t) => t.id === h)) continue;
+        const ts = Math.min(e.created_at | 0, nowS);
+        if (!(updates[h] >= ts)) updates[h] = ts;
+      }
+    }
+    const marked = targets.filter((t) => updates[t.id] != null);
+    if (!marked.length) return ok("buzz_mark_read: nothing to mark — no messages there yet.");
+    // read-before-write on OUR OWN coordinate; a foreign client_id there = conflict → never publish over it.
+    const rs = await loadReadState({ ownOnly: true });
+    if (rs.conflict) return fail(`buzz_mark_read: refused — the read-state slot this identity derives is held by a different client_id (NIP-RS conflict). Nothing was published. Is this key running in another buzz-mcp install? (one key = one host)`);
+    const before = rs.own ? rs.own.contexts : {};
+    const next = nextReadStateBlob({ clientId: rs.id.clientId, ownContexts: before, updates, nowS, ownMaxCreatedAt: rs.ownMaxCreatedAt });
+    const changed = marked.filter((t) => !(before[t.id] >= updates[t.id]));
+    if (!changed.length) return ok(`already read: ${marked.map((t) => t.label).join(", ")} — nothing to update.`);
+    const content = signer.selfCipher.encrypt(next.plaintext);
+    const ev = await signer.sign({ kind: READ_STATE_KIND, created_at: next.created_at, tags: withAuth([["d", rs.id.d], ["t", READ_STATE_T]]), content });
+    await bridge("/events", ev);
+    return ok(`marked read (NIP-RS, encrypted to you): ${changed.map((t) => `${t.label} up to ${fmtTime(updates[t.id], true)}`).join("; ")}${changed.length < marked.length ? ` (${marked.length - changed.length} already read)` : ""}.`);
+  }
+
+  if (name === "buzz_save") {
+    const g = guard("saving items"); if (g) return g;
+    const wb = wireBlocked(BOOKMARK_KIND, name); if (wb) return fail(wb);
+    const isPrivate = a.private !== false;
+    if (isPrivate && !signer.selfCipher) return fail("buzz_save: private saved items need NIP-44 encrypt-to-self (agent mode). Nothing was sent.");
+    const ch = await resolveChannel(a.channel);
+    const hit = await resolveEventInChannel(ch.id, ch.name, a.event);
+    const { ev, list } = await loadSavedList();
+    if (list.opaque) return fail("buzz_save: refused — your saved list (NIP-51 kind 10003) has private items this shim can't decrypt (another client may use legacy NIP-04 encryption). Rewriting it would destroy them, so nothing was sent.");
+    const remove = a.remove === true;
+    const nx = applyBookmark(list, { id: hit.id, remove, isPrivate });
+    if (!nx.changed) return ok(remove ? `<${hit.id.slice(0, 8)}> wasn't in your saved items — nothing to do.` : `<${hit.id.slice(0, 8)}> is already saved.`);
+    const content = nx.privateTags.length ? signer.selfCipher.encrypt(JSON.stringify(nx.privateTags)) : "";
+    // replaceable event: strictly newer than the list we read, so a same-second update always wins
+    const created_at = Math.max(Math.floor(Date.now() / 1000), ((ev && ev.created_at) | 0) + 1);
+    const sev = await signer.sign({ kind: BOOKMARK_KIND, created_at, tags: withAuth(nx.tags.filter((t) => t[0] !== "auth")), content });
+    await bridge("/events", sev);
+    return ok(remove ? `removed <${hit.id.slice(0, 8)}> (#${escapeName(ch.name)}) from your saved items.`
+      : `saved <${hit.id.slice(0, 8)}> from #${escapeName(ch.name)}${isPrivate ? " (private — encrypted to you)" : " (PUBLIC — anyone can see this list entry)"}. See them with buzz_saved.`);
+  }
+
+  if (name === "buzz_saved") {
+    const { ev, list } = await loadSavedList();
+    const ids = [...list.priv.map((id) => ({ id, priv: true })), ...list.pub.map((id) => ({ id, priv: false }))].reverse();
+    const limit = clampLimit(a.limit, 50, 200);
+    const shown = ids.slice(0, limit);
+    const notes = [];
+    if (list.opaque) notes.push(signer.selfCipher ? "⚠ some private items can't be decrypted (legacy NIP-04?) and aren't shown" : "private items are encrypted to your key — only an agent-mode session can list them");
+    if (!ev) return ok("Saved items — 0. Save a message with buzz_save { channel, event }.");
+    let byId = new Map(), scrNote = "", flagOf;
+    if (shown.length) {
+      const scr = screen(await query([{ ids: shown.map((x) => x.id), limit: shown.length }]));
+      byId = new Map(scr.events.map((e) => [e.id, e])); scrNote = scr.note; flagOf = scr.flagOf;
+    }
+    await profiles();
+    let cs = [], dms = [];
+    try { cs = await channels(); } catch { /* labels only */ }
+    try { dms = await dmChannels(); } catch { /* labels only */ }
+    const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+    for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+    const rows = shown.map(({ id, priv }) => {
+      const e = byId.get(id);
+      if (!e) return `${priv ? "🔒" : "🌐"} <${id.slice(0, 8)}> (not visible — deleted, or in a conversation you can't read)`;
+      const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+      return `${priv ? "🔒" : "🌐"} ${h ? (labelOf.get(h) || `#${escapeName(h.slice(0, 8))}`) + " " : ""}${row(e, { withDate: true, flagOf })}`;
+    });
+    return ok(`Saved items — ${ids.length}${ids.length > shown.length ? ` (showing newest ${shown.length})` : ""} (🔒 private, 🌐 public):\n${UNTRUSTED_NOTE}${scrNote ? "\n" + scrNote : ""}${notes.length ? "\n" + notes.join("\n") : ""}\n` + (rows.join("\n") || "(none)"));
+  }
+
+  if (name === "buzz_post_diff") {
+    const g = guard("posting"); if (g) return g;
+    const wb = wireBlocked(DIFF_KIND, name); if (wb) return fail(wb);
+    let diff, meta;
+    try {
+      diff = checkDiffContent(a.diff);
+      meta = buildDiffTags({ repo: a.repo, commit: a.commit, file: a.file, parent_commit: a.parent_commit, source_branch: a.source_branch, target_branch: a.target_branch, pr: a.pr, language: a.language, description: a.description, truncated: a.truncated });
+    } catch (e) { return fail(`buzz_post_diff: ${e.message}`); }
+    const ch = await resolveChannel(a.channel);
+    const tags = [["h", ch.id], ...meta];
+    let where = `#${escapeName(ch.name)}`;
+    if (a.event != null) {
+      const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+      const rootId = threadRootOf(target);
+      if (rootId && rootId !== target.id) { tags.push(["e", rootId, "", "root"]); tags.push(["e", target.id, "", "reply"]); }
+      else tags.push(["e", target.id, "", "reply"]);
+      if (/^[0-9a-f]{64}$/.test(target.pubkey || "") && target.pubkey !== PK) tags.push(["p", target.pubkey]);
+      where += ` (thread <${rootId.slice(0, 8)}>)`;
+    }
+    const ev = await publish(DIFF_KIND, tags, diff);
+    const lines = diff.split("\n").length;
+    return ok(`posted a diff to ${where} <${String(ev.id).slice(0, 8)}>: ${escapeContent(a.repo, { cap: 200 })} @ ${escapeName(String(a.commit).slice(0, 12))}${a.file ? ` — ${escapeName(a.file)}` : ""} (${lines} line(s), ${Buffer.byteLength(diff, "utf8")} B).`);
+  }
 
   if (name === "buzz_edit_message") {
     const g = guard("editing"); if (g) return g;
@@ -1288,7 +1453,8 @@ const CH = { type: "string", description: "channel name or id" };
 const EV = { type: "string", description: "the target message's <id> (from buzz_read)" };
 const TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+  { name: "buzz_setname", description: "DEPRECATED alias of buzz_profile_set { name } — override this session's friendly display name on the fleet. Agent mode only.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+  { name: "buzz_profile_set", description: "Set your own profile (kind 0): any of `name` (display name, ≤64 chars), `about` (≤500 chars), `picture` (an https:// image URL; empty string clears it). PATCH-style: other profile fields are kept. Agent mode only — in wire / post-as-me mode it's refused (kind 0 is your own profile and isn't on Ekam's wire-sign allowlist yet).", inputSchema: { type: "object", properties: { name: { type: "string", description: "display name (≤64 chars, no control/bidi/invisible characters)" }, about: { type: "string", description: "bio (≤500 chars; newlines ok)" }, picture: { type: "string", description: "https:// avatar URL (empty string clears)" } } } },
   { name: "buzz_channels", description: "List channels. Default `scope: \"member\"` = the channels you're in. `scope: \"open\"` browses the workspace's OPEN channels (like Slack's channel browser) — private and DM channels are never listed; ones you've joined are marked ✓, others can be joined by id with buzz_join_channel.", inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["member", "open"], description: "\"member\" (default) or \"open\"" } } } },
   { name: "buzz_create_channel", description: "Create a new channel (NIP-29 kind 9007), as you — you become its owner. `name` is required. `visibility`: \"private\" (invite-only; the DEFAULT — fail-closed) or \"open\" (searchable, anyone self-joins). `type`: \"stream\" (default) or \"forum\". Optional `description`, and `ttl` (seconds — an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.", inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; ≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"private\" (default) or \"open\"" }, type: { type: "string", description: "\"stream\" (default) or \"forum\"" }, description: { type: "string", description: "optional channel description/about (≤500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
   { name: "buzz_edit_channel", description: "Edit a channel's metadata (NIP-29 kind 9002), as you — owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` (\"open\"/\"private\"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.", inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (≤80 chars, no control characters)" }, visibility: { type: "string", description: "\"open\" or \"private\"" }, description: { type: "string", description: "new about/description (empty string clears it; ≤500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
@@ -1331,6 +1497,11 @@ const TOOLS = [
   { name: "buzz_files", description: "List the files shared in a channel (or DM): filename, type, size, who shared it, when, and the message <id> + `index` to pass to buzz_attachment_read. Read-only; nothing is downloaded. `limit` = messages scanned (default 200, max 500).", inputSchema: { type: "object", properties: { channel: CH, limit: { type: "number", description: "messages to scan (default 200, max 500)" } }, required: ["channel"] } },
   { name: "buzz_presence", description: "Who's online: presence for one or more people (`users`: npub / hex / email in wire mode / exact display name), or for a channel's members (`channel`). Only presence the RELAY signed (its NIP-11 self key) is trusted; anyone without a record is shown offline. Read-only.", inputSchema: { type: "object", properties: { users: { type: "array", items: { type: "string" }, maxItems: 50, description: "people to look up" }, channel: CH } } },
   { name: "buzz_emoji", description: "List the workspace's custom emoji (the union of every member's NIP-30 kind:30030 set): :shortcode: and image URL. Optional `query` filters by shortcode substring. Read-only; the URLs are listed as text and never fetched.", inputSchema: { type: "object", properties: { query: { type: "string", description: "only shortcodes containing this" } } } },
+  // ---- v0.2.33 Slack-parity batch 2 ----
+  { name: "buzz_mark_read", description: "Mark a channel or DM read (like Slack's mark-as-read) — NIP-RS read state (kind 30078), NIP-44 encrypted to you so the relay can't read it, synced with other Buzz clients. `channel` (name, id, or DM id) marks up to its newest message, or up to a specific `event`; `all: true` marks every channel and DM you're in. Only moves forward (never marks unread). Agent mode only — refused in wire / post-as-me mode.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name / id, or a DM's channel id" }, event: { type: "string", description: "mark read up to this message <id> (default: the newest)" }, all: { type: "boolean", description: "mark every channel and DM you're in" } } } },
+  { name: "buzz_save", description: "Save a message for later (like Slack's Saved items) — your NIP-51 bookmark list (kind 10003). Private by default (NIP-44 encrypted to you); `private: false` makes the entry public. `remove: true` unsaves it. Agent mode only for now (kind 10003 isn't on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, event: EV, remove: { type: "boolean", description: "unsave instead of save" }, private: { type: "boolean", description: "default true (encrypted); false = public entry" } }, required: ["channel", "event"] } },
+  { name: "buzz_saved", description: "List your saved messages (NIP-51 kind 10003), newest first, with where each one is. Private entries are only readable in agent mode. Read-only; message text is untrusted.", inputSchema: { type: "object", properties: { limit: { type: "number", description: "max items (default 50, max 200)" } } } },
+  { name: "buzz_post_diff", description: "Post a code diff to a channel as a rich diff message (kind 40008) that Buzz clients render with syntax highlighting. `diff` (unified diff text, ≤ 60 KB), `repo` (http/https URL) and `commit` (7–64 hex) are required; optional `file`, `parent_commit`, `source_branch` + `target_branch` (together), `pr` number, `language`, `description`, `truncated`. `event` posts it as a thread reply. Agent mode only for now (kind 40008 isn't on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, diff: { type: "string", description: "unified diff text (≤ 60 KB)" }, repo: { type: "string", description: "repository URL (http/https)" }, commit: { type: "string", description: "commit SHA (7–64 hex)" }, file: { type: "string", description: "file path within the repo" }, parent_commit: { type: "string" }, source_branch: { type: "string" }, target_branch: { type: "string" }, pr: { type: "integer", description: "pull request number" }, language: { type: "string", description: "language id for highlighting (e.g. rust)" }, description: { type: "string", description: "one-line description (≤500 chars)" }, truncated: { type: "boolean", description: "set true if you cut the diff down to fit" }, event: { type: "string", description: "post as a reply in this message's thread" } }, required: ["channel", "diff", "repo", "commit"] } },
   { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 41012) — agent key only.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } },
 ];
 
@@ -1339,9 +1510,9 @@ const TOOLS = [
 // repeating it has no further effect; openWorld = talks to the Buzz relay (all do, except whoami's
 // local identity lines, which still fetch relay info).
 const ANNOTATIONS = {
-  readOnly: ["buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
+  readOnly: ["buzz_saved", "buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
   destructive: ["buzz_remove_member", "buzz_delete", "buzz_edit_channel", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_unreact", "buzz_edit_message", "buzz_status_clear", "buzz_dm_hide"],
-  idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel"],
+  idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel", "buzz_profile_set", "buzz_mark_read", "buzz_save"],
 };
 const ARG_BOUNDS = {
   limit: { minimum: 1, maximum: 200 }, hours: { minimum: 0, maximum: 720 }, timeout_s: { minimum: 0, maximum: 30 },
@@ -1351,6 +1522,9 @@ const ARG_BOUNDS = {
   event: { maxLength: 128 }, user: { maxLength: 320 }, client_id: { maxLength: 256 }, role: { maxLength: 16 },
   visibility: { maxLength: 16 }, type: { maxLength: 16 }, name: { maxLength: 400 }, description: { maxLength: 2000 },
   topic: { maxLength: 2000 }, purpose: { maxLength: 2000 },
+  about: { maxLength: 2000 }, picture: { maxLength: 2048 }, diff: { maxLength: 65536 }, repo: { maxLength: 2048 }, commit: { maxLength: 64 },
+  parent_commit: { maxLength: 64 }, file: { maxLength: 512 }, source_branch: { maxLength: 255 }, target_branch: { maxLength: 255 }, language: { maxLength: 64 },
+  pr: { minimum: 1, maximum: 4294967295 },
   from: { maxLength: 320 }, after: { maxLength: 40 }, before: { maxLength: 40 }, link: { maxLength: 512 }, scope: { maxLength: 16 }, in: { maxLength: 16 },
 };
 // v0.2.32: every WRITE tool takes dry_run (preview the exact event, sign/send nothing). Not buzz_login
@@ -1470,11 +1644,23 @@ async function callTool(req) {
       return ok(`Buzz CLI identity:\n  name: ${MY_NAME}\n  shim: @ola/buzz-mcp v${SHIM_VERSION}${skewNote}\n  model: ${AGENT_MODEL}\n  harness: ${AGENT_HARNESS}\n  interface: ${AGENT_INTERFACE}\n  npub: ${nip19.npubEncode(PK)}\n  pubkey: ${PK}\n  identity: ${keyProvenance()}\n  config: ${configLine}\n  relay (dial): ${RELAY}\n  relay (self-report): ${relayLine}\n  auth_tag: ${AUTH_TAG ? "present (ViaOwner delegation)" : (AUTH_TAG_MALFORMED ? "⚠ set but MALFORMED (quote-stripped? single-quote it in agent.env) — omitted → 403 membership" : "none")}\n  transport: ${TRANSPORT_WEDGED ? "⚠ undici pool wedged — self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}\n  NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) — compare it before claiming "X is deployed". reachable ≠ up-to-date.`);
     }
 
-    if (name === "buzz_setname") {
+    // v0.2.33: buzz_profile_set (kind 0: name / about / picture). buzz_setname is kept as a DEPRECATED
+    // alias for { name }. Wire mode: kind 0 is not on Ekam's wire-sign allowlist (and it is the USER's
+    // own profile) — refused until Ekam allows kind 0; nothing is ever signed some other way.
+    if (name === "buzz_setname" || name === "buzz_profile_set") {
+      const alias = name === "buzz_setname";
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — key ${PK.slice(0, 16)}… ≠ pinned ${EXPECTED_PK.slice(0, 16)}… (running as ${MY_NAME}). Not writing a profile as the wrong agent.` }], isError: true };
-      if (signer.mode === "wire") return { content: [{ type: "text", text: `refused: wire mode posts as the user — the display name is the user's own profile (kind:0), not settable from the shim.` }], isError: true };
-      await publishProfile(a.name);
-      return ok(`renamed this session to "${a.name}" on the fleet.`);
+      if (signer.mode === "wire" || !signer.canSign(0)) return { content: [{ type: "text", text: `refused: ${name}: wire mode posts as the user — your profile (kind 0) is your own and kind 0 is blocked on Ekam wire-sign allowlist, so it can't be set from the shim yet (pending Ekam allowing kind 0). Nothing was sent.` }], isError: true };
+      const v = validateProfilePatch(alias ? { name: a.name } : { name: a.name, about: a.about, picture: a.picture });
+      if (v.error) return fail(`${name}: ${v.error}`);
+      const existing = await ownProfile();
+      await publishProfile(v.patch.name || MY_NAME, v.patch, existing);
+      const parts = [];
+      if (v.patch.name != null) parts.push(`name "${escapeName(v.patch.name)}"`);
+      if (v.patch.about != null) parts.push(`about (${[...v.patch.about].length} chars)`);
+      if (v.patch.picture != null) parts.push(v.patch.picture ? `picture ${escapeContent(v.patch.picture, { cap: 200 })}` : "picture cleared");
+      return ok(alias ? `renamed this session to "${escapeName(v.patch.name)}" on the fleet. (buzz_setname is deprecated — use buzz_profile_set { name }.)`
+        : `profile updated: ${parts.join(", ")}. Other profile fields were kept.`);
     }
 
     if (name === "buzz_channels") {
@@ -2064,11 +2250,14 @@ async function callTool(req) {
     // ---- Live user status (NIP-38 kind 30315) — v0.2.13. AGENT MODE ONLY: 30315 is NOT in the
     // wire-sign allowlist (Ekam doesn't sign it for post-as-me yet), so canSign(30315) fail-closes
     // in wire mode. We deliberately do NOT add 30315 to WIRE_ALLOWLIST. ----
+    // TODO(v0.2.3x, Ekam): when Ekam adds kind 30315 to its wire-sign allowlist, add it to WIRE_ALLOWLIST
+    // in signer.mjs (with an Ekam-side test) and these tools work in wire mode unchanged. Until then the
+    // refusal below is the designed behavior (v0.2.33 parity batch 2 re-confirmed; tested in v033.test.mjs).
     const STATUS_KIND = 30315;
     if (name === "buzz_status_set") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not setting a status as the wrong identity.` }], isError: true };
       if (!signer.canSign(STATUS_KIND))
-        return { content: [{ type: "text", text: "buzz_status_set: status (kind 30315) isn't in the wire-sign allowlist — agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+        return { content: [{ type: "text", text: "buzz_status_set: status (kind 30315) is blocked on Ekam wire-sign allowlist — agent-mode only until Ekam signs it for post-as-me. Nothing was sent." }], isError: true };
       const text = typeof a.text === "string" ? a.text : "";
       const tags = [["d", "general"]];   // NIP-38 general status
       const emoji = a.emoji && String(a.emoji).trim();
@@ -2082,7 +2271,7 @@ async function callTool(req) {
     if (name === "buzz_status_clear") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard — this session's key ${PK.slice(0, 16)}… ≠ pinned identity ${(EXPECTED_PK || "").slice(0, 16)}…. Not clearing a status as the wrong identity.` }], isError: true };
       if (!signer.canSign(STATUS_KIND))
-        return { content: [{ type: "text", text: "buzz_status_clear: status (kind 30315) isn't in the wire-sign allowlist — agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+        return { content: [{ type: "text", text: "buzz_status_clear: status (kind 30315) is blocked on Ekam wire-sign allowlist — agent-mode only until Ekam signs it for post-as-me. Nothing was sent." }], isError: true };
       const tags = [["d", "general"]];
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: STATUS_KIND, tags, content: "" });
@@ -2090,11 +2279,48 @@ async function callTool(req) {
       return ok("status cleared.");
     }
 
-    // ---- Read-only unread digest (v0.2.13). A HEURISTIC, not NIP-RS real read-state: it counts
-    // recent kind:9 from OTHERS per channel/DM and how many @mention this session's PK. No writes. ----
+    // ---- Unread. v0.2.33: REAL counts from NIP-RS read state (kind 30078, NIP-44 to self) in agent
+    // mode — messages from others after your read frontier (channel / thread / msg hierarchy). A
+    // conversation with no read marker is counted within the `hours` window and labelled as such.
+    // Wire mode (no key to decrypt your read state) and any read-state failure fall back to the
+    // v0.2.13 HEURISTIC (recent kind:9 from others in the window), clearly labelled. No writes. ----
+    let rsFallbackNote = null;
+    if (name === "buzz_unread" && signer.selfCipher) {
+      const hours = (Number.isFinite(a.hours) && a.hours > 0) ? Math.min(a.hours, 720) : 24;
+      const nowS = Math.floor(Date.now() / 1000);
+      const fallbackSince = nowS - Math.floor(hours * 3600);
+      let rs = null, rsErr = null;
+      try { rs = await loadReadState(); } catch (e) { rsErr = e; }
+      if (rs) {
+        const cs = await channels();
+        const dms = await dmChannels();
+        await profiles();
+        const meta = new Map();
+        for (const c of cs) meta.set(c.id, `#${escapeName(c.name)}`);
+        for (const d of dms) meta.set(d.id, `DM ${d.others.map((p) => who(p)).join(", ") || "(self)"}`);
+        const ids = [...meta.keys()];
+        if (!ids.length) return ok("no channels or DMs to scan.");
+        const fr = frontiers(rs.merged);
+        const floor = nowS - 30 * 86400;   // never scan more than 30 days back
+        const marks = ids.map((id) => fr[id]).filter((v) => v != null);
+        const since = Math.max(floor, Math.min(fallbackSince, ...marks.map((m) => m + 1)));
+        const evs = screen(await query([{ kinds: [9], "#h": ids, since, limit: 2000 }])).events;
+        const stat = unreadCounts(evs, fr, { me: PK, channelIds: ids, fallbackSince });
+        const active = [...stat.entries()].filter(([, s]) => s.unread > 0).sort((x, y) => y[1].unread - x[1].unread);
+        const marked = ids.filter((id) => fr[id] != null).length;
+        const head = `Unread (NIP-RS read state: ${rs.used} blob(s), ${marked} of ${ids.length} conversation(s) have a read marker${rs.skipped ? `; ${rs.skipped} unreadable blob(s) ignored` : ""})`;
+        const capNote = evs.length >= 2000 ? "\n(scan capped at 2000 messages — counts may be low)" : "";
+        if (!active.length) return ok(`${head}: nothing unread.${capNote}`);
+        const lines = active.map(([id, s]) => `  ${meta.get(id)}  —  ${s.unread} unread${s.mentions ? `  (${s.mentions} @you)` : ""}${s.noMarker ? `  (no read marker — last ${hours}h)` : ""}`);
+        const tot = active.reduce((n, [, s]) => n + s.unread, 0), totM = active.reduce((n, [, s]) => n + s.mentions, 0);
+        return ok(`${head}:\n${lines.join("\n")}\nTotals: ${tot} unread, ${totM} @mention(s) of you. Mark read with buzz_mark_read.${capNote}`);
+      }
+      rsFallbackNote = `read state unavailable (${escapeContent(rsErr && rsErr.message, { cap: 120 })}) — heuristic shown`;
+    }
     if (name === "buzz_unread") {
       const hours = (Number.isFinite(a.hours) && a.hours > 0) ? Math.min(a.hours, 720) : 24;
       const since = Math.floor(Date.now() / 1000) - Math.floor(hours * 3600);
+      const rsNote = rsFallbackNote ? `\n(${rsFallbackNote})` : (signer.selfCipher ? "" : "\n(heuristic: real read state needs agent mode — wire mode can't decrypt your NIP-44 read state)");
       const cs = await channels();
       const dms = await dmChannels();
       const names = await profiles();
@@ -2117,11 +2343,11 @@ async function callTool(req) {
         stat.set(id, s);
       }
       const active = [...stat.entries()].sort((x, y) => y[1].msgs - x[1].msgs);
-      if (!active.length) return ok(`Unread digest (last ${hours}h): no new messages across ${ids.length} channel(s)/DM(s).`);
+      if (!active.length) return ok(`Unread digest (last ${hours}h): no new messages across ${ids.length} channel(s)/DM(s).${rsNote}`);
       const totMsgs = active.reduce((n, [, s]) => n + s.msgs, 0);
       const totMentions = active.reduce((n, [, s]) => n + s.mentions, 0);
       const lines = active.map(([id, s]) => `  ${meta.get(id)}  —  ${s.msgs} new${s.mentions ? `  (${s.mentions} @you)` : ""}`);
-      return ok(`Unread digest (last ${hours}h) — ${active.length} active of ${ids.length}:\n${lines.join("\n")}\nTotals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
+      return ok(`Unread digest (last ${hours}h) — ${active.length} active of ${ids.length}:\n${lines.join("\n")}\nTotals: ${totMsgs} new, ${totMentions} @mention(s) of you.${rsNote}`);
     }
 
     // ---- buzz_login (v0.2.15): terminal-free "post as me" wire-sign OAuth, in-process. -----

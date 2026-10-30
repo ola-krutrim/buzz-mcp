@@ -4770,11 +4770,11 @@ var require_core = __commonJS({
     Ajv2.ValidationError = validation_error_1.default;
     Ajv2.MissingRefError = ref_error_1.default;
     exports.default = Ajv2;
-    function checkOptions(checkOpts, options, msg, log = "error") {
-      for (const key in checkOpts) {
+    function checkOptions(checkOpts2, options, msg, log = "error") {
+      for (const key in checkOpts2) {
         const opt = key;
         if (opt in options)
-          this.logger[log](`${msg}: option ${key}. ${checkOpts[opt]}`);
+          this.logger[log](`${msg}: option ${key}. ${checkOpts2[opt]}`);
       }
     }
     function getSchEnv(keyRef) {
@@ -17061,6 +17061,12 @@ function abytes(value, length, title = "") {
   }
   return value;
 }
+function ahash(h) {
+  if (typeof h !== "function" || typeof h.create !== "function")
+    throw new Error("Hash must wrapped by utils.createHasher");
+  anumber(h.outputLen);
+  anumber(h.blockLen);
+}
 function aexists(instance, checkFinished = true) {
   if (instance.destroyed)
     throw new Error("Hash instance has been destroyed");
@@ -17139,10 +17145,10 @@ function concatBytes(...arrays) {
     sum += a.length;
   }
   const res = new Uint8Array(sum);
-  for (let i2 = 0, pad = 0; i2 < arrays.length; i2++) {
+  for (let i2 = 0, pad2 = 0; i2 < arrays.length; i2++) {
     const a = arrays[i2];
-    res.set(a, pad);
-    pad += a.length;
+    res.set(a, pad2);
+    pad2 += a.length;
   }
   return res;
 }
@@ -17546,11 +17552,11 @@ var HashMD = class {
   length = 0;
   pos = 0;
   destroyed = false;
-  constructor(blockLen, outputLen, padOffset, isLE) {
+  constructor(blockLen, outputLen, padOffset, isLE2) {
     this.blockLen = blockLen;
     this.outputLen = outputLen;
     this.padOffset = padOffset;
-    this.isLE = isLE;
+    this.isLE = isLE2;
     this.buffer = new Uint8Array(blockLen);
     this.view = createView(this.buffer);
   }
@@ -17583,7 +17589,7 @@ var HashMD = class {
     aexists(this);
     aoutput(out, this);
     this.finished = true;
-    const { buffer, view, blockLen, isLE } = this;
+    const { buffer, view, blockLen, isLE: isLE2 } = this;
     let { pos } = this;
     buffer[pos++] = 128;
     clean(this.buffer.subarray(pos));
@@ -17593,7 +17599,7 @@ var HashMD = class {
     }
     for (let i2 = pos; i2 < blockLen; i2++)
       buffer[i2] = 0;
-    view.setBigUint64(blockLen - 8, BigInt(this.length * 8), isLE);
+    view.setBigUint64(blockLen - 8, BigInt(this.length * 8), isLE2);
     this.process(view, 0);
     const oview = createView(out);
     const len = this.outputLen;
@@ -17604,7 +17610,7 @@ var HashMD = class {
     if (outLen > state.length)
       throw new Error("_sha2: outputLen bigger than state");
     for (let i2 = 0; i2 < outLen; i2++)
-      oview.setUint32(4 * i2, state[i2], isLE);
+      oview.setUint32(4 * i2, state[i2], isLE2);
   }
   digest() {
     const { buffer, outputLen } = this;
@@ -17808,6 +17814,10 @@ function abignumber(n) {
     anumber(n);
   return n;
 }
+function numberToHexUnpadded(num2) {
+  const hex = abignumber(num2).toString(16);
+  return hex.length & 1 ? "0" + hex : hex;
+}
 function hexToNumber(hex) {
   if (typeof hex !== "string")
     throw new Error("hex string expected, got " + typeof hex);
@@ -17843,6 +17853,13 @@ function asciiToBytes(ascii) {
   });
 }
 var isPosBig = (n) => typeof n === "bigint" && _0n <= n;
+function inRange(n, min, max) {
+  return isPosBig(n) && isPosBig(min) && isPosBig(max) && min <= n && n < max;
+}
+function aInRange(title, n, min, max) {
+  if (!inRange(n, min, max))
+    throw new Error("expected valid " + title + ": " + min + " <= n < " + max + ", got " + n);
+}
 function bitLen(n) {
   let len;
   for (len = 0; n > _0n; n >>= _1n, len += 1)
@@ -17850,6 +17867,57 @@ function bitLen(n) {
   return len;
 }
 var bitMask = (n) => (_1n << BigInt(n)) - _1n;
+function createHmacDrbg(hashLen, qByteLen, hmacFn) {
+  anumber(hashLen, "hashLen");
+  anumber(qByteLen, "qByteLen");
+  if (typeof hmacFn !== "function")
+    throw new Error("hmacFn must be a function");
+  const u8n = (len) => new Uint8Array(len);
+  const NULL = Uint8Array.of();
+  const byte0 = Uint8Array.of(0);
+  const byte1 = Uint8Array.of(1);
+  const _maxDrbgIters = 1e3;
+  let v = u8n(hashLen);
+  let k = u8n(hashLen);
+  let i2 = 0;
+  const reset = () => {
+    v.fill(1);
+    k.fill(0);
+    i2 = 0;
+  };
+  const h = (...msgs) => hmacFn(k, concatBytes(v, ...msgs));
+  const reseed = (seed = NULL) => {
+    k = h(byte0, seed);
+    v = h();
+    if (seed.length === 0)
+      return;
+    k = h(byte1, seed);
+    v = h();
+  };
+  const gen = () => {
+    if (i2++ >= _maxDrbgIters)
+      throw new Error("drbg: tried max amount of iterations");
+    let len = 0;
+    const out = [];
+    while (len < qByteLen) {
+      v = h();
+      const sl = v.slice();
+      out.push(sl);
+      len += v.length;
+    }
+    return concatBytes(...out);
+  };
+  const genUntil = (seed, pred) => {
+    reset();
+    reseed(seed);
+    let res = void 0;
+    while (!(res = pred(gen())))
+      reseed();
+    reset();
+    return res;
+  };
+  return genUntil;
+}
 function validateObject(object3, fields = {}, optFields = {}) {
   if (!object3 || typeof object3 !== "object")
     throw new Error("expected valid options object");
@@ -18208,18 +18276,18 @@ var _Field = class {
   }
   fromBytes(bytes, skipValidation = false) {
     abytes(bytes);
-    const { _lengths: allowedLengths, BYTES, isLE, ORDER, _mod: modFromBytes } = this;
+    const { _lengths: allowedLengths, BYTES, isLE: isLE2, ORDER, _mod: modFromBytes } = this;
     if (allowedLengths) {
       if (!allowedLengths.includes(bytes.length) || bytes.length > BYTES) {
         throw new Error("Field.fromBytes: expected " + allowedLengths + " bytes, got " + bytes.length);
       }
       const padded = new Uint8Array(BYTES);
-      padded.set(bytes, isLE ? 0 : padded.length - bytes.length);
+      padded.set(bytes, isLE2 ? 0 : padded.length - bytes.length);
       bytes = padded;
     }
     if (bytes.length !== BYTES)
       throw new Error("Field.fromBytes: expected " + BYTES + " bytes, got " + bytes.length);
-    let scalar = isLE ? bytesToNumberLE(bytes) : bytesToNumberBE(bytes);
+    let scalar = isLE2 ? bytesToNumberLE(bytes) : bytesToNumberBE(bytes);
     if (modFromBytes)
       scalar = mod(scalar, ORDER);
     if (!skipValidation) {
@@ -18251,16 +18319,16 @@ function getMinHashLength(fieldOrder) {
   const length = getFieldBytesLength(fieldOrder);
   return length + Math.ceil(length / 2);
 }
-function mapHashToField(key, fieldOrder, isLE = false) {
+function mapHashToField(key, fieldOrder, isLE2 = false) {
   abytes(key);
   const len = key.length;
   const fieldLen = getFieldBytesLength(fieldOrder);
   const minLen = getMinHashLength(fieldOrder);
   if (len < 16 || len < minLen || len > 1024)
     throw new Error("expected " + minLen + "-1024 bytes of input, got " + len);
-  const num2 = isLE ? bytesToNumberLE(key) : bytesToNumberBE(key);
+  const num2 = isLE2 ? bytesToNumberLE(key) : bytesToNumberBE(key);
   const reduced = mod(num2, fieldOrder - _1n2) + _1n2;
-  return isLE ? numberToBytesLE(reduced, fieldLen) : numberToBytesBE(reduced, fieldLen);
+  return isLE2 ? numberToBytesLE(reduced, fieldLen) : numberToBytesBE(reduced, fieldLen);
 }
 
 // node_modules/@noble/curves/abstract/curve.js
@@ -18458,14 +18526,14 @@ function mulEndoUnsafe(Point, point, k1, k2) {
   }
   return { p1, p2 };
 }
-function createField(order, field, isLE) {
+function createField(order, field, isLE2) {
   if (field) {
     if (field.ORDER !== order)
       throw new Error("Field.ORDER must match order: Fp == p, Fn == n");
     validateField(field);
     return field;
   } else {
-    return Field(order, { isLE });
+    return Field(order, { isLE: isLE2 });
   }
 }
 function createCurveFields(type, CURVE, curveOpts = {}, FpFnLE) {
@@ -18496,6 +18564,77 @@ function createKeygen(randomSecretKey, getPublicKey2) {
   };
 }
 
+// node_modules/@noble/hashes/hmac.js
+var _HMAC = class {
+  oHash;
+  iHash;
+  blockLen;
+  outputLen;
+  finished = false;
+  destroyed = false;
+  constructor(hash, key) {
+    ahash(hash);
+    abytes(key, void 0, "key");
+    this.iHash = hash.create();
+    if (typeof this.iHash.update !== "function")
+      throw new Error("Expected instance of class which extends utils.Hash");
+    this.blockLen = this.iHash.blockLen;
+    this.outputLen = this.iHash.outputLen;
+    const blockLen = this.blockLen;
+    const pad2 = new Uint8Array(blockLen);
+    pad2.set(key.length > blockLen ? hash.create().update(key).digest() : key);
+    for (let i2 = 0; i2 < pad2.length; i2++)
+      pad2[i2] ^= 54;
+    this.iHash.update(pad2);
+    this.oHash = hash.create();
+    for (let i2 = 0; i2 < pad2.length; i2++)
+      pad2[i2] ^= 54 ^ 92;
+    this.oHash.update(pad2);
+    clean(pad2);
+  }
+  update(buf) {
+    aexists(this);
+    this.iHash.update(buf);
+    return this;
+  }
+  digestInto(out) {
+    aexists(this);
+    abytes(out, this.outputLen, "output");
+    this.finished = true;
+    this.iHash.digestInto(out);
+    this.oHash.update(out);
+    this.oHash.digestInto(out);
+    this.destroy();
+  }
+  digest() {
+    const out = new Uint8Array(this.oHash.outputLen);
+    this.digestInto(out);
+    return out;
+  }
+  _cloneInto(to) {
+    to ||= Object.create(Object.getPrototypeOf(this), {});
+    const { oHash, iHash, finished, destroyed, blockLen, outputLen } = this;
+    to = to;
+    to.finished = finished;
+    to.destroyed = destroyed;
+    to.blockLen = blockLen;
+    to.outputLen = outputLen;
+    to.oHash = oHash._cloneInto(to.oHash);
+    to.iHash = iHash._cloneInto(to.iHash);
+    return to;
+  }
+  clone() {
+    return this._cloneInto();
+  }
+  destroy() {
+    this.destroyed = true;
+    this.oHash.destroy();
+    this.iHash.destroy();
+  }
+};
+var hmac = (hash, key, message) => new _HMAC(hash, key).update(message).digest();
+hmac.create = (hash, key) => new _HMAC(hash, key);
+
 // node_modules/@noble/curves/abstract/weierstrass.js
 var divNearest = (num2, den) => (num2 + (num2 >= 0 ? den : -den) / _2n2) / den;
 function _splitEndoScalar(k, basis, n) {
@@ -18516,6 +18655,127 @@ function _splitEndoScalar(k, basis, n) {
   }
   return { k1neg, k1, k2neg, k2 };
 }
+function validateSigFormat(format) {
+  if (!["compact", "recovered", "der"].includes(format))
+    throw new Error('Signature format must be "compact", "recovered", or "der"');
+  return format;
+}
+function validateSigOpts(opts, def) {
+  const optsn = {};
+  for (let optName of Object.keys(def)) {
+    optsn[optName] = opts[optName] === void 0 ? def[optName] : opts[optName];
+  }
+  abool(optsn.lowS, "lowS");
+  abool(optsn.prehash, "prehash");
+  if (optsn.format !== void 0)
+    validateSigFormat(optsn.format);
+  return optsn;
+}
+var DERErr = class extends Error {
+  constructor(m = "") {
+    super(m);
+  }
+};
+var DER = {
+  // asn.1 DER encoding utils
+  Err: DERErr,
+  // Basic building block is TLV (Tag-Length-Value)
+  _tlv: {
+    encode: (tag, data) => {
+      const { Err: E } = DER;
+      if (tag < 0 || tag > 256)
+        throw new E("tlv.encode: wrong tag");
+      if (data.length & 1)
+        throw new E("tlv.encode: unpadded data");
+      const dataLen = data.length / 2;
+      const len = numberToHexUnpadded(dataLen);
+      if (len.length / 2 & 128)
+        throw new E("tlv.encode: long form length too big");
+      const lenLen = dataLen > 127 ? numberToHexUnpadded(len.length / 2 | 128) : "";
+      const t = numberToHexUnpadded(tag);
+      return t + lenLen + len + data;
+    },
+    // v - value, l - left bytes (unparsed)
+    decode(tag, data) {
+      const { Err: E } = DER;
+      let pos = 0;
+      if (tag < 0 || tag > 256)
+        throw new E("tlv.encode: wrong tag");
+      if (data.length < 2 || data[pos++] !== tag)
+        throw new E("tlv.decode: wrong tlv");
+      const first = data[pos++];
+      const isLong = !!(first & 128);
+      let length = 0;
+      if (!isLong)
+        length = first;
+      else {
+        const lenLen = first & 127;
+        if (!lenLen)
+          throw new E("tlv.decode(long): indefinite length not supported");
+        if (lenLen > 4)
+          throw new E("tlv.decode(long): byte length is too big");
+        const lengthBytes = data.subarray(pos, pos + lenLen);
+        if (lengthBytes.length !== lenLen)
+          throw new E("tlv.decode: length bytes not complete");
+        if (lengthBytes[0] === 0)
+          throw new E("tlv.decode(long): zero leftmost byte");
+        for (const b of lengthBytes)
+          length = length << 8 | b;
+        pos += lenLen;
+        if (length < 128)
+          throw new E("tlv.decode(long): not minimal encoding");
+      }
+      const v = data.subarray(pos, pos + length);
+      if (v.length !== length)
+        throw new E("tlv.decode: wrong value length");
+      return { v, l: data.subarray(pos + length) };
+    }
+  },
+  // https://crypto.stackexchange.com/a/57734 Leftmost bit of first byte is 'negative' flag,
+  // since we always use positive integers here. It must always be empty:
+  // - add zero byte if exists
+  // - if next byte doesn't have a flag, leading zero is not allowed (minimal encoding)
+  _int: {
+    encode(num2) {
+      const { Err: E } = DER;
+      if (num2 < _0n4)
+        throw new E("integer: negative integers are not allowed");
+      let hex = numberToHexUnpadded(num2);
+      if (Number.parseInt(hex[0], 16) & 8)
+        hex = "00" + hex;
+      if (hex.length & 1)
+        throw new E("unexpected DER parsing assertion: unpadded hex");
+      return hex;
+    },
+    decode(data) {
+      const { Err: E } = DER;
+      if (data[0] & 128)
+        throw new E("invalid signature integer: negative");
+      if (data[0] === 0 && !(data[1] & 128))
+        throw new E("invalid signature integer: unnecessary leading zero");
+      return bytesToNumberBE(data);
+    }
+  },
+  toSig(bytes) {
+    const { Err: E, _int: int2, _tlv: tlv } = DER;
+    const data = abytes(bytes, void 0, "signature");
+    const { v: seqBytes, l: seqLeftBytes } = tlv.decode(48, data);
+    if (seqLeftBytes.length)
+      throw new E("invalid signature: left bytes after parsing");
+    const { v: rBytes, l: rLeftBytes } = tlv.decode(2, seqBytes);
+    const { v: sBytes, l: sLeftBytes } = tlv.decode(2, rLeftBytes);
+    if (sLeftBytes.length)
+      throw new E("invalid signature: left bytes after parsing");
+    return { r: int2.decode(rBytes), s: int2.decode(sBytes) };
+  },
+  hexFromSig(sig) {
+    const { _tlv: tlv, _int: int2 } = DER;
+    const rs = tlv.encode(2, int2.encode(sig.r));
+    const ss = tlv.encode(2, int2.encode(sig.s));
+    const seq = rs + ss;
+    return tlv.encode(48, seq);
+  }
+};
 var _0n4 = BigInt(0);
 var _1n4 = BigInt(1);
 var _2n2 = BigInt(2);
@@ -18957,6 +19217,295 @@ function getWLengths(Fp, Fn) {
     signature: 2 * Fn.BYTES
   };
 }
+function ecdh(Point, ecdhOpts = {}) {
+  const { Fn } = Point;
+  const randomBytes_ = ecdhOpts.randomBytes || randomBytes;
+  const lengths = Object.assign(getWLengths(Point.Fp, Fn), { seed: getMinHashLength(Fn.ORDER) });
+  function isValidSecretKey(secretKey) {
+    try {
+      const num2 = Fn.fromBytes(secretKey);
+      return Fn.isValidNot0(num2);
+    } catch (error2) {
+      return false;
+    }
+  }
+  function isValidPublicKey(publicKey, isCompressed) {
+    const { publicKey: comp, publicKeyUncompressed } = lengths;
+    try {
+      const l = publicKey.length;
+      if (isCompressed === true && l !== comp)
+        return false;
+      if (isCompressed === false && l !== publicKeyUncompressed)
+        return false;
+      return !!Point.fromBytes(publicKey);
+    } catch (error2) {
+      return false;
+    }
+  }
+  function randomSecretKey(seed = randomBytes_(lengths.seed)) {
+    return mapHashToField(abytes(seed, lengths.seed, "seed"), Fn.ORDER);
+  }
+  function getPublicKey2(secretKey, isCompressed = true) {
+    return Point.BASE.multiply(Fn.fromBytes(secretKey)).toBytes(isCompressed);
+  }
+  function isProbPub(item) {
+    const { secretKey, publicKey, publicKeyUncompressed } = lengths;
+    if (!isBytes(item))
+      return void 0;
+    if ("_lengths" in Fn && Fn._lengths || secretKey === publicKey)
+      return void 0;
+    const l = abytes(item, void 0, "key").length;
+    return l === publicKey || l === publicKeyUncompressed;
+  }
+  function getSharedSecret(secretKeyA, publicKeyB, isCompressed = true) {
+    if (isProbPub(secretKeyA) === true)
+      throw new Error("first arg must be private key");
+    if (isProbPub(publicKeyB) === false)
+      throw new Error("second arg must be public key");
+    const s = Fn.fromBytes(secretKeyA);
+    const b = Point.fromBytes(publicKeyB);
+    return b.multiply(s).toBytes(isCompressed);
+  }
+  const utils = {
+    isValidSecretKey,
+    isValidPublicKey,
+    randomSecretKey
+  };
+  const keygen = createKeygen(randomSecretKey, getPublicKey2);
+  return Object.freeze({ getPublicKey: getPublicKey2, getSharedSecret, keygen, Point, utils, lengths });
+}
+function ecdsa(Point, hash, ecdsaOpts = {}) {
+  ahash(hash);
+  validateObject(ecdsaOpts, {}, {
+    hmac: "function",
+    lowS: "boolean",
+    randomBytes: "function",
+    bits2int: "function",
+    bits2int_modN: "function"
+  });
+  ecdsaOpts = Object.assign({}, ecdsaOpts);
+  const randomBytes5 = ecdsaOpts.randomBytes || randomBytes;
+  const hmac2 = ecdsaOpts.hmac || ((key, msg) => hmac(hash, key, msg));
+  const { Fp, Fn } = Point;
+  const { ORDER: CURVE_ORDER, BITS: fnBits } = Fn;
+  const { keygen, getPublicKey: getPublicKey2, getSharedSecret, utils, lengths } = ecdh(Point, ecdsaOpts);
+  const defaultSigOpts = {
+    prehash: true,
+    lowS: typeof ecdsaOpts.lowS === "boolean" ? ecdsaOpts.lowS : true,
+    format: "compact",
+    extraEntropy: false
+  };
+  const hasLargeCofactor = CURVE_ORDER * _2n2 < Fp.ORDER;
+  function isBiggerThanHalfOrder(number3) {
+    const HALF = CURVE_ORDER >> _1n4;
+    return number3 > HALF;
+  }
+  function validateRS(title, num2) {
+    if (!Fn.isValidNot0(num2))
+      throw new Error(`invalid signature ${title}: out of range 1..Point.Fn.ORDER`);
+    return num2;
+  }
+  function assertSmallCofactor() {
+    if (hasLargeCofactor)
+      throw new Error('"recovered" sig type is not supported for cofactor >2 curves');
+  }
+  function validateSigLength(bytes, format) {
+    validateSigFormat(format);
+    const size = lengths.signature;
+    const sizer = format === "compact" ? size : format === "recovered" ? size + 1 : void 0;
+    return abytes(bytes, sizer);
+  }
+  class Signature {
+    r;
+    s;
+    recovery;
+    constructor(r, s, recovery) {
+      this.r = validateRS("r", r);
+      this.s = validateRS("s", s);
+      if (recovery != null) {
+        assertSmallCofactor();
+        if (![0, 1, 2, 3].includes(recovery))
+          throw new Error("invalid recovery id");
+        this.recovery = recovery;
+      }
+      Object.freeze(this);
+    }
+    static fromBytes(bytes, format = defaultSigOpts.format) {
+      validateSigLength(bytes, format);
+      let recid;
+      if (format === "der") {
+        const { r: r2, s: s2 } = DER.toSig(abytes(bytes));
+        return new Signature(r2, s2);
+      }
+      if (format === "recovered") {
+        recid = bytes[0];
+        format = "compact";
+        bytes = bytes.subarray(1);
+      }
+      const L = lengths.signature / 2;
+      const r = bytes.subarray(0, L);
+      const s = bytes.subarray(L, L * 2);
+      return new Signature(Fn.fromBytes(r), Fn.fromBytes(s), recid);
+    }
+    static fromHex(hex, format) {
+      return this.fromBytes(hexToBytes(hex), format);
+    }
+    assertRecovery() {
+      const { recovery } = this;
+      if (recovery == null)
+        throw new Error("invalid recovery id: must be present");
+      return recovery;
+    }
+    addRecoveryBit(recovery) {
+      return new Signature(this.r, this.s, recovery);
+    }
+    recoverPublicKey(messageHash) {
+      const { r, s } = this;
+      const recovery = this.assertRecovery();
+      const radj = recovery === 2 || recovery === 3 ? r + CURVE_ORDER : r;
+      if (!Fp.isValid(radj))
+        throw new Error("invalid recovery id: sig.r+curve.n != R.x");
+      const x = Fp.toBytes(radj);
+      const R = Point.fromBytes(concatBytes(pprefix((recovery & 1) === 0), x));
+      const ir = Fn.inv(radj);
+      const h = bits2int_modN(abytes(messageHash, void 0, "msgHash"));
+      const u1 = Fn.create(-h * ir);
+      const u2 = Fn.create(s * ir);
+      const Q = Point.BASE.multiplyUnsafe(u1).add(R.multiplyUnsafe(u2));
+      if (Q.is0())
+        throw new Error("invalid recovery: point at infinify");
+      Q.assertValidity();
+      return Q;
+    }
+    // Signatures should be low-s, to prevent malleability.
+    hasHighS() {
+      return isBiggerThanHalfOrder(this.s);
+    }
+    toBytes(format = defaultSigOpts.format) {
+      validateSigFormat(format);
+      if (format === "der")
+        return hexToBytes(DER.hexFromSig(this));
+      const { r, s } = this;
+      const rb = Fn.toBytes(r);
+      const sb = Fn.toBytes(s);
+      if (format === "recovered") {
+        assertSmallCofactor();
+        return concatBytes(Uint8Array.of(this.assertRecovery()), rb, sb);
+      }
+      return concatBytes(rb, sb);
+    }
+    toHex(format) {
+      return bytesToHex(this.toBytes(format));
+    }
+  }
+  const bits2int = ecdsaOpts.bits2int || function bits2int_def(bytes) {
+    if (bytes.length > 8192)
+      throw new Error("input is too large");
+    const num2 = bytesToNumberBE(bytes);
+    const delta = bytes.length * 8 - fnBits;
+    return delta > 0 ? num2 >> BigInt(delta) : num2;
+  };
+  const bits2int_modN = ecdsaOpts.bits2int_modN || function bits2int_modN_def(bytes) {
+    return Fn.create(bits2int(bytes));
+  };
+  const ORDER_MASK = bitMask(fnBits);
+  function int2octets(num2) {
+    aInRange("num < 2^" + fnBits, num2, _0n4, ORDER_MASK);
+    return Fn.toBytes(num2);
+  }
+  function validateMsgAndHash(message, prehash) {
+    abytes(message, void 0, "message");
+    return prehash ? abytes(hash(message), void 0, "prehashed message") : message;
+  }
+  function prepSig(message, secretKey, opts) {
+    const { lowS, prehash, extraEntropy } = validateSigOpts(opts, defaultSigOpts);
+    message = validateMsgAndHash(message, prehash);
+    const h1int = bits2int_modN(message);
+    const d = Fn.fromBytes(secretKey);
+    if (!Fn.isValidNot0(d))
+      throw new Error("invalid private key");
+    const seedArgs = [int2octets(d), int2octets(h1int)];
+    if (extraEntropy != null && extraEntropy !== false) {
+      const e = extraEntropy === true ? randomBytes5(lengths.secretKey) : extraEntropy;
+      seedArgs.push(abytes(e, void 0, "extraEntropy"));
+    }
+    const seed = concatBytes(...seedArgs);
+    const m = h1int;
+    function k2sig(kBytes) {
+      const k = bits2int(kBytes);
+      if (!Fn.isValidNot0(k))
+        return;
+      const ik = Fn.inv(k);
+      const q = Point.BASE.multiply(k).toAffine();
+      const r = Fn.create(q.x);
+      if (r === _0n4)
+        return;
+      const s = Fn.create(ik * Fn.create(m + r * d));
+      if (s === _0n4)
+        return;
+      let recovery = (q.x === r ? 0 : 2) | Number(q.y & _1n4);
+      let normS = s;
+      if (lowS && isBiggerThanHalfOrder(s)) {
+        normS = Fn.neg(s);
+        recovery ^= 1;
+      }
+      return new Signature(r, normS, hasLargeCofactor ? void 0 : recovery);
+    }
+    return { seed, k2sig };
+  }
+  function sign(message, secretKey, opts = {}) {
+    const { seed, k2sig } = prepSig(message, secretKey, opts);
+    const drbg = createHmacDrbg(hash.outputLen, Fn.BYTES, hmac2);
+    const sig = drbg(seed, k2sig);
+    return sig.toBytes(opts.format);
+  }
+  function verify(signature, message, publicKey, opts = {}) {
+    const { lowS, prehash, format } = validateSigOpts(opts, defaultSigOpts);
+    publicKey = abytes(publicKey, void 0, "publicKey");
+    message = validateMsgAndHash(message, prehash);
+    if (!isBytes(signature)) {
+      const end = signature instanceof Signature ? ", use sig.toBytes()" : "";
+      throw new Error("verify expects Uint8Array signature" + end);
+    }
+    validateSigLength(signature, format);
+    try {
+      const sig = Signature.fromBytes(signature, format);
+      const P = Point.fromBytes(publicKey);
+      if (lowS && sig.hasHighS())
+        return false;
+      const { r, s } = sig;
+      const h = bits2int_modN(message);
+      const is = Fn.inv(s);
+      const u1 = Fn.create(h * is);
+      const u2 = Fn.create(r * is);
+      const R = Point.BASE.multiplyUnsafe(u1).add(P.multiplyUnsafe(u2));
+      if (R.is0())
+        return false;
+      const v = Fn.create(R.x);
+      return v === r;
+    } catch (e) {
+      return false;
+    }
+  }
+  function recoverPublicKey(signature, message, opts = {}) {
+    const { prehash } = validateSigOpts(opts, defaultSigOpts);
+    message = validateMsgAndHash(message, prehash);
+    return Signature.fromBytes(signature, "recovered").recoverPublicKey(message).toBytes();
+  }
+  return Object.freeze({
+    keygen,
+    getPublicKey: getPublicKey2,
+    getSharedSecret,
+    utils,
+    lengths,
+    Point,
+    sign,
+    verify,
+    recoverPublicKey,
+    Signature,
+    hash
+  });
+}
 
 // node_modules/@noble/curves/secp256k1.js
 var secp256k1_CURVE = {
@@ -19004,6 +19553,7 @@ var Pointk1 = /* @__PURE__ */ weierstrass(secp256k1_CURVE, {
   Fp: Fpk1,
   endo: secp256k1_ENDO
 });
+var secp256k1 = /* @__PURE__ */ ecdsa(Pointk1, sha256);
 var TAGGED_HASH_PREFIXES = {};
 function taggedHash(tag, ...messages) {
   let tagP = TAGGED_HASH_PREFIXES[tag];
@@ -19396,6 +19946,875 @@ ${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }
 
+// node_modules/@noble/ciphers/utils.js
+function isBytes3(a) {
+  return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
+}
+function abool2(b) {
+  if (typeof b !== "boolean")
+    throw new Error(`boolean expected, not ${b}`);
+}
+function anumber3(n) {
+  if (!Number.isSafeInteger(n) || n < 0)
+    throw new Error("positive integer expected, got " + n);
+}
+function abytes2(value, length, title = "") {
+  const bytes = isBytes3(value);
+  const len = value?.length;
+  const needsLen = length !== void 0;
+  if (!bytes || needsLen && len !== length) {
+    const prefix = title && `"${title}" `;
+    const ofLen = needsLen ? ` of length ${length}` : "";
+    const got = bytes ? `length=${len}` : `type=${typeof value}`;
+    throw new Error(prefix + "expected Uint8Array" + ofLen + ", got " + got);
+  }
+  return value;
+}
+function aexists2(instance, checkFinished = true) {
+  if (instance.destroyed)
+    throw new Error("Hash instance has been destroyed");
+  if (checkFinished && instance.finished)
+    throw new Error("Hash#digest() has already been called");
+}
+function aoutput2(out, instance) {
+  abytes2(out, void 0, "output");
+  const min = instance.outputLen;
+  if (out.length < min) {
+    throw new Error("digestInto() expects output buffer of length at least " + min);
+  }
+}
+function u32(arr) {
+  return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
+}
+function clean2(...arrays) {
+  for (let i2 = 0; i2 < arrays.length; i2++) {
+    arrays[i2].fill(0);
+  }
+}
+function createView2(arr) {
+  return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+var isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([287454020]).buffer)[0] === 68)();
+function checkOpts(defaults, opts) {
+  if (opts == null || typeof opts !== "object")
+    throw new Error("options must be defined");
+  const merged = Object.assign(defaults, opts);
+  return merged;
+}
+function equalBytes(a, b) {
+  if (a.length !== b.length)
+    return false;
+  let diff = 0;
+  for (let i2 = 0; i2 < a.length; i2++)
+    diff |= a[i2] ^ b[i2];
+  return diff === 0;
+}
+var wrapCipher = /* @__NO_SIDE_EFFECTS__ */ (params, constructor) => {
+  function wrappedCipher(key, ...args) {
+    abytes2(key, void 0, "key");
+    if (!isLE)
+      throw new Error("Non little-endian hardware is not yet supported");
+    if (params.nonceLength !== void 0) {
+      const nonce = args[0];
+      abytes2(nonce, params.varSizeNonce ? void 0 : params.nonceLength, "nonce");
+    }
+    const tagl = params.tagLength;
+    if (tagl && args[1] !== void 0)
+      abytes2(args[1], void 0, "AAD");
+    const cipher = constructor(key, ...args);
+    const checkOutput = (fnLength, output) => {
+      if (output !== void 0) {
+        if (fnLength !== 2)
+          throw new Error("cipher output not supported");
+        abytes2(output, void 0, "output");
+      }
+    };
+    let called = false;
+    const wrCipher = {
+      encrypt(data, output) {
+        if (called)
+          throw new Error("cannot encrypt() twice with same key + nonce");
+        called = true;
+        abytes2(data);
+        checkOutput(cipher.encrypt.length, output);
+        return cipher.encrypt(data, output);
+      },
+      decrypt(data, output) {
+        abytes2(data);
+        if (tagl && data.length < tagl)
+          throw new Error('"ciphertext" expected length bigger than tagLength=' + tagl);
+        checkOutput(cipher.decrypt.length, output);
+        return cipher.decrypt(data, output);
+      }
+    };
+    return wrCipher;
+  }
+  Object.assign(wrappedCipher, params);
+  return wrappedCipher;
+};
+function getOutput(expectedLength, out, onlyAligned = true) {
+  if (out === void 0)
+    return new Uint8Array(expectedLength);
+  if (out.length !== expectedLength)
+    throw new Error('"output" expected Uint8Array of length ' + expectedLength + ", got: " + out.length);
+  if (onlyAligned && !isAligned32(out))
+    throw new Error("invalid output, must be aligned");
+  return out;
+}
+function u64Lengths(dataLength, aadLength, isLE2) {
+  abool2(isLE2);
+  const num2 = new Uint8Array(16);
+  const view = createView2(num2);
+  view.setBigUint64(0, BigInt(aadLength), isLE2);
+  view.setBigUint64(8, BigInt(dataLength), isLE2);
+  return num2;
+}
+function isAligned32(bytes) {
+  return bytes.byteOffset % 4 === 0;
+}
+function copyBytes2(bytes) {
+  return Uint8Array.from(bytes);
+}
+
+// node_modules/@noble/ciphers/_arx.js
+var encodeStr = (str) => Uint8Array.from(str.split(""), (c) => c.charCodeAt(0));
+var sigma16 = encodeStr("expand 16-byte k");
+var sigma32 = encodeStr("expand 32-byte k");
+var sigma16_32 = u32(sigma16);
+var sigma32_32 = u32(sigma32);
+function rotl(a, b) {
+  return a << b | a >>> 32 - b;
+}
+function isAligned322(b) {
+  return b.byteOffset % 4 === 0;
+}
+var BLOCK_LEN = 64;
+var BLOCK_LEN32 = 16;
+var MAX_COUNTER = 2 ** 32 - 1;
+var U32_EMPTY = Uint32Array.of();
+function runCipher(core, sigma, key, nonce, data, output, counter, rounds) {
+  const len = data.length;
+  const block = new Uint8Array(BLOCK_LEN);
+  const b32 = u32(block);
+  const isAligned = isAligned322(data) && isAligned322(output);
+  const d32 = isAligned ? u32(data) : U32_EMPTY;
+  const o32 = isAligned ? u32(output) : U32_EMPTY;
+  for (let pos = 0; pos < len; counter++) {
+    core(sigma, key, nonce, b32, counter, rounds);
+    if (counter >= MAX_COUNTER)
+      throw new Error("arx: counter overflow");
+    const take = Math.min(BLOCK_LEN, len - pos);
+    if (isAligned && take === BLOCK_LEN) {
+      const pos32 = pos / 4;
+      if (pos % 4 !== 0)
+        throw new Error("arx: invalid block position");
+      for (let j = 0, posj; j < BLOCK_LEN32; j++) {
+        posj = pos32 + j;
+        o32[posj] = d32[posj] ^ b32[j];
+      }
+      pos += BLOCK_LEN;
+      continue;
+    }
+    for (let j = 0, posj; j < take; j++) {
+      posj = pos + j;
+      output[posj] = data[posj] ^ block[j];
+    }
+    pos += take;
+  }
+}
+function createCipher(core, opts) {
+  const { allowShortKeys, extendNonceFn, counterLength, counterRight, rounds } = checkOpts({ allowShortKeys: false, counterLength: 8, counterRight: false, rounds: 20 }, opts);
+  if (typeof core !== "function")
+    throw new Error("core must be a function");
+  anumber3(counterLength);
+  anumber3(rounds);
+  abool2(counterRight);
+  abool2(allowShortKeys);
+  return (key, nonce, data, output, counter = 0) => {
+    abytes2(key, void 0, "key");
+    abytes2(nonce, void 0, "nonce");
+    abytes2(data, void 0, "data");
+    const len = data.length;
+    if (output === void 0)
+      output = new Uint8Array(len);
+    abytes2(output, void 0, "output");
+    anumber3(counter);
+    if (counter < 0 || counter >= MAX_COUNTER)
+      throw new Error("arx: counter overflow");
+    if (output.length < len)
+      throw new Error(`arx: output (${output.length}) is shorter than data (${len})`);
+    const toClean = [];
+    let l = key.length;
+    let k;
+    let sigma;
+    if (l === 32) {
+      toClean.push(k = copyBytes2(key));
+      sigma = sigma32_32;
+    } else if (l === 16 && allowShortKeys) {
+      k = new Uint8Array(32);
+      k.set(key);
+      k.set(key, 16);
+      sigma = sigma16_32;
+      toClean.push(k);
+    } else {
+      abytes2(key, 32, "arx key");
+      throw new Error("invalid key size");
+    }
+    if (!isAligned322(nonce))
+      toClean.push(nonce = copyBytes2(nonce));
+    const k32 = u32(k);
+    if (extendNonceFn) {
+      if (nonce.length !== 24)
+        throw new Error(`arx: extended nonce must be 24 bytes`);
+      extendNonceFn(sigma, k32, u32(nonce.subarray(0, 16)), k32);
+      nonce = nonce.subarray(16);
+    }
+    const nonceNcLen = 16 - counterLength;
+    if (nonceNcLen !== nonce.length)
+      throw new Error(`arx: nonce must be ${nonceNcLen} or 16 bytes`);
+    if (nonceNcLen !== 12) {
+      const nc = new Uint8Array(12);
+      nc.set(nonce, counterRight ? 0 : 12 - nonce.length);
+      nonce = nc;
+      toClean.push(nonce);
+    }
+    const n32 = u32(nonce);
+    runCipher(core, sigma, k32, n32, data, output, counter, rounds);
+    clean2(...toClean);
+    return output;
+  };
+}
+
+// node_modules/@noble/ciphers/_poly1305.js
+function u8to16(a, i2) {
+  return a[i2++] & 255 | (a[i2++] & 255) << 8;
+}
+var Poly1305 = class {
+  blockLen = 16;
+  outputLen = 16;
+  buffer = new Uint8Array(16);
+  r = new Uint16Array(10);
+  // Allocating 1 array with .subarray() here is slower than 3
+  h = new Uint16Array(10);
+  pad = new Uint16Array(8);
+  pos = 0;
+  finished = false;
+  // Can be speed-up using BigUint64Array, at the cost of complexity
+  constructor(key) {
+    key = copyBytes2(abytes2(key, 32, "key"));
+    const t0 = u8to16(key, 0);
+    const t1 = u8to16(key, 2);
+    const t2 = u8to16(key, 4);
+    const t3 = u8to16(key, 6);
+    const t4 = u8to16(key, 8);
+    const t5 = u8to16(key, 10);
+    const t6 = u8to16(key, 12);
+    const t7 = u8to16(key, 14);
+    this.r[0] = t0 & 8191;
+    this.r[1] = (t0 >>> 13 | t1 << 3) & 8191;
+    this.r[2] = (t1 >>> 10 | t2 << 6) & 7939;
+    this.r[3] = (t2 >>> 7 | t3 << 9) & 8191;
+    this.r[4] = (t3 >>> 4 | t4 << 12) & 255;
+    this.r[5] = t4 >>> 1 & 8190;
+    this.r[6] = (t4 >>> 14 | t5 << 2) & 8191;
+    this.r[7] = (t5 >>> 11 | t6 << 5) & 8065;
+    this.r[8] = (t6 >>> 8 | t7 << 8) & 8191;
+    this.r[9] = t7 >>> 5 & 127;
+    for (let i2 = 0; i2 < 8; i2++)
+      this.pad[i2] = u8to16(key, 16 + 2 * i2);
+  }
+  process(data, offset, isLast = false) {
+    const hibit = isLast ? 0 : 1 << 11;
+    const { h, r } = this;
+    const r0 = r[0];
+    const r1 = r[1];
+    const r2 = r[2];
+    const r3 = r[3];
+    const r4 = r[4];
+    const r5 = r[5];
+    const r6 = r[6];
+    const r7 = r[7];
+    const r8 = r[8];
+    const r9 = r[9];
+    const t0 = u8to16(data, offset + 0);
+    const t1 = u8to16(data, offset + 2);
+    const t2 = u8to16(data, offset + 4);
+    const t3 = u8to16(data, offset + 6);
+    const t4 = u8to16(data, offset + 8);
+    const t5 = u8to16(data, offset + 10);
+    const t6 = u8to16(data, offset + 12);
+    const t7 = u8to16(data, offset + 14);
+    let h0 = h[0] + (t0 & 8191);
+    let h1 = h[1] + ((t0 >>> 13 | t1 << 3) & 8191);
+    let h2 = h[2] + ((t1 >>> 10 | t2 << 6) & 8191);
+    let h3 = h[3] + ((t2 >>> 7 | t3 << 9) & 8191);
+    let h4 = h[4] + ((t3 >>> 4 | t4 << 12) & 8191);
+    let h5 = h[5] + (t4 >>> 1 & 8191);
+    let h6 = h[6] + ((t4 >>> 14 | t5 << 2) & 8191);
+    let h7 = h[7] + ((t5 >>> 11 | t6 << 5) & 8191);
+    let h8 = h[8] + ((t6 >>> 8 | t7 << 8) & 8191);
+    let h9 = h[9] + (t7 >>> 5 | hibit);
+    let c = 0;
+    let d0 = c + h0 * r0 + h1 * (5 * r9) + h2 * (5 * r8) + h3 * (5 * r7) + h4 * (5 * r6);
+    c = d0 >>> 13;
+    d0 &= 8191;
+    d0 += h5 * (5 * r5) + h6 * (5 * r4) + h7 * (5 * r3) + h8 * (5 * r2) + h9 * (5 * r1);
+    c += d0 >>> 13;
+    d0 &= 8191;
+    let d1 = c + h0 * r1 + h1 * r0 + h2 * (5 * r9) + h3 * (5 * r8) + h4 * (5 * r7);
+    c = d1 >>> 13;
+    d1 &= 8191;
+    d1 += h5 * (5 * r6) + h6 * (5 * r5) + h7 * (5 * r4) + h8 * (5 * r3) + h9 * (5 * r2);
+    c += d1 >>> 13;
+    d1 &= 8191;
+    let d2 = c + h0 * r2 + h1 * r1 + h2 * r0 + h3 * (5 * r9) + h4 * (5 * r8);
+    c = d2 >>> 13;
+    d2 &= 8191;
+    d2 += h5 * (5 * r7) + h6 * (5 * r6) + h7 * (5 * r5) + h8 * (5 * r4) + h9 * (5 * r3);
+    c += d2 >>> 13;
+    d2 &= 8191;
+    let d3 = c + h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * (5 * r9);
+    c = d3 >>> 13;
+    d3 &= 8191;
+    d3 += h5 * (5 * r8) + h6 * (5 * r7) + h7 * (5 * r6) + h8 * (5 * r5) + h9 * (5 * r4);
+    c += d3 >>> 13;
+    d3 &= 8191;
+    let d4 = c + h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+    c = d4 >>> 13;
+    d4 &= 8191;
+    d4 += h5 * (5 * r9) + h6 * (5 * r8) + h7 * (5 * r7) + h8 * (5 * r6) + h9 * (5 * r5);
+    c += d4 >>> 13;
+    d4 &= 8191;
+    let d5 = c + h0 * r5 + h1 * r4 + h2 * r3 + h3 * r2 + h4 * r1;
+    c = d5 >>> 13;
+    d5 &= 8191;
+    d5 += h5 * r0 + h6 * (5 * r9) + h7 * (5 * r8) + h8 * (5 * r7) + h9 * (5 * r6);
+    c += d5 >>> 13;
+    d5 &= 8191;
+    let d6 = c + h0 * r6 + h1 * r5 + h2 * r4 + h3 * r3 + h4 * r2;
+    c = d6 >>> 13;
+    d6 &= 8191;
+    d6 += h5 * r1 + h6 * r0 + h7 * (5 * r9) + h8 * (5 * r8) + h9 * (5 * r7);
+    c += d6 >>> 13;
+    d6 &= 8191;
+    let d7 = c + h0 * r7 + h1 * r6 + h2 * r5 + h3 * r4 + h4 * r3;
+    c = d7 >>> 13;
+    d7 &= 8191;
+    d7 += h5 * r2 + h6 * r1 + h7 * r0 + h8 * (5 * r9) + h9 * (5 * r8);
+    c += d7 >>> 13;
+    d7 &= 8191;
+    let d8 = c + h0 * r8 + h1 * r7 + h2 * r6 + h3 * r5 + h4 * r4;
+    c = d8 >>> 13;
+    d8 &= 8191;
+    d8 += h5 * r3 + h6 * r2 + h7 * r1 + h8 * r0 + h9 * (5 * r9);
+    c += d8 >>> 13;
+    d8 &= 8191;
+    let d9 = c + h0 * r9 + h1 * r8 + h2 * r7 + h3 * r6 + h4 * r5;
+    c = d9 >>> 13;
+    d9 &= 8191;
+    d9 += h5 * r4 + h6 * r3 + h7 * r2 + h8 * r1 + h9 * r0;
+    c += d9 >>> 13;
+    d9 &= 8191;
+    c = (c << 2) + c | 0;
+    c = c + d0 | 0;
+    d0 = c & 8191;
+    c = c >>> 13;
+    d1 += c;
+    h[0] = d0;
+    h[1] = d1;
+    h[2] = d2;
+    h[3] = d3;
+    h[4] = d4;
+    h[5] = d5;
+    h[6] = d6;
+    h[7] = d7;
+    h[8] = d8;
+    h[9] = d9;
+  }
+  finalize() {
+    const { h, pad: pad2 } = this;
+    const g = new Uint16Array(10);
+    let c = h[1] >>> 13;
+    h[1] &= 8191;
+    for (let i2 = 2; i2 < 10; i2++) {
+      h[i2] += c;
+      c = h[i2] >>> 13;
+      h[i2] &= 8191;
+    }
+    h[0] += c * 5;
+    c = h[0] >>> 13;
+    h[0] &= 8191;
+    h[1] += c;
+    c = h[1] >>> 13;
+    h[1] &= 8191;
+    h[2] += c;
+    g[0] = h[0] + 5;
+    c = g[0] >>> 13;
+    g[0] &= 8191;
+    for (let i2 = 1; i2 < 10; i2++) {
+      g[i2] = h[i2] + c;
+      c = g[i2] >>> 13;
+      g[i2] &= 8191;
+    }
+    g[9] -= 1 << 13;
+    let mask = (c ^ 1) - 1;
+    for (let i2 = 0; i2 < 10; i2++)
+      g[i2] &= mask;
+    mask = ~mask;
+    for (let i2 = 0; i2 < 10; i2++)
+      h[i2] = h[i2] & mask | g[i2];
+    h[0] = (h[0] | h[1] << 13) & 65535;
+    h[1] = (h[1] >>> 3 | h[2] << 10) & 65535;
+    h[2] = (h[2] >>> 6 | h[3] << 7) & 65535;
+    h[3] = (h[3] >>> 9 | h[4] << 4) & 65535;
+    h[4] = (h[4] >>> 12 | h[5] << 1 | h[6] << 14) & 65535;
+    h[5] = (h[6] >>> 2 | h[7] << 11) & 65535;
+    h[6] = (h[7] >>> 5 | h[8] << 8) & 65535;
+    h[7] = (h[8] >>> 8 | h[9] << 5) & 65535;
+    let f = h[0] + pad2[0];
+    h[0] = f & 65535;
+    for (let i2 = 1; i2 < 8; i2++) {
+      f = (h[i2] + pad2[i2] | 0) + (f >>> 16) | 0;
+      h[i2] = f & 65535;
+    }
+    clean2(g);
+  }
+  update(data) {
+    aexists2(this);
+    abytes2(data);
+    data = copyBytes2(data);
+    const { buffer, blockLen } = this;
+    const len = data.length;
+    for (let pos = 0; pos < len; ) {
+      const take = Math.min(blockLen - this.pos, len - pos);
+      if (take === blockLen) {
+        for (; blockLen <= len - pos; pos += blockLen)
+          this.process(data, pos);
+        continue;
+      }
+      buffer.set(data.subarray(pos, pos + take), this.pos);
+      this.pos += take;
+      pos += take;
+      if (this.pos === blockLen) {
+        this.process(buffer, 0, false);
+        this.pos = 0;
+      }
+    }
+    return this;
+  }
+  destroy() {
+    clean2(this.h, this.r, this.buffer, this.pad);
+  }
+  digestInto(out) {
+    aexists2(this);
+    aoutput2(out, this);
+    this.finished = true;
+    const { buffer, h } = this;
+    let { pos } = this;
+    if (pos) {
+      buffer[pos++] = 1;
+      for (; pos < 16; pos++)
+        buffer[pos] = 0;
+      this.process(buffer, 0, true);
+    }
+    this.finalize();
+    let opos = 0;
+    for (let i2 = 0; i2 < 8; i2++) {
+      out[opos++] = h[i2] >>> 0;
+      out[opos++] = h[i2] >>> 8;
+    }
+    return out;
+  }
+  digest() {
+    const { buffer, outputLen } = this;
+    this.digestInto(buffer);
+    const res = buffer.slice(0, outputLen);
+    this.destroy();
+    return res;
+  }
+};
+function wrapConstructorWithKey(hashCons) {
+  const hashC = (msg, key) => hashCons(key).update(msg).digest();
+  const tmp = hashCons(new Uint8Array(32));
+  hashC.outputLen = tmp.outputLen;
+  hashC.blockLen = tmp.blockLen;
+  hashC.create = (key) => hashCons(key);
+  return hashC;
+}
+var poly1305 = /* @__PURE__ */ (() => wrapConstructorWithKey((key) => new Poly1305(key)))();
+
+// node_modules/@noble/ciphers/chacha.js
+function chachaCore(s, k, n, out, cnt, rounds = 20) {
+  let y00 = s[0], y01 = s[1], y02 = s[2], y03 = s[3], y04 = k[0], y05 = k[1], y06 = k[2], y07 = k[3], y08 = k[4], y09 = k[5], y10 = k[6], y11 = k[7], y12 = cnt, y13 = n[0], y14 = n[1], y15 = n[2];
+  let x00 = y00, x01 = y01, x02 = y02, x03 = y03, x04 = y04, x05 = y05, x06 = y06, x07 = y07, x08 = y08, x09 = y09, x10 = y10, x11 = y11, x12 = y12, x13 = y13, x14 = y14, x15 = y15;
+  for (let r = 0; r < rounds; r += 2) {
+    x00 = x00 + x04 | 0;
+    x12 = rotl(x12 ^ x00, 16);
+    x08 = x08 + x12 | 0;
+    x04 = rotl(x04 ^ x08, 12);
+    x00 = x00 + x04 | 0;
+    x12 = rotl(x12 ^ x00, 8);
+    x08 = x08 + x12 | 0;
+    x04 = rotl(x04 ^ x08, 7);
+    x01 = x01 + x05 | 0;
+    x13 = rotl(x13 ^ x01, 16);
+    x09 = x09 + x13 | 0;
+    x05 = rotl(x05 ^ x09, 12);
+    x01 = x01 + x05 | 0;
+    x13 = rotl(x13 ^ x01, 8);
+    x09 = x09 + x13 | 0;
+    x05 = rotl(x05 ^ x09, 7);
+    x02 = x02 + x06 | 0;
+    x14 = rotl(x14 ^ x02, 16);
+    x10 = x10 + x14 | 0;
+    x06 = rotl(x06 ^ x10, 12);
+    x02 = x02 + x06 | 0;
+    x14 = rotl(x14 ^ x02, 8);
+    x10 = x10 + x14 | 0;
+    x06 = rotl(x06 ^ x10, 7);
+    x03 = x03 + x07 | 0;
+    x15 = rotl(x15 ^ x03, 16);
+    x11 = x11 + x15 | 0;
+    x07 = rotl(x07 ^ x11, 12);
+    x03 = x03 + x07 | 0;
+    x15 = rotl(x15 ^ x03, 8);
+    x11 = x11 + x15 | 0;
+    x07 = rotl(x07 ^ x11, 7);
+    x00 = x00 + x05 | 0;
+    x15 = rotl(x15 ^ x00, 16);
+    x10 = x10 + x15 | 0;
+    x05 = rotl(x05 ^ x10, 12);
+    x00 = x00 + x05 | 0;
+    x15 = rotl(x15 ^ x00, 8);
+    x10 = x10 + x15 | 0;
+    x05 = rotl(x05 ^ x10, 7);
+    x01 = x01 + x06 | 0;
+    x12 = rotl(x12 ^ x01, 16);
+    x11 = x11 + x12 | 0;
+    x06 = rotl(x06 ^ x11, 12);
+    x01 = x01 + x06 | 0;
+    x12 = rotl(x12 ^ x01, 8);
+    x11 = x11 + x12 | 0;
+    x06 = rotl(x06 ^ x11, 7);
+    x02 = x02 + x07 | 0;
+    x13 = rotl(x13 ^ x02, 16);
+    x08 = x08 + x13 | 0;
+    x07 = rotl(x07 ^ x08, 12);
+    x02 = x02 + x07 | 0;
+    x13 = rotl(x13 ^ x02, 8);
+    x08 = x08 + x13 | 0;
+    x07 = rotl(x07 ^ x08, 7);
+    x03 = x03 + x04 | 0;
+    x14 = rotl(x14 ^ x03, 16);
+    x09 = x09 + x14 | 0;
+    x04 = rotl(x04 ^ x09, 12);
+    x03 = x03 + x04 | 0;
+    x14 = rotl(x14 ^ x03, 8);
+    x09 = x09 + x14 | 0;
+    x04 = rotl(x04 ^ x09, 7);
+  }
+  let oi = 0;
+  out[oi++] = y00 + x00 | 0;
+  out[oi++] = y01 + x01 | 0;
+  out[oi++] = y02 + x02 | 0;
+  out[oi++] = y03 + x03 | 0;
+  out[oi++] = y04 + x04 | 0;
+  out[oi++] = y05 + x05 | 0;
+  out[oi++] = y06 + x06 | 0;
+  out[oi++] = y07 + x07 | 0;
+  out[oi++] = y08 + x08 | 0;
+  out[oi++] = y09 + x09 | 0;
+  out[oi++] = y10 + x10 | 0;
+  out[oi++] = y11 + x11 | 0;
+  out[oi++] = y12 + x12 | 0;
+  out[oi++] = y13 + x13 | 0;
+  out[oi++] = y14 + x14 | 0;
+  out[oi++] = y15 + x15 | 0;
+}
+function hchacha(s, k, i2, out) {
+  let x00 = s[0], x01 = s[1], x02 = s[2], x03 = s[3], x04 = k[0], x05 = k[1], x06 = k[2], x07 = k[3], x08 = k[4], x09 = k[5], x10 = k[6], x11 = k[7], x12 = i2[0], x13 = i2[1], x14 = i2[2], x15 = i2[3];
+  for (let r = 0; r < 20; r += 2) {
+    x00 = x00 + x04 | 0;
+    x12 = rotl(x12 ^ x00, 16);
+    x08 = x08 + x12 | 0;
+    x04 = rotl(x04 ^ x08, 12);
+    x00 = x00 + x04 | 0;
+    x12 = rotl(x12 ^ x00, 8);
+    x08 = x08 + x12 | 0;
+    x04 = rotl(x04 ^ x08, 7);
+    x01 = x01 + x05 | 0;
+    x13 = rotl(x13 ^ x01, 16);
+    x09 = x09 + x13 | 0;
+    x05 = rotl(x05 ^ x09, 12);
+    x01 = x01 + x05 | 0;
+    x13 = rotl(x13 ^ x01, 8);
+    x09 = x09 + x13 | 0;
+    x05 = rotl(x05 ^ x09, 7);
+    x02 = x02 + x06 | 0;
+    x14 = rotl(x14 ^ x02, 16);
+    x10 = x10 + x14 | 0;
+    x06 = rotl(x06 ^ x10, 12);
+    x02 = x02 + x06 | 0;
+    x14 = rotl(x14 ^ x02, 8);
+    x10 = x10 + x14 | 0;
+    x06 = rotl(x06 ^ x10, 7);
+    x03 = x03 + x07 | 0;
+    x15 = rotl(x15 ^ x03, 16);
+    x11 = x11 + x15 | 0;
+    x07 = rotl(x07 ^ x11, 12);
+    x03 = x03 + x07 | 0;
+    x15 = rotl(x15 ^ x03, 8);
+    x11 = x11 + x15 | 0;
+    x07 = rotl(x07 ^ x11, 7);
+    x00 = x00 + x05 | 0;
+    x15 = rotl(x15 ^ x00, 16);
+    x10 = x10 + x15 | 0;
+    x05 = rotl(x05 ^ x10, 12);
+    x00 = x00 + x05 | 0;
+    x15 = rotl(x15 ^ x00, 8);
+    x10 = x10 + x15 | 0;
+    x05 = rotl(x05 ^ x10, 7);
+    x01 = x01 + x06 | 0;
+    x12 = rotl(x12 ^ x01, 16);
+    x11 = x11 + x12 | 0;
+    x06 = rotl(x06 ^ x11, 12);
+    x01 = x01 + x06 | 0;
+    x12 = rotl(x12 ^ x01, 8);
+    x11 = x11 + x12 | 0;
+    x06 = rotl(x06 ^ x11, 7);
+    x02 = x02 + x07 | 0;
+    x13 = rotl(x13 ^ x02, 16);
+    x08 = x08 + x13 | 0;
+    x07 = rotl(x07 ^ x08, 12);
+    x02 = x02 + x07 | 0;
+    x13 = rotl(x13 ^ x02, 8);
+    x08 = x08 + x13 | 0;
+    x07 = rotl(x07 ^ x08, 7);
+    x03 = x03 + x04 | 0;
+    x14 = rotl(x14 ^ x03, 16);
+    x09 = x09 + x14 | 0;
+    x04 = rotl(x04 ^ x09, 12);
+    x03 = x03 + x04 | 0;
+    x14 = rotl(x14 ^ x03, 8);
+    x09 = x09 + x14 | 0;
+    x04 = rotl(x04 ^ x09, 7);
+  }
+  let oi = 0;
+  out[oi++] = x00;
+  out[oi++] = x01;
+  out[oi++] = x02;
+  out[oi++] = x03;
+  out[oi++] = x12;
+  out[oi++] = x13;
+  out[oi++] = x14;
+  out[oi++] = x15;
+}
+var chacha20 = /* @__PURE__ */ createCipher(chachaCore, {
+  counterRight: false,
+  counterLength: 4,
+  allowShortKeys: false
+});
+var xchacha20 = /* @__PURE__ */ createCipher(chachaCore, {
+  counterRight: false,
+  counterLength: 8,
+  extendNonceFn: hchacha,
+  allowShortKeys: false
+});
+var ZEROS16 = /* @__PURE__ */ new Uint8Array(16);
+var updatePadded = (h, msg) => {
+  h.update(msg);
+  const leftover = msg.length % 16;
+  if (leftover)
+    h.update(ZEROS16.subarray(leftover));
+};
+var ZEROS32 = /* @__PURE__ */ new Uint8Array(32);
+function computeTag(fn, key, nonce, ciphertext, AAD) {
+  if (AAD !== void 0)
+    abytes2(AAD, void 0, "AAD");
+  const authKey = fn(key, nonce, ZEROS32);
+  const lengths = u64Lengths(ciphertext.length, AAD ? AAD.length : 0, true);
+  const h = poly1305.create(authKey);
+  if (AAD)
+    updatePadded(h, AAD);
+  updatePadded(h, ciphertext);
+  h.update(lengths);
+  const res = h.digest();
+  clean2(authKey, lengths);
+  return res;
+}
+var _poly1305_aead = (xorStream) => (key, nonce, AAD) => {
+  const tagLength = 16;
+  return {
+    encrypt(plaintext, output) {
+      const plength = plaintext.length;
+      output = getOutput(plength + tagLength, output, false);
+      output.set(plaintext);
+      const oPlain = output.subarray(0, -tagLength);
+      xorStream(key, nonce, oPlain, oPlain, 1);
+      const tag = computeTag(xorStream, key, nonce, oPlain, AAD);
+      output.set(tag, plength);
+      clean2(tag);
+      return output;
+    },
+    decrypt(ciphertext, output) {
+      output = getOutput(ciphertext.length - tagLength, output, false);
+      const data = ciphertext.subarray(0, -tagLength);
+      const passedTag = ciphertext.subarray(-tagLength);
+      const tag = computeTag(xorStream, key, nonce, data, AAD);
+      if (!equalBytes(passedTag, tag))
+        throw new Error("invalid tag");
+      output.set(ciphertext.subarray(0, -tagLength));
+      xorStream(key, nonce, output, output, 1);
+      clean2(tag);
+      return output;
+    }
+  };
+};
+var chacha20poly1305 = /* @__PURE__ */ wrapCipher({ blockSize: 64, nonceLength: 12, tagLength: 16 }, _poly1305_aead(chacha20));
+var xchacha20poly1305 = /* @__PURE__ */ wrapCipher({ blockSize: 64, nonceLength: 24, tagLength: 16 }, _poly1305_aead(xchacha20));
+
+// node_modules/@noble/hashes/hkdf.js
+function extract(hash, ikm, salt) {
+  ahash(hash);
+  if (salt === void 0)
+    salt = new Uint8Array(hash.outputLen);
+  return hmac(hash, salt, ikm);
+}
+var HKDF_COUNTER = /* @__PURE__ */ Uint8Array.of(0);
+var EMPTY_BUFFER = /* @__PURE__ */ Uint8Array.of();
+function expand(hash, prk, info, length = 32) {
+  ahash(hash);
+  anumber(length, "length");
+  const olen = hash.outputLen;
+  if (length > 255 * olen)
+    throw new Error("Length must be <= 255*HashLen");
+  const blocks = Math.ceil(length / olen);
+  if (info === void 0)
+    info = EMPTY_BUFFER;
+  else
+    abytes(info, void 0, "info");
+  const okm = new Uint8Array(blocks * olen);
+  const HMAC = hmac.create(hash, prk);
+  const HMACTmp = HMAC._cloneInto();
+  const T = new Uint8Array(HMAC.outputLen);
+  for (let counter = 0; counter < blocks; counter++) {
+    HKDF_COUNTER[0] = counter + 1;
+    HMACTmp.update(counter === 0 ? EMPTY_BUFFER : T).update(info).update(HKDF_COUNTER).digestInto(T);
+    okm.set(T, olen * counter);
+    HMAC._cloneInto(HMACTmp);
+  }
+  HMAC.destroy();
+  HMACTmp.destroy();
+  clean(T, HKDF_COUNTER);
+  return okm.slice(0, length);
+}
+
+// nip44.mjs
+var SALT = new TextEncoder().encode("nip44-v2");
+var MIN_PLAINTEXT = 1;
+var MAX_PLAINTEXT = 65535;
+var te = new TextEncoder();
+var td = new TextDecoder("utf-8", { fatal: true });
+var isHex = (s, n) => typeof s === "string" && s.length === n && /^[0-9a-f]+$/i.test(s);
+var hexToBytes2 = (h) => Uint8Array.from(Buffer.from(h, "hex"));
+function toBytes32(k, what) {
+  if (k instanceof Uint8Array && k.length === 32) return k;
+  if (isHex(k, 64)) return hexToBytes2(k);
+  throw new Error(`nip44: ${what} must be 32 bytes`);
+}
+function ctEqual(a, b) {
+  if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array) || a.length !== b.length) return false;
+  let d = 0;
+  for (let i2 = 0; i2 < a.length; i2++) d |= a[i2] ^ b[i2];
+  return d === 0;
+}
+function getConversationKey(privA, pubBx) {
+  const sk = toBytes32(privA, "private key");
+  if (!isHex(pubBx, 64)) throw new Error("nip44: public key must be 64 hex chars (x-only)");
+  const shared = secp256k1.getSharedSecret(sk, hexToBytes2("02" + pubBx));
+  const x = shared.subarray(1, 33);
+  const key = extract(sha256, x, SALT);
+  shared.fill(0);
+  return key;
+}
+function getMessageKeys(conversationKey, nonce) {
+  const ck = toBytes32(conversationKey, "conversation key");
+  const n = toBytes32(nonce, "nonce");
+  const keys = expand(sha256, ck, n, 76);
+  return { chachaKey: keys.subarray(0, 32), chachaNonce: keys.subarray(32, 44), hmacKey: keys.subarray(44, 76), _all: keys };
+}
+function calcPaddedLen(len) {
+  if (!Number.isSafeInteger(len) || len < 1) throw new Error("nip44: expected positive integer");
+  if (len <= 32) return 32;
+  const nextPower = 1 << Math.floor(Math.log2(len - 1)) + 1;
+  const chunk = nextPower <= 256 ? 32 : nextPower / 8;
+  return chunk * (Math.floor((len - 1) / chunk) + 1);
+}
+function pad(plaintext) {
+  const u = te.encode(plaintext);
+  const n = u.length;
+  if (n < MIN_PLAINTEXT || n > MAX_PLAINTEXT) throw new Error("nip44: invalid plaintext size: must be between 1 and 65535 bytes");
+  const out = new Uint8Array(2 + calcPaddedLen(n));
+  out[0] = n >> 8;
+  out[1] = n & 255;
+  out.set(u, 2);
+  return out;
+}
+function unpad(padded) {
+  if (padded.length < 2) throw new Error("nip44: invalid padding");
+  const n = padded[0] << 8 | padded[1];
+  if (n < MIN_PLAINTEXT || n > MAX_PLAINTEXT || padded.length !== 2 + calcPaddedLen(n)) throw new Error("nip44: invalid padding");
+  try {
+    return td.decode(padded.subarray(2, 2 + n));
+  } catch {
+    throw new Error("nip44: invalid utf-8");
+  }
+}
+var hmacAad = (key, msg, aad) => hmac(sha256, key, concatBytes(aad, msg));
+function encrypt(plaintext, conversationKey, nonce = randomBytes(32)) {
+  if (typeof plaintext !== "string") throw new Error("nip44: plaintext must be a string");
+  const n = toBytes32(nonce, "nonce");
+  const { chachaKey, chachaNonce, hmacKey, _all } = getMessageKeys(conversationKey, n);
+  try {
+    const padded = pad(plaintext);
+    const ciphertext = chacha20(chachaKey, chachaNonce, padded);
+    padded.fill(0);
+    const mac2 = hmacAad(hmacKey, ciphertext, n);
+    return Buffer.from(concatBytes(new Uint8Array([2]), n, ciphertext, mac2)).toString("base64");
+  } finally {
+    _all.fill(0);
+  }
+}
+var B64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+function decodePayload(payload) {
+  if (typeof payload !== "string") throw new Error("nip44: payload must be a string");
+  const plen = payload.length;
+  if (plen === 0 || payload[0] === "#") throw new Error("nip44: unknown encryption version");
+  if (plen < 132 || plen > 87472) throw new Error("nip44: invalid payload length");
+  if (plen % 4 !== 0 || !B64_RE.test(payload)) throw new Error("nip44: invalid base64");
+  const data = Uint8Array.from(Buffer.from(payload, "base64"));
+  const dlen = data.length;
+  if (dlen < 99 || dlen > 65603) throw new Error("nip44: invalid data length");
+  if (data[0] !== 2) throw new Error("nip44: unknown encryption version");
+  return { nonce: data.subarray(1, 33), ciphertext: data.subarray(33, dlen - 32), mac: data.subarray(dlen - 32) };
+}
+function decrypt(payload, conversationKey) {
+  const { nonce, ciphertext, mac: mac2 } = decodePayload(payload);
+  const { chachaKey, chachaNonce, hmacKey, _all } = getMessageKeys(conversationKey, nonce);
+  try {
+    const want = hmacAad(hmacKey, ciphertext, nonce);
+    if (!ctEqual(want, mac2)) throw new Error("nip44: invalid MAC");
+    const padded = chacha20(chachaKey, chachaNonce, ciphertext);
+    try {
+      return unpad(padded);
+    } finally {
+      padded.fill(0);
+    }
+  } finally {
+    _all.fill(0);
+  }
+}
+
 // signer.mjs
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
@@ -19770,6 +21189,9 @@ async function resolveSigner(opts = {}) {
       canSign: (kind) => WIRE_ALLOWLIST.has(kind),
       wipe() {
       },
+      // v0.2.33: no encrypt-to-self in wire mode — the user's key is escrowed at Ekam and Ekam offers
+      // no NIP-44 endpoint, so NIP-44 features (read state, private saved items) are agent-mode only.
+      selfCipher: null,
       // Expose a valid wire:sign access token for authed Ekam reads (e.g. the
       // email→pubkey directory resolve) — same WHO-gate as signing, no new credential.
       ekamToken: () => tokens.get(false),
@@ -19792,16 +21214,29 @@ async function resolveSigner(opts = {}) {
   const sk = await resolveKey(opts);
   const pubkey = getPublicKey(sk);
   let wiped = false;
+  let convKey = null;
+  const ck = () => {
+    if (wiped) throw new Error("signer: key already wiped (shutting down)");
+    if (!convKey) convKey = getConversationKey(sk, pubkey);
+    return convKey;
+  };
+  const selfCipher = Object.freeze({
+    encrypt: (plaintext) => encrypt(plaintext, ck()),
+    decrypt: (payload) => decrypt(payload, ck()),
+    derive: (label) => Buffer.from(hmac(sha256, ck(), new TextEncoder().encode(String(label)))).toString("hex")
+  });
   return {
     mode: "local",
     pubkey,
     canSign: () => true,
+    selfCipher,
     // v0.2.31 (item 8): zero the in-memory secret key on shutdown. After wipe() the signer refuses
     // rather than signing with an all-zero key. (Best effort: JS strings the key passed through as
     // hex cannot be wiped; the Uint8Array the signer holds can.)
     wipe() {
       wiped = true;
       sk.fill(0);
+      if (convKey) convKey.fill(0);
     },
     async sign(template) {
       if (wiped) throw new Error("signer: key already wiped (shutting down)");
@@ -19891,9 +21326,9 @@ var stripInvisible = (s) => String(s ?? "").replace(NAME_INVIS_G, "");
 var stripVariationSelectors = (s) => String(s ?? "").replace(VARIATION_SELECTOR_G, "");
 var LABEL_ESCAPE_G = new RegExp(`[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029${INVISIBLE_CLASS}]`, "gu");
 function quoteLabel(s, cap = 64) {
-  const cps = [...String(s ?? "")];
-  const body = cps.slice(0, cap).join("").replace(/[\\"]/g, (c) => "\\" + c).replace(LABEL_ESCAPE_G, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
-  return `"${body}"${cps.length > cap ? `\u2026[+${cps.length - cap} chars]` : ""}`;
+  const cps2 = [...String(s ?? "")];
+  const body = cps2.slice(0, cap).join("").replace(/[\\"]/g, (c) => "\\" + c).replace(LABEL_ESCAPE_G, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+  return `"${body}"${cps2.length > cap ? `\u2026[+${cps2.length - cap} chars]` : ""}`;
 }
 var caseFold = (s) => s.toUpperCase().toLowerCase().replace(/\u03C2/g, "\u03C3");
 function foldName(s) {
@@ -20401,8 +21836,8 @@ var charBefore = (str, off) => {
 };
 function escapeContent(s, { cap = MSG_CAP } = {}) {
   let out = String(s ?? "").replace(/\\/g, "\\\\").replace(/\r\n|\r|\n/g, "\\n").replace(/\t/g, "\\t").replace(CONTENT_ESCAPE_G, (c, off, str) => isVS(c) && off > 0 && !CONTENT_ESCAPE_1.test(charBefore(str, off)) ? c : `\\u{${c.codePointAt(0).toString(16)}}`);
-  const cps = [...out];
-  if (cps.length > cap) out = cps.slice(0, cap).join("") + `\u2026[+${cps.length - cap} chars]`;
+  const cps2 = [...out];
+  if (cps2.length > cap) out = cps2.slice(0, cap).join("") + `\u2026[+${cps2.length - cap} chars]`;
   return out;
 }
 var escapeName = (s) => escapeContent(s, { cap: 64 });
@@ -20812,15 +22247,297 @@ function emojiPalette(evs) {
   return [...by].map(([shortcode, v]) => ({ shortcode, url: v.url, pubkey: v.pubkey })).sort((a, b) => a.shortcode.localeCompare(b.shortcode));
 }
 
+// parity33.mjs
+var READ_STATE_KIND = 30078;
+var READ_STATE_T = "read-state";
+var READ_STATE_MAX_CONTEXTS = 1e4;
+var READ_STATE_MAX_CTX_BYTES = 256;
+var READ_STATE_MAX_TS = 4294967295;
+var SLOT_RE = /^read-state:[0-9a-f]{32}$/;
+function isReadStateEvent(e) {
+  if (!e || e.kind !== READ_STATE_KIND || !Array.isArray(e.tags)) return false;
+  const ds = e.tags.filter((t) => Array.isArray(t) && t[0] === "d");
+  const ts = e.tags.filter((t) => Array.isArray(t) && t[0] === "t");
+  return ds.length === 1 && SLOT_RE.test(String(ds[0][1])) && ts.length === 1 && ts[0][1] === READ_STATE_T;
+}
+var readStateD = (e) => (e.tags.find((t) => t[0] === "d") || [])[1];
+function readStateIdentity(derive) {
+  const slot = String(derive("buzz-mcp/nip-rs/slot/v1")).slice(0, 32);
+  const client = String(derive("buzz-mcp/nip-rs/client-id/v1")).slice(0, 16);
+  if (!/^[0-9a-f]{32}$/.test(slot) || !/^[0-9a-f]{16}$/.test(client)) throw new Error("read state: identity derivation failed");
+  return { slot, d: `read-state:${slot}`, clientId: `buzz-mcp-${client}` };
+}
+var isCtxTs = (v) => Number.isInteger(v) && v >= 0 && v <= READ_STATE_MAX_TS;
+function parseReadStateBlob(plaintext) {
+  let j;
+  try {
+    j = JSON.parse(plaintext);
+  } catch {
+    return null;
+  }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return null;
+  if (j.v !== 1) return null;
+  const cid = j.client_id;
+  if (typeof cid !== "string" || [...cid].length < 1 || [...cid].length > 64) return null;
+  const c = j.contexts;
+  if (!c || typeof c !== "object" || Array.isArray(c)) return null;
+  const keys = Object.keys(c);
+  if (keys.length > READ_STATE_MAX_CONTEXTS) return null;
+  const contexts = /* @__PURE__ */ Object.create(null);
+  for (const k of keys) {
+    if (Buffer.byteLength(k, "utf8") > READ_STATE_MAX_CTX_BYTES) continue;
+    if (!isCtxTs(c[k])) continue;
+    contexts[k] = c[k];
+  }
+  return { clientId: cid, contexts };
+}
+function mergeContexts(...maps) {
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const m of maps) for (const [k, v] of Object.entries(m || {})) if (isCtxTs(v) && !(k in out && out[k] >= v)) out[k] = v;
+  return out;
+}
+var escapeCtxKey = (raw) => /^(ov_|esc:)/.test(raw) ? `esc:${raw}` : raw;
+var unescapeCtxKey = (wire) => wire.startsWith("esc:") ? wire.slice(4) : wire;
+function frontiers(contexts) {
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(contexts || {})) {
+    if (k.startsWith("ov_")) continue;
+    out[unescapeCtxKey(k)] = v;
+  }
+  return out;
+}
+function decodeReadState(events, { me, decrypt: decrypt2, ownD, ownClientId }) {
+  const blobs = [];
+  let skipped = 0, own2 = null, ownMaxCreatedAt = 0, conflict = false;
+  for (const e of events || []) {
+    if (!e || e.pubkey !== me || !isReadStateEvent(e)) {
+      skipped++;
+      continue;
+    }
+    let pt;
+    try {
+      pt = decrypt2(String(e.content || ""));
+    } catch {
+      skipped++;
+      continue;
+    }
+    const b = parseReadStateBlob(pt);
+    if (!b) {
+      skipped++;
+      continue;
+    }
+    blobs.push(b.contexts);
+    if (readStateD(e) === ownD) {
+      ownMaxCreatedAt = Math.max(ownMaxCreatedAt, e.created_at | 0);
+      if (b.clientId !== ownClientId) conflict = true;
+      else if (!own2 || (e.created_at | 0) >= own2.created_at) own2 = { created_at: e.created_at | 0, contexts: b.contexts };
+    }
+  }
+  return { merged: mergeContexts(...blobs), own: own2, ownMaxCreatedAt, conflict, used: blobs.length, skipped };
+}
+function nextReadStateBlob({ clientId, ownContexts, updates, nowS, ownMaxCreatedAt = 0 }) {
+  const esc2 = /* @__PURE__ */ Object.create(null);
+  for (const [raw, ts] of Object.entries(updates || {})) {
+    if (!isCtxTs(ts)) throw new Error("read state: timestamp out of range");
+    const k = escapeCtxKey(String(raw));
+    if (Buffer.byteLength(k, "utf8") > READ_STATE_MAX_CTX_BYTES) throw new Error("read state: context id too long");
+    esc2[k] = ts;
+  }
+  const contexts = mergeContexts(ownContexts || {}, esc2);
+  if (Object.keys(contexts).length > READ_STATE_MAX_CONTEXTS) throw new Error(`read state: more than ${READ_STATE_MAX_CONTEXTS} contexts \u2014 refusing to publish a blob other clients must reject`);
+  const plaintext = JSON.stringify({ v: 1, client_id: clientId, contexts });
+  if (Buffer.byteLength(plaintext, "utf8") > 65535) throw new Error("read state: blob exceeds the NIP-44 plaintext limit");
+  return { plaintext, contexts, created_at: Math.max(nowS, (ownMaxCreatedAt | 0) + 1) };
+}
+function effectiveFrontier(fr, { channel, root, id }) {
+  let f = fr[channel] ?? -1;
+  if (root && fr[`thread:${root}`] != null) f = Math.max(f, fr[`thread:${root}`]);
+  if (id && fr[`msg:${id}`] != null) f = Math.max(f, fr[`msg:${id}`]);
+  return f;
+}
+var tagVal = (e, n) => ((e.tags || []).find((t) => t[0] === n) || [])[1];
+var rootOf = (e) => {
+  const tags = (e.tags || []).filter((t) => t[0] === "e" && /^[0-9a-f]{64}$/.test(t[1] || ""));
+  const r = tags.find((t) => t[3] === "root") || tags.find((t) => t[3] === "reply");
+  return r ? r[1] : null;
+};
+function unreadCounts(events, fr, { me, channelIds, fallbackSince }) {
+  const want = new Set(channelIds);
+  const stat = /* @__PURE__ */ new Map();
+  for (const id of channelIds) stat.set(id, { unread: 0, mentions: 0, noMarker: fr[id] == null, newest: 0 });
+  for (const e of events || []) {
+    const ch = tagVal(e, "h");
+    if (!ch || !want.has(ch) || e.pubkey === me) continue;
+    const s = stat.get(ch);
+    const f = s.noMarker ? Math.max(effectiveFrontier(fr, { channel: ch, root: rootOf(e), id: e.id }), (fallbackSince | 0) - 1) : effectiveFrontier(fr, { channel: ch, root: rootOf(e), id: e.id });
+    if (e.created_at > f) {
+      s.unread++;
+      if ((e.tags || []).some((t) => t[0] === "p" && t[1] === me)) s.mentions++;
+      s.newest = Math.max(s.newest, e.created_at);
+    }
+  }
+  return stat;
+}
+var CTRL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/u;
+var cps = (s) => [...s].length;
+var PROFILE_NAME_MAX = 64;
+var PROFILE_ABOUT_MAX = 500;
+var PROFILE_PICTURE_MAX = 2048;
+function validateProfilePatch(a = {}) {
+  const patch = {};
+  if (a.name != null) {
+    const n = String(a.name).trim();
+    if (!n) return { error: "name must not be empty" };
+    if (cps(n) > PROFILE_NAME_MAX) return { error: `name is limited to ${PROFILE_NAME_MAX} characters` };
+    if (CTRL_RE.test(n) || /[\n\t]/.test(n)) return { error: "name must not contain control, bidi or invisible characters" };
+    patch.name = n;
+  }
+  if (a.about != null) {
+    const s = String(a.about);
+    if (cps(s) > PROFILE_ABOUT_MAX) return { error: `about is limited to ${PROFILE_ABOUT_MAX} characters` };
+    if (CTRL_RE.test(s)) return { error: "about must not contain control, bidi or invisible characters (newlines are fine)" };
+    patch.about = s;
+  }
+  if (a.picture != null) {
+    const s = String(a.picture).trim();
+    if (s === "") patch.picture = "";
+    else {
+      if (s.length > PROFILE_PICTURE_MAX) return { error: `picture URL is limited to ${PROFILE_PICTURE_MAX} characters` };
+      let u;
+      try {
+        u = new URL(s);
+      } catch {
+        return { error: "picture must be an https:// URL" };
+      }
+      if (u.protocol !== "https:" || u.username || u.password || CTRL_RE.test(s) || /\s/.test(s)) return { error: "picture must be a plain https:// URL (no credentials, spaces or control characters)" };
+      patch.picture = u.href;
+    }
+  }
+  if (!Object.keys(patch).length) return { error: "give at least one of name / about / picture" };
+  return { patch };
+}
+var AUTO_ABOUT_RE = /^[^·\n]+ · [^·\n]+ · [^·\n]+ · [^·\n]+$/;
+var KEEP_FIELDS = ["picture", "banner", "website", "lud16", "nip05", "about", "bot"];
+function mergeProfile(existing, auto, patch = {}) {
+  const base = {};
+  if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+    for (const k of KEEP_FIELDS) if (typeof existing[k] === "string" || k === "bot" && typeof existing[k] === "boolean") base[k] = existing[k];
+  }
+  const out = { ...base, ...auto };
+  if (typeof base.about === "string" && base.about && !AUTO_ABOUT_RE.test(base.about)) out.about = base.about;
+  if (patch.name != null) {
+    out.name = patch.name;
+    out.display_name = patch.name;
+  }
+  if (patch.about != null) out.about = patch.about;
+  if (patch.picture != null) {
+    if (patch.picture === "") delete out.picture;
+    else out.picture = patch.picture;
+  }
+  return out;
+}
+function parseProfileContent(content) {
+  try {
+    const j = JSON.parse(content);
+    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
+  } catch {
+    return null;
+  }
+}
+var BOOKMARK_KIND = 10003;
+var BOOKMARK_MAX = 500;
+var isId = (s) => /^[0-9a-f]{64}$/.test(String(s || ""));
+function parseBookmarks(ev, decrypt2) {
+  if (!ev) return { pub: [], priv: [], opaque: false, otherPub: [] };
+  const pub = [], otherPub = [];
+  for (const t of ev.tags || []) {
+    if (!Array.isArray(t)) continue;
+    if (t[0] === "e" && isId(t[1])) pub.push(t[1]);
+    else otherPub.push(t);
+  }
+  let priv = [], otherPriv = [], opaque = false;
+  const c = String(ev.content || "");
+  if (c) {
+    try {
+      if (!decrypt2) throw new Error("no cipher");
+      const arr = JSON.parse(decrypt2(c));
+      if (!Array.isArray(arr)) throw new Error("not an array");
+      for (const t of arr) {
+        if (Array.isArray(t) && t[0] === "e" && isId(t[1])) priv.push(t[1]);
+        else if (Array.isArray(t)) otherPriv.push(t);
+      }
+    } catch {
+      opaque = true;
+    }
+  }
+  return { pub: [...new Set(pub)], priv: [...new Set(priv)], opaque, otherPub, otherPriv };
+}
+function applyBookmark(list, { id, remove = false, isPrivate = true }) {
+  if (!isId(id)) throw new Error("saved items: a 64-hex event id is required");
+  let pub = list.pub.filter((x) => x !== id), priv = list.priv.filter((x) => x !== id);
+  if (!remove) {
+    if (isPrivate) priv.push(id);
+    else pub.push(id);
+  }
+  if (pub.length + priv.length > BOOKMARK_MAX) throw new Error(`saved items: list is full (${BOOKMARK_MAX}) \u2014 unsave something first`);
+  return {
+    tags: [...(list.otherPub || []).filter((t) => t[0] !== "e"), ...pub.map((x) => ["e", x])],
+    privateTags: [...list.otherPriv || [], ...priv.map((x) => ["e", x])],
+    changed: list.pub.length !== pub.length || list.priv.length !== priv.length || list.pub.some((x, i2) => x !== pub[i2]) || list.priv.some((x, i2) => x !== priv[i2])
+  };
+}
+var DIFF_KIND = 40008;
+var DIFF_MAX_BYTES = 61440;
+var HEX7 = /^[0-9a-fA-F]{7,}$/;
+function buildDiffTags(m = {}) {
+  const repo = String(m.repo || "").trim();
+  if (!/^https?:\/\//.test(repo)) throw new Error("repo must be an http:// or https:// URL");
+  if (/\s/.test(repo) || CTRL_RE.test(repo) || repo.length > 2048) throw new Error("repo URL must not contain spaces or control characters (\u2264 2048 chars)");
+  const commit = String(m.commit || "").trim();
+  if (!HEX7.test(commit) || commit.length > 64) throw new Error("commit must be 7\u201364 hex characters");
+  const tags = [["repo", repo], ["commit", commit]];
+  const str = (v, what, max) => {
+    const s = String(v).trim();
+    if (!s) throw new Error(`${what} must not be empty`);
+    if (CTRL_RE.test(s) || /[\n\r\t]/.test(s) || cps(s) > max) throw new Error(`${what} must be one line, \u2264 ${max} characters, no control characters`);
+    return s;
+  };
+  if (m.file != null) tags.push(["file", str(m.file, "file", 512)]);
+  if (m.parent_commit != null) {
+    const pc = String(m.parent_commit).trim();
+    if (!HEX7.test(pc) || pc.length > 64) throw new Error("parent_commit must be 7\u201364 hex characters");
+    tags.push(["parent-commit", pc]);
+  }
+  if (m.source_branch != null || m.target_branch != null) {
+    if (m.source_branch == null || m.target_branch == null) throw new Error("source_branch and target_branch go together (both or neither)");
+    tags.push(["branch", str(m.source_branch, "source_branch", 255), str(m.target_branch, "target_branch", 255)]);
+  }
+  if (m.pr != null) {
+    if (!Number.isInteger(m.pr) || m.pr < 1 || m.pr > 4294967295) throw new Error("pr must be a positive integer");
+    tags.push(["pr", String(m.pr)]);
+  }
+  if (m.language != null) tags.push(["l", str(m.language, "language", 64)]);
+  if (m.description != null) tags.push(["description", str(m.description, "description", 500)]);
+  if (m.truncated === true) tags.push(["truncated", "true"]);
+  return tags;
+}
+function checkDiffContent(diff) {
+  if (typeof diff !== "string" || !diff.trim()) throw new Error("diff text is required");
+  const n = Buffer.byteLength(diff, "utf8");
+  if (n > DIFF_MAX_BYTES) throw new Error(`diff is ${n} bytes \u2014 the relay caps kind:40008 at ${DIFF_MAX_BYTES} (60 KB); trim it or set truncated:true after cutting it down`);
+  if (/\u0000/.test(diff)) throw new Error("diff must not contain NUL bytes");
+  return diff;
+}
+
 // wirelogin.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { createHash as createHash2, randomBytes as randomBytes2 } from "node:crypto";
+import { createHash as createHash2, randomBytes as randomBytes3 } from "node:crypto";
 import { realpathSync as realpathSync2 } from "node:fs";
 import { fileURLToPath } from "node:url";
 var b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 function pkce() {
-  const verifier = b64url(randomBytes2(32));
+  const verifier = b64url(randomBytes3(32));
   const challenge2 = b64url(createHash2("sha256").update(verifier).digest());
   return { verifier, challenge: challenge2 };
 }
@@ -20899,7 +22616,7 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
   }
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge: challenge2 } = pkce();
-  const state = b64url(randomBytes2(16));
+  const state = b64url(randomBytes3(16));
   const { srv, port } = await bindLoopback(ports);
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   const url = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
@@ -20977,7 +22694,7 @@ ${url}
 }
 
 // buzz-mcp.mjs
-import { createHash as createHash3, randomBytes as randomBytes3, randomUUID } from "node:crypto";
+import { createHash as createHash3, randomBytes as randomBytes4, randomUUID } from "node:crypto";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, mkdirSync as mkdirSync4, existsSync as existsSync3, statSync as statSync2, createReadStream, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
 import { Readable } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
@@ -21104,11 +22821,11 @@ if (!IDENTITY_OK)
 async function nip98(url, method, body) {
   const payload = createHash3("sha256").update(body ?? "").digest("hex");
   const ev = await signer.sign(
-    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes3(12).toString("hex")]], content: "" }
+    { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes4(12).toString("hex")]], content: "" }
   );
   return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
 }
-var SHIM_VERSION = "0.2.32";
+var SHIM_VERSION = "0.2.33";
 function retryClass(e) {
   const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
   if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -21511,10 +23228,20 @@ var AGENT_MODEL = process.env.BUZZ_MODEL || process.env.ANTHROPIC_MODEL || "anth
 var AGENT_HARNESS = process.env.BUZZ_HARNESS || "claude-code";
 var AGENT_INTERFACE = process.env.BUZZ_INTERFACE || "terminal";
 var KIND_AGENT_PROFILE = 10100;
-async function publishProfile(name) {
+async function ownProfile() {
+  try {
+    const evs = (await query([{ kinds: [0], authors: [PK], limit: 5 }]) || []).filter((e) => e && e.pubkey === PK && verifyEvent(e));
+    const top = evs.sort((x, y) => y.created_at - x.created_at)[0];
+    return top ? { profile: parseProfileContent(top.content), created_at: top.created_at | 0 } : null;
+  } catch {
+    return null;
+  }
+}
+async function publishProfile(name, patch = {}, existing = void 0) {
   if (!isDryRun()) MY_NAME = name;
   const host = hostname().split(".")[0];
-  const profile = {
+  if (existing === void 0) existing = await ownProfile();
+  const profile = mergeProfile(existing && existing.profile, {
     display_name: name,
     name,
     about: `${AGENT_MODEL} \xB7 ${AGENT_HARNESS} \xB7 ${AGENT_INTERFACE} \xB7 ${host}`,
@@ -21523,8 +23250,9 @@ async function publishProfile(name) {
     interface: AGENT_INTERFACE,
     client_version: SHIM_VERSION
     // (C, v0.2.30) which shim build published this profile
-  };
-  const res = await signer.sign({ kind: 0, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }).then((ev) => bridge("/events", ev));
+  }, patch);
+  const created_at = Math.max(Math.floor(Date.now() / 1e3), ((existing && existing.created_at) | 0) + 1);
+  const res = await signer.sign({ kind: 0, created_at, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }).then((ev) => bridge("/events", ev));
   try {
     const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed", client_version: SHIM_VERSION };
     const cardTags = [
@@ -21937,6 +23665,22 @@ async function dmById(id) {
   if (!hit) throw new Error(`no DM conversation ${String(id).slice(0, 8)}\u2026 that you're in \u2014 see buzz_dm_list`);
   return hit;
 }
+var ownVerified = (evs) => (evs || []).filter((e) => e && e.pubkey === PK && verifyEvent(e));
+async function loadReadState({ ownOnly = false } = {}) {
+  if (!signer.selfCipher) throw new Error("read state needs agent mode (NIP-44 encrypt-to-self)");
+  const id = readStateIdentity(signer.selfCipher.derive);
+  const filters = [{ kinds: [READ_STATE_KIND], authors: [PK], "#d": [id.d], limit: 10 }];
+  if (!ownOnly) filters.push({ kinds: [READ_STATE_KIND], authors: [PK], "#t": [READ_STATE_T], limit: 200 });
+  const evs = ownVerified(await query(filters));
+  const seen = /* @__PURE__ */ new Set();
+  const uniq = evs.filter((e) => seen.has(e.id) ? false : (seen.add(e.id), true));
+  return { id, ...decodeReadState(uniq, { me: PK, decrypt: signer.selfCipher.decrypt, ownD: id.d, ownClientId: id.clientId }) };
+}
+async function loadSavedList() {
+  const evs = ownVerified(await query([{ kinds: [BOOKMARK_KIND], authors: [PK], limit: 5 }]));
+  const top = evs.sort((x, y) => y.created_at - x.created_at)[0] || null;
+  return { ev: top, list: parseBookmarks(top, signer.selfCipher ? signer.selfCipher.decrypt : null) };
+}
 async function parityTool(name, a, { ok, fail }) {
   const guard = (verb) => IDENTITY_OK ? null : fail(`refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not ${verb} as the wrong identity.`);
   const withAuth = (tags) => AUTH_TAG ? [...tags, AUTH_TAG] : tags;
@@ -21945,6 +23689,149 @@ async function parityTool(name, a, { ok, fail }) {
     await bridge("/events", ev);
     return ev;
   };
+  if (name === "buzz_mark_read") {
+    const g = guard("writing read state");
+    if (g) return g;
+    if (!signer.selfCipher || !signer.canSign(READ_STATE_KIND))
+      return fail(`buzz_mark_read: read state (kind ${READ_STATE_KIND}) is agent-mode only \u2014 it must be NIP-44 encrypted with your own key, and in wire / post-as-me mode your key is escrowed at Ekam (no encrypt-to-self endpoint, and kind ${READ_STATE_KIND} is blocked on Ekam wire-sign allowlist). Nothing was sent.`);
+    const all = a.all === true;
+    if (all === (a.channel != null)) return fail("buzz_mark_read: give either `channel` (one conversation) or `all: true` (every channel and DM you're in)");
+    if (all && a.event != null) return fail("buzz_mark_read: `event` goes with a single `channel`, not `all`");
+    const nowS = Math.floor(Date.now() / 1e3);
+    const targets = [];
+    if (all) {
+      const byId = /* @__PURE__ */ new Map();
+      for (const c of await channels()) byId.set(c.id, `#${escapeName(c.name)}`);
+      await profiles();
+      for (const d of await dmChannels()) byId.set(d.id, `DM ${d.others.map((p) => who(p)).join(", ") || "(self)"}`);
+      for (const [id, label] of byId) targets.push({ id, label });
+    } else {
+      let ch = null;
+      try {
+        ch = await resolveChannel(a.channel);
+      } catch (e) {
+        if (e instanceof ChannelAmbiguousError) throw e;
+        const dm = (await dmChannels().catch(() => [])).find((d) => d.id === String(a.channel || "").trim());
+        if (!dm) throw e;
+        await profiles();
+        ch = { id: dm.id, name: null, label: `DM ${dm.others.map((p) => who(p)).join(", ")}` };
+      }
+      targets.push({ id: ch.id, label: ch.label || `#${escapeName(ch.name)}`, name: ch.name || ch.id });
+    }
+    if (!targets.length) return ok("buzz_mark_read: no channels or DMs to mark.");
+    if (targets.length > 500) return fail("buzz_mark_read: more than 500 conversations \u2014 mark them one at a time");
+    const updates = {};
+    if (a.event != null) {
+      const hit = await resolveEventInChannel(targets[0].id, targets[0].name, a.event);
+      updates[targets[0].id] = Math.min(hit.created_at | 0, nowS);
+    } else {
+      const evs = await query(targets.map((t) => ({ kinds: [9], "#h": [t.id], limit: 1 }))) || [];
+      for (const e of screen(evs).events) {
+        const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+        if (!h || !targets.some((t) => t.id === h)) continue;
+        const ts = Math.min(e.created_at | 0, nowS);
+        if (!(updates[h] >= ts)) updates[h] = ts;
+      }
+    }
+    const marked = targets.filter((t) => updates[t.id] != null);
+    if (!marked.length) return ok("buzz_mark_read: nothing to mark \u2014 no messages there yet.");
+    const rs = await loadReadState({ ownOnly: true });
+    if (rs.conflict) return fail(`buzz_mark_read: refused \u2014 the read-state slot this identity derives is held by a different client_id (NIP-RS conflict). Nothing was published. Is this key running in another buzz-mcp install? (one key = one host)`);
+    const before = rs.own ? rs.own.contexts : {};
+    const next = nextReadStateBlob({ clientId: rs.id.clientId, ownContexts: before, updates, nowS, ownMaxCreatedAt: rs.ownMaxCreatedAt });
+    const changed = marked.filter((t) => !(before[t.id] >= updates[t.id]));
+    if (!changed.length) return ok(`already read: ${marked.map((t) => t.label).join(", ")} \u2014 nothing to update.`);
+    const content = signer.selfCipher.encrypt(next.plaintext);
+    const ev = await signer.sign({ kind: READ_STATE_KIND, created_at: next.created_at, tags: withAuth([["d", rs.id.d], ["t", READ_STATE_T]]), content });
+    await bridge("/events", ev);
+    return ok(`marked read (NIP-RS, encrypted to you): ${changed.map((t) => `${t.label} up to ${fmtTime(updates[t.id], true)}`).join("; ")}${changed.length < marked.length ? ` (${marked.length - changed.length} already read)` : ""}.`);
+  }
+  if (name === "buzz_save") {
+    const g = guard("saving items");
+    if (g) return g;
+    const wb = wireBlocked(BOOKMARK_KIND, name);
+    if (wb) return fail(wb);
+    const isPrivate = a.private !== false;
+    if (isPrivate && !signer.selfCipher) return fail("buzz_save: private saved items need NIP-44 encrypt-to-self (agent mode). Nothing was sent.");
+    const ch = await resolveChannel(a.channel);
+    const hit = await resolveEventInChannel(ch.id, ch.name, a.event);
+    const { ev, list } = await loadSavedList();
+    if (list.opaque) return fail("buzz_save: refused \u2014 your saved list (NIP-51 kind 10003) has private items this shim can't decrypt (another client may use legacy NIP-04 encryption). Rewriting it would destroy them, so nothing was sent.");
+    const remove = a.remove === true;
+    const nx = applyBookmark(list, { id: hit.id, remove, isPrivate });
+    if (!nx.changed) return ok(remove ? `<${hit.id.slice(0, 8)}> wasn't in your saved items \u2014 nothing to do.` : `<${hit.id.slice(0, 8)}> is already saved.`);
+    const content = nx.privateTags.length ? signer.selfCipher.encrypt(JSON.stringify(nx.privateTags)) : "";
+    const created_at = Math.max(Math.floor(Date.now() / 1e3), ((ev && ev.created_at) | 0) + 1);
+    const sev = await signer.sign({ kind: BOOKMARK_KIND, created_at, tags: withAuth(nx.tags.filter((t) => t[0] !== "auth")), content });
+    await bridge("/events", sev);
+    return ok(remove ? `removed <${hit.id.slice(0, 8)}> (#${escapeName(ch.name)}) from your saved items.` : `saved <${hit.id.slice(0, 8)}> from #${escapeName(ch.name)}${isPrivate ? " (private \u2014 encrypted to you)" : " (PUBLIC \u2014 anyone can see this list entry)"}. See them with buzz_saved.`);
+  }
+  if (name === "buzz_saved") {
+    const { ev, list } = await loadSavedList();
+    const ids = [...list.priv.map((id) => ({ id, priv: true })), ...list.pub.map((id) => ({ id, priv: false }))].reverse();
+    const limit = clampLimit(a.limit, 50, 200);
+    const shown = ids.slice(0, limit);
+    const notes = [];
+    if (list.opaque) notes.push(signer.selfCipher ? "\u26A0 some private items can't be decrypted (legacy NIP-04?) and aren't shown" : "private items are encrypted to your key \u2014 only an agent-mode session can list them");
+    if (!ev) return ok("Saved items \u2014 0. Save a message with buzz_save { channel, event }.");
+    let byId = /* @__PURE__ */ new Map(), scrNote = "", flagOf;
+    if (shown.length) {
+      const scr = screen(await query([{ ids: shown.map((x) => x.id), limit: shown.length }]));
+      byId = new Map(scr.events.map((e) => [e.id, e]));
+      scrNote = scr.note;
+      flagOf = scr.flagOf;
+    }
+    await profiles();
+    let cs = [], dms = [];
+    try {
+      cs = await channels();
+    } catch {
+    }
+    try {
+      dms = await dmChannels();
+    } catch {
+    }
+    const labelOf = new Map(cs.map((c) => [c.id, `#${escapeName(c.name)}`]));
+    for (const d of dms) labelOf.set(d.id, `[DM ${d.others.map((pk) => who(pk)).join(", ") || "(self)"}]`);
+    const rows = shown.map(({ id, priv }) => {
+      const e = byId.get(id);
+      if (!e) return `${priv ? "\u{1F512}" : "\u{1F310}"} <${id.slice(0, 8)}> (not visible \u2014 deleted, or in a conversation you can't read)`;
+      const h = ((e.tags || []).find((t) => t[0] === "h") || [])[1];
+      return `${priv ? "\u{1F512}" : "\u{1F310}"} ${h ? (labelOf.get(h) || `#${escapeName(h.slice(0, 8))}`) + " " : ""}${row(e, { withDate: true, flagOf })}`;
+    });
+    return ok(`Saved items \u2014 ${ids.length}${ids.length > shown.length ? ` (showing newest ${shown.length})` : ""} (\u{1F512} private, \u{1F310} public):
+${UNTRUSTED_NOTE}${scrNote ? "\n" + scrNote : ""}${notes.length ? "\n" + notes.join("\n") : ""}
+` + (rows.join("\n") || "(none)"));
+  }
+  if (name === "buzz_post_diff") {
+    const g = guard("posting");
+    if (g) return g;
+    const wb = wireBlocked(DIFF_KIND, name);
+    if (wb) return fail(wb);
+    let diff, meta2;
+    try {
+      diff = checkDiffContent(a.diff);
+      meta2 = buildDiffTags({ repo: a.repo, commit: a.commit, file: a.file, parent_commit: a.parent_commit, source_branch: a.source_branch, target_branch: a.target_branch, pr: a.pr, language: a.language, description: a.description, truncated: a.truncated });
+    } catch (e) {
+      return fail(`buzz_post_diff: ${e.message}`);
+    }
+    const ch = await resolveChannel(a.channel);
+    const tags = [["h", ch.id], ...meta2];
+    let where = `#${escapeName(ch.name)}`;
+    if (a.event != null) {
+      const target = await resolveEventInChannel(ch.id, ch.name, a.event);
+      const rootId = threadRootOf(target);
+      if (rootId && rootId !== target.id) {
+        tags.push(["e", rootId, "", "root"]);
+        tags.push(["e", target.id, "", "reply"]);
+      } else tags.push(["e", target.id, "", "reply"]);
+      if (/^[0-9a-f]{64}$/.test(target.pubkey || "") && target.pubkey !== PK) tags.push(["p", target.pubkey]);
+      where += ` (thread <${rootId.slice(0, 8)}>)`;
+    }
+    const ev = await publish(DIFF_KIND, tags, diff);
+    const lines = diff.split("\n").length;
+    return ok(`posted a diff to ${where} <${String(ev.id).slice(0, 8)}>: ${escapeContent(a.repo, { cap: 200 })} @ ${escapeName(String(a.commit).slice(0, 12))}${a.file ? ` \u2014 ${escapeName(a.file)}` : ""} (${lines} line(s), ${Buffer.byteLength(diff, "utf8")} B).`);
+  }
   if (name === "buzz_edit_message") {
     const g = guard("editing");
     if (g) return g;
@@ -22139,7 +24026,8 @@ var CH = { type: "string", description: "channel name or id" };
 var EV = { type: "string", description: "the target message's <id> (from buzz_read)" };
 var TOOLS = [
   { name: "buzz_whoami", description: "Show this CLI session's Buzz identity (friendly name + npub + pubkey).", inputSchema: { type: "object", properties: {} } },
-  { name: "buzz_setname", description: "Override this session's friendly display name on the fleet.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+  { name: "buzz_setname", description: "DEPRECATED alias of buzz_profile_set { name } \u2014 override this session's friendly display name on the fleet. Agent mode only.", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+  { name: "buzz_profile_set", description: "Set your own profile (kind 0): any of `name` (display name, \u226464 chars), `about` (\u2264500 chars), `picture` (an https:// image URL; empty string clears it). PATCH-style: other profile fields are kept. Agent mode only \u2014 in wire / post-as-me mode it's refused (kind 0 is your own profile and isn't on Ekam's wire-sign allowlist yet).", inputSchema: { type: "object", properties: { name: { type: "string", description: "display name (\u226464 chars, no control/bidi/invisible characters)" }, about: { type: "string", description: "bio (\u2264500 chars; newlines ok)" }, picture: { type: "string", description: "https:// avatar URL (empty string clears)" } } } },
   { name: "buzz_channels", description: "List channels. Default `scope: \"member\"` = the channels you're in. `scope: \"open\"` browses the workspace's OPEN channels (like Slack's channel browser) \u2014 private and DM channels are never listed; ones you've joined are marked \u2713, others can be joined by id with buzz_join_channel.", inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["member", "open"], description: '"member" (default) or "open"' } } } },
   { name: "buzz_create_channel", description: 'Create a new channel (NIP-29 kind 9007), as you \u2014 you become its owner. `name` is required. `visibility`: "private" (invite-only; the DEFAULT \u2014 fail-closed) or "open" (searchable, anyone self-joins). `type`: "stream" (default) or "forum". Optional `description`, and `ttl` (seconds \u2014 an ephemeral channel archived after that much idle). Does NOT add members: after creating, add them with buzz_add_member. The relay authorizes this against your own channel-write permission; it may refuse if your identity/delegation lacks it. `name` is at most 80 characters and `description` at most 500, neither containing control characters.', inputSchema: { type: "object", properties: { name: { type: "string", description: "channel name (a leading # and surrounding whitespace are trimmed; \u226480 chars, no control characters)" }, visibility: { type: "string", description: '"private" (default) or "open"' }, type: { type: "string", description: '"stream" (default) or "forum"' }, description: { type: "string", description: "optional channel description/about (\u2264500 chars)" }, ttl: { type: "number", description: "optional idle-seconds before the channel is archived (ephemeral)" } }, required: ["name"] } },
   { name: "buzz_edit_channel", description: 'Edit a channel\'s metadata (NIP-29 kind 9002), as you \u2014 owner/admin only (relay-enforced). PATCH-style: pass only what changes; fields you omit are left untouched. `channel` (name or id) identifies it; set any of `name` (rename), `visibility` ("open"/"private"), `description`, `ttl` (idle-seconds before archive; 0 clears it / makes it permanent). Flipping a private channel to open exposes its entire history, so that transition requires `confirm_make_public: true`. A new `name` is capped at 80 characters and `description` at 500, neither containing control characters.', inputSchema: { type: "object", properties: { channel: { type: "string" }, name: { type: "string", description: "new channel name (\u226480 chars, no control characters)" }, visibility: { type: "string", description: '"open" or "private"' }, description: { type: "string", description: "new about/description (empty string clears it; \u2264500 chars)" }, ttl: { type: "number", description: "idle-seconds before archive; 0 clears it" }, confirm_make_public: { type: "boolean", description: "required opt-in when changing a private channel to open (acknowledges exposing its history)" } }, required: ["channel"] } },
@@ -22182,12 +24070,17 @@ var TOOLS = [
   { name: "buzz_files", description: "List the files shared in a channel (or DM): filename, type, size, who shared it, when, and the message <id> + `index` to pass to buzz_attachment_read. Read-only; nothing is downloaded. `limit` = messages scanned (default 200, max 500).", inputSchema: { type: "object", properties: { channel: CH, limit: { type: "number", description: "messages to scan (default 200, max 500)" } }, required: ["channel"] } },
   { name: "buzz_presence", description: "Who's online: presence for one or more people (`users`: npub / hex / email in wire mode / exact display name), or for a channel's members (`channel`). Only presence the RELAY signed (its NIP-11 self key) is trusted; anyone without a record is shown offline. Read-only.", inputSchema: { type: "object", properties: { users: { type: "array", items: { type: "string" }, maxItems: 50, description: "people to look up" }, channel: CH } } },
   { name: "buzz_emoji", description: "List the workspace's custom emoji (the union of every member's NIP-30 kind:30030 set): :shortcode: and image URL. Optional `query` filters by shortcode substring. Read-only; the URLs are listed as text and never fetched.", inputSchema: { type: "object", properties: { query: { type: "string", description: "only shortcodes containing this" } } } },
+  // ---- v0.2.33 Slack-parity batch 2 ----
+  { name: "buzz_mark_read", description: "Mark a channel or DM read (like Slack's mark-as-read) \u2014 NIP-RS read state (kind 30078), NIP-44 encrypted to you so the relay can't read it, synced with other Buzz clients. `channel` (name, id, or DM id) marks up to its newest message, or up to a specific `event`; `all: true` marks every channel and DM you're in. Only moves forward (never marks unread). Agent mode only \u2014 refused in wire / post-as-me mode.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "channel name / id, or a DM's channel id" }, event: { type: "string", description: "mark read up to this message <id> (default: the newest)" }, all: { type: "boolean", description: "mark every channel and DM you're in" } } } },
+  { name: "buzz_save", description: "Save a message for later (like Slack's Saved items) \u2014 your NIP-51 bookmark list (kind 10003). Private by default (NIP-44 encrypted to you); `private: false` makes the entry public. `remove: true` unsaves it. Agent mode only for now (kind 10003 isn't on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, event: EV, remove: { type: "boolean", description: "unsave instead of save" }, private: { type: "boolean", description: "default true (encrypted); false = public entry" } }, required: ["channel", "event"] } },
+  { name: "buzz_saved", description: "List your saved messages (NIP-51 kind 10003), newest first, with where each one is. Private entries are only readable in agent mode. Read-only; message text is untrusted.", inputSchema: { type: "object", properties: { limit: { type: "number", description: "max items (default 50, max 200)" } } } },
+  { name: "buzz_post_diff", description: "Post a code diff to a channel as a rich diff message (kind 40008) that Buzz clients render with syntax highlighting. `diff` (unified diff text, \u2264 60 KB), `repo` (http/https URL) and `commit` (7\u201364 hex) are required; optional `file`, `parent_commit`, `source_branch` + `target_branch` (together), `pr` number, `language`, `description`, `truncated`. `event` posts it as a thread reply. Agent mode only for now (kind 40008 isn't on Ekam's wire-sign allowlist).", inputSchema: { type: "object", properties: { channel: CH, diff: { type: "string", description: "unified diff text (\u2264 60 KB)" }, repo: { type: "string", description: "repository URL (http/https)" }, commit: { type: "string", description: "commit SHA (7\u201364 hex)" }, file: { type: "string", description: "file path within the repo" }, parent_commit: { type: "string" }, source_branch: { type: "string" }, target_branch: { type: "string" }, pr: { type: "integer", description: "pull request number" }, language: { type: "string", description: "language id for highlighting (e.g. rust)" }, description: { type: "string", description: "one-line description (\u2264500 chars)" }, truncated: { type: "boolean", description: "set true if you cut the diff down to fit" }, event: { type: "string", description: "post as a reply in this message's thread" } }, required: ["channel", "diff", "repo", "commit"] } },
   { name: "buzz_dm_hide", description: "Hide a DM conversation from your DM list (kind 41012). Identify it by `channel` (dm id) or `to` (the other person of a 1:1). Not available in wire / post-as-me mode (Ekam deliberately doesn't sign kind 41012) \u2014 agent key only.", inputSchema: { type: "object", properties: { channel: { type: "string", description: "the DM's channel id" }, to: { type: "string", description: "the other person of a 1:1 DM" } } } }
 ];
 var ANNOTATIONS = {
-  readOnly: ["buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
+  readOnly: ["buzz_saved", "buzz_message_link", "buzz_activity", "buzz_files", "buzz_presence", "buzz_emoji", "buzz_whoami", "buzz_channels", "buzz_agents", "buzz_search", "buzz_channel_members", "buzz_read", "buzz_attachment_read", "buzz_dm_list", "buzz_dm_read", "buzz_unread", "buzz_doctor", "buzz_thread_read", "buzz_profile", "buzz_reactions"],
   destructive: ["buzz_remove_member", "buzz_delete", "buzz_edit_channel", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_unreact", "buzz_edit_message", "buzz_status_clear", "buzz_dm_hide"],
-  idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel"]
+  idempotent: ["buzz_setname", "buzz_join_channel", "buzz_add_member", "buzz_remove_member", "buzz_delete", "buzz_dm_open", "buzz_status_set", "buzz_status_clear", "buzz_channel_topic", "buzz_leave_channel", "buzz_archive_channel", "buzz_delete_channel", "buzz_edit_message", "buzz_unreact", "buzz_dm_add", "buzz_dm_hide", "buzz_login", "buzz_edit_channel", "buzz_profile_set", "buzz_mark_read", "buzz_save"]
 };
 var ARG_BOUNDS = {
   limit: { minimum: 1, maximum: 200 },
@@ -22213,6 +24106,17 @@ var ARG_BOUNDS = {
   description: { maxLength: 2e3 },
   topic: { maxLength: 2e3 },
   purpose: { maxLength: 2e3 },
+  about: { maxLength: 2e3 },
+  picture: { maxLength: 2048 },
+  diff: { maxLength: 65536 },
+  repo: { maxLength: 2048 },
+  commit: { maxLength: 64 },
+  parent_commit: { maxLength: 64 },
+  file: { maxLength: 512 },
+  source_branch: { maxLength: 255 },
+  target_branch: { maxLength: 255 },
+  language: { maxLength: 64 },
+  pr: { minimum: 1, maximum: 4294967295 },
   from: { maxLength: 320 },
   after: { maxLength: 40 },
   before: { maxLength: 40 },
@@ -22331,11 +24235,19 @@ async function callTool(req) {
   transport: ${TRANSPORT_WEDGED ? "\u26A0 undici pool wedged \u2014 self-healing via fresh node:https sockets (reads/posts still work); a full client RESTART clears it" : "ok"}
   NOTE: the deploy SHA above is the LIVE prod build (relay's software_sha) \u2014 compare it before claiming "X is deployed". reachable \u2260 up-to-date.`);
     }
-    if (name === "buzz_setname") {
+    if (name === "buzz_setname" || name === "buzz_profile_set") {
+      const alias = name === "buzz_setname";
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 key ${PK.slice(0, 16)}\u2026 \u2260 pinned ${EXPECTED_PK.slice(0, 16)}\u2026 (running as ${MY_NAME}). Not writing a profile as the wrong agent.` }], isError: true };
-      if (signer.mode === "wire") return { content: [{ type: "text", text: `refused: wire mode posts as the user \u2014 the display name is the user's own profile (kind:0), not settable from the shim.` }], isError: true };
-      await publishProfile(a.name);
-      return ok(`renamed this session to "${a.name}" on the fleet.`);
+      if (signer.mode === "wire" || !signer.canSign(0)) return { content: [{ type: "text", text: `refused: ${name}: wire mode posts as the user \u2014 your profile (kind 0) is your own and kind 0 is blocked on Ekam wire-sign allowlist, so it can't be set from the shim yet (pending Ekam allowing kind 0). Nothing was sent.` }], isError: true };
+      const v = validateProfilePatch(alias ? { name: a.name } : { name: a.name, about: a.about, picture: a.picture });
+      if (v.error) return fail(`${name}: ${v.error}`);
+      const existing = await ownProfile();
+      await publishProfile(v.patch.name || MY_NAME, v.patch, existing);
+      const parts = [];
+      if (v.patch.name != null) parts.push(`name "${escapeName(v.patch.name)}"`);
+      if (v.patch.about != null) parts.push(`about (${[...v.patch.about].length} chars)`);
+      if (v.patch.picture != null) parts.push(v.patch.picture ? `picture ${escapeContent(v.patch.picture, { cap: 200 })}` : "picture cleared");
+      return ok(alias ? `renamed this session to "${escapeName(v.patch.name)}" on the fleet. (buzz_setname is deprecated \u2014 use buzz_profile_set { name }.)` : `profile updated: ${parts.join(", ")}. Other profile fields were kept.`);
     }
     if (name === "buzz_channels") {
       const scopeArg = a.scope == null ? "member" : String(a.scope);
@@ -22512,7 +24424,7 @@ ${up.url}` : up.url;
       if (isText) {
         const full = readFileSync3(dest, "utf8");
         const CAP = 200 * 1024;
-        const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes3(6).toString("hex")}>>>`;
+        const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes4(6).toString("hex")}>>>`;
         const body = full.length > CAP ? `${full.slice(0, CAP)}
 \u2026[truncated ${full.length - CAP} chars \u2014 full file at ${dest}]` : full;
         return ok(`\u{1F4CE} ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(size / 1024).toFixed(0)} KB) from #${escapeName(ch.name)} \u2014 saved at ${dest}
@@ -22886,7 +24798,7 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
     if (name === "buzz_status_set") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not setting a status as the wrong identity.` }], isError: true };
       if (!signer.canSign(STATUS_KIND))
-        return { content: [{ type: "text", text: "buzz_status_set: status (kind 30315) isn't in the wire-sign allowlist \u2014 agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+        return { content: [{ type: "text", text: "buzz_status_set: status (kind 30315) is blocked on Ekam wire-sign allowlist \u2014 agent-mode only until Ekam signs it for post-as-me. Nothing was sent." }], isError: true };
       const text = typeof a.text === "string" ? a.text : "";
       const tags = [["d", "general"]];
       const emoji2 = a.emoji && String(a.emoji).trim();
@@ -22899,16 +24811,57 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
     if (name === "buzz_status_clear") {
       if (!IDENTITY_OK) return { content: [{ type: "text", text: `refused: impersonation guard \u2014 this session's key ${PK.slice(0, 16)}\u2026 \u2260 pinned identity ${(EXPECTED_PK || "").slice(0, 16)}\u2026. Not clearing a status as the wrong identity.` }], isError: true };
       if (!signer.canSign(STATUS_KIND))
-        return { content: [{ type: "text", text: "buzz_status_clear: status (kind 30315) isn't in the wire-sign allowlist \u2014 agent-mode only (Ekam doesn't sign it for post-as-me yet)." }], isError: true };
+        return { content: [{ type: "text", text: "buzz_status_clear: status (kind 30315) is blocked on Ekam wire-sign allowlist \u2014 agent-mode only until Ekam signs it for post-as-me. Nothing was sent." }], isError: true };
       const tags = [["d", "general"]];
       if (AUTH_TAG) tags.push(AUTH_TAG);
       const ev = await signer.sign({ kind: STATUS_KIND, tags, content: "" });
       await bridge("/events", ev);
       return ok("status cleared.");
     }
+    let rsFallbackNote = null;
+    if (name === "buzz_unread" && signer.selfCipher) {
+      const hours = Number.isFinite(a.hours) && a.hours > 0 ? Math.min(a.hours, 720) : 24;
+      const nowS = Math.floor(Date.now() / 1e3);
+      const fallbackSince = nowS - Math.floor(hours * 3600);
+      let rs = null, rsErr = null;
+      try {
+        rs = await loadReadState();
+      } catch (e) {
+        rsErr = e;
+      }
+      if (rs) {
+        const cs = await channels();
+        const dms = await dmChannels();
+        await profiles();
+        const meta2 = /* @__PURE__ */ new Map();
+        for (const c of cs) meta2.set(c.id, `#${escapeName(c.name)}`);
+        for (const d of dms) meta2.set(d.id, `DM ${d.others.map((p) => who(p)).join(", ") || "(self)"}`);
+        const ids = [...meta2.keys()];
+        if (!ids.length) return ok("no channels or DMs to scan.");
+        const fr = frontiers(rs.merged);
+        const floor = nowS - 30 * 86400;
+        const marks = ids.map((id) => fr[id]).filter((v) => v != null);
+        const since = Math.max(floor, Math.min(fallbackSince, ...marks.map((m) => m + 1)));
+        const evs = screen(await query([{ kinds: [9], "#h": ids, since, limit: 2e3 }])).events;
+        const stat = unreadCounts(evs, fr, { me: PK, channelIds: ids, fallbackSince });
+        const active = [...stat.entries()].filter(([, s]) => s.unread > 0).sort((x, y) => y[1].unread - x[1].unread);
+        const marked = ids.filter((id) => fr[id] != null).length;
+        const head = `Unread (NIP-RS read state: ${rs.used} blob(s), ${marked} of ${ids.length} conversation(s) have a read marker${rs.skipped ? `; ${rs.skipped} unreadable blob(s) ignored` : ""})`;
+        const capNote = evs.length >= 2e3 ? "\n(scan capped at 2000 messages \u2014 counts may be low)" : "";
+        if (!active.length) return ok(`${head}: nothing unread.${capNote}`);
+        const lines = active.map(([id, s]) => `  ${meta2.get(id)}  \u2014  ${s.unread} unread${s.mentions ? `  (${s.mentions} @you)` : ""}${s.noMarker ? `  (no read marker \u2014 last ${hours}h)` : ""}`);
+        const tot = active.reduce((n, [, s]) => n + s.unread, 0), totM = active.reduce((n, [, s]) => n + s.mentions, 0);
+        return ok(`${head}:
+${lines.join("\n")}
+Totals: ${tot} unread, ${totM} @mention(s) of you. Mark read with buzz_mark_read.${capNote}`);
+      }
+      rsFallbackNote = `read state unavailable (${escapeContent(rsErr && rsErr.message, { cap: 120 })}) \u2014 heuristic shown`;
+    }
     if (name === "buzz_unread") {
       const hours = Number.isFinite(a.hours) && a.hours > 0 ? Math.min(a.hours, 720) : 24;
       const since = Math.floor(Date.now() / 1e3) - Math.floor(hours * 3600);
+      const rsNote = rsFallbackNote ? `
+(${rsFallbackNote})` : signer.selfCipher ? "" : "\n(heuristic: real read state needs agent mode \u2014 wire mode can't decrypt your NIP-44 read state)";
       const cs = await channels();
       const dms = await dmChannels();
       const names = await profiles();
@@ -22930,13 +24883,13 @@ ${UNTRUSTED_NOTE}${scr.note ? "\n" + scr.note : ""}
         stat.set(id, s);
       }
       const active = [...stat.entries()].sort((x, y) => y[1].msgs - x[1].msgs);
-      if (!active.length) return ok(`Unread digest (last ${hours}h): no new messages across ${ids.length} channel(s)/DM(s).`);
+      if (!active.length) return ok(`Unread digest (last ${hours}h): no new messages across ${ids.length} channel(s)/DM(s).${rsNote}`);
       const totMsgs = active.reduce((n, [, s]) => n + s.msgs, 0);
       const totMentions = active.reduce((n, [, s]) => n + s.mentions, 0);
       const lines = active.map(([id, s]) => `  ${meta2.get(id)}  \u2014  ${s.msgs} new${s.mentions ? `  (${s.mentions} @you)` : ""}`);
       return ok(`Unread digest (last ${hours}h) \u2014 ${active.length} active of ${ids.length}:
 ${lines.join("\n")}
-Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.`);
+Totals: ${totMsgs} new, ${totMentions} @mention(s) of you.${rsNote}`);
     }
     if (name === "buzz_login") {
       const env = process.env;
@@ -22972,7 +24925,7 @@ After you approve, run buzz_login again \u2014 or buzz_whoami \u2014 to confirm.
         return { content: [{ type: "text", text: "buzz_login: no OAuth client id \u2014 pass `client_id` or set the BUZZ_EKAM_CLIENT_ID env var (from the Ekam DCR registration). Without it the wire-sign login can't start." }], isError: true };
       const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
       const { verifier, challenge: challenge2 } = pkce();
-      const state = randomBytes3(16).toString("base64url");
+      const state = randomBytes4(16).toString("base64url");
       const { srv, port } = await bindLoopback(ports);
       const redirectUri = `http://127.0.0.1:${port}/callback`;
       const authUrl = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
@@ -23334,4 +25287,7 @@ await server.connect(new StdioServerTransport());
 @noble/curves/abstract/weierstrass.js:
 @noble/curves/secp256k1.js:
   (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
+
+@noble/ciphers/utils.js:
+  (*! noble-ciphers - MIT License (c) 2023 Paul Miller (paulmillr.com) *)
 */
