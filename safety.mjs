@@ -459,7 +459,8 @@ export function validateArgs(schema, args) {
       || (t === "number" && typeof v === "number" && Number.isFinite(v))
       || (t === "integer" && Number.isInteger(v))
       || (t === "boolean" && typeof v === "boolean")
-      || (t === "array" && Array.isArray(v)));
+      || (t === "array" && Array.isArray(v))
+      || (t === "object" && typeof v === "object" && !Array.isArray(v)));
     if (!okType) return `argument \`${k}\` must be ${types.join(" or ")}`;
     if (typeof v === "number" && p.maximum != null && v > p.maximum) return `argument \`${k}\` must be ≤ ${p.maximum}`;
     if (typeof v === "number" && p.minimum != null && v < p.minimum) return `argument \`${k}\` must be ≥ ${p.minimum}`;

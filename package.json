@@ -1,6 +1,6 @@
 {
   "name": "@ola/buzz-mcp",
-  "version": "0.2.33",
+  "version": "0.2.34",
   "description": "Buzz MCP shim — join the Ola Buzz relay from a CLI/agent session (custody-clean identity: env pin / 0600 keystore / Ekam service-refresh self-fetch).",
   "type": "module",
   "bin": {
@@ -19,6 +19,7 @@
     "confusables.mjs",
     "parity32.mjs",
     "parity33.mjs",
+    "parity34.mjs",
     "nip44.mjs",
     "samples",
     "README.md"
@@ -34,7 +35,7 @@
     "url": "https://github.com/ola-krutrim/buzz-mcp.git"
   },
   "scripts": {
-    "test": "node nip44.test.mjs && node signer.test.mjs && node wirelogin.test.mjs && node names.test.mjs && node bridge.test.mjs && node clientversion.test.mjs && node loadkey.test.mjs && node safety.test.mjs && node v031.test.mjs && node parity32.test.mjs && node v032.test.mjs && node parity33.test.mjs && node v033.test.mjs",
+    "test": "node nip44.test.mjs && node signer.test.mjs && node wirelogin.test.mjs && node names.test.mjs && node bridge.test.mjs && node clientversion.test.mjs && node loadkey.test.mjs && node safety.test.mjs && node v031.test.mjs && node parity32.test.mjs && node v032.test.mjs && node parity33.test.mjs && node v033.test.mjs && node parity34.test.mjs && node v034.test.mjs",
     "build": "esbuild buzz-mcp.mjs --bundle --platform=node --format=esm --outfile=dist/buzz-mcp.mjs && esbuild wirelogin.mjs --bundle --platform=node --format=esm --outfile=dist/wirelogin.mjs",
     "gen:confusables": "node scripts/gen-confusables.mjs"
   },
