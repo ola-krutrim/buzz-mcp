@@ -14,6 +14,7 @@
 // This module never imports buzz-mcp.mjs (the factory is passed in): buzz-mcp.mjs's entry does a
 // top-level-await import of this file, and a cycle would deadlock.
 import { createServer } from "node:http";
+import { isIP, BlockList } from "node:net";
 import { randomUUID, createHash } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -55,6 +56,57 @@ export function redact(s) {
     .replace(/("?(?:access_token|subject_token|refresh_token|id_token|client_secret|token)"?\s*[:=]\s*"?)[^"\s,&}]+/gi, "$1[redacted]");
 }
 
+// ---- client address for the pre-auth limiter ----
+// Default: the socket peer. Behind an ingress that is the ingress pod, so every client shares one
+// bucket; set BUZZ_HOSTED_TRUSTED_PROXY_HOPS=N (opt-in) to take the client from X-Forwarded-For
+// instead: the N-th entry counted from the RIGHT (N = number of proxies you run that each append the
+// address they saw; ingress-nginx alone → 1). Entries to the left of that are client-supplied and are
+// never used. Optional BUZZ_HOSTED_TRUSTED_PROXY_CIDRS limits this to requests whose socket peer is
+// one of your proxies; from anyone else X-Forwarded-For is ignored. With HOPS unset/0, X-Forwarded-For
+// is never read. Any doubt (header missing, fewer entries than hops, not an IP) → the socket peer.
+export const normIp = (a) => {
+  let s = String(a ?? "").trim();
+  if (/^\[[0-9a-f:.]+\](?::\d+)?$/i.test(s)) s = s.slice(1, s.indexOf("]"));        // [v6] / [v6]:port
+  else if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(s)) s = s.slice(0, s.lastIndexOf(":")); // v4:port
+  s = s.toLowerCase();
+  if (s.startsWith("::ffff:") && isIP(s.slice(7)) === 4) s = s.slice(7);                // v4-mapped v6
+  return isIP(s) ? s : null;
+};
+export function trustedProxyConfig(env = process.env) {
+  const rawHops = String(env.BUZZ_HOSTED_TRUSTED_PROXY_HOPS ?? "").trim();
+  let hops = 0;
+  if (rawHops !== "") {
+    if (!/^\d+$/.test(rawHops) || Number(rawHops) > 10) throw new Error(`BUZZ_HOSTED_TRUSTED_PROXY_HOPS must be an integer 0..10 (got "${rawHops}")`);
+    hops = Number(rawHops);
+  }
+  const cidrs = list(env.BUZZ_HOSTED_TRUSTED_PROXY_CIDRS);
+  if (cidrs.length && !hops) throw new Error("BUZZ_HOSTED_TRUSTED_PROXY_CIDRS is set but BUZZ_HOSTED_TRUSTED_PROXY_HOPS is 0 — set the hop count too (X-Forwarded-For is only read when HOPS ≥ 1)");
+  let trusted = null;
+  if (cidrs.length) {
+    trusted = new BlockList();
+    for (const c of cidrs) {
+      const [addr, bits, extra] = c.split("/");
+      const a = normIp(addr), fam = a ? isIP(a) : 0, max = fam === 6 ? 128 : 32;
+      const n = bits == null ? max : (/^\d+$/.test(bits) ? Number(bits) : NaN);
+      if (!a || extra != null || !Number.isInteger(n) || n < 0 || n > max) throw new Error(`BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: bad entry "${c}"`);
+      trusted.addSubnet(a, n, fam === 6 ? "ipv6" : "ipv4");
+    }
+  }
+  return Object.freeze({ hops, trusted, cidrs });
+}
+export function makeClientIp({ hops = 0, trusted = null } = {}) {
+  return (req) => {
+    const sock = normIp(req.socket && req.socket.remoteAddress) || "?";
+    if (!hops) return sock;
+    if (trusted && (sock === "?" || !trusted.check(sock, isIP(sock) === 6 ? "ipv6" : "ipv4"))) return sock;
+    const raw = req.headers && req.headers["x-forwarded-for"];
+    if (raw == null) return sock;
+    const parts = (Array.isArray(raw) ? raw.join(",") : String(raw)).split(",").map((x) => x.trim());
+    if (parts.length < hops) return sock;
+    return normIp(parts[parts.length - hops]) || sock;
+  };
+}
+
 function bucket(perMin, now) {
   const m = new Map();
   return (key) => {
@@ -80,7 +132,9 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
     allowedOrigins: list(env.BUZZ_HOSTED_ALLOWED_ORIGINS),
     allowedHosts: list(env.BUZZ_HOSTED_ALLOWED_HOSTS).map((h) => h.toLowerCase()),
     jsonResponse: env.BUZZ_HOSTED_JSON_RESPONSE === "1",
+    pubkeyTtlMs: int(env.BUZZ_HOSTED_PUBKEY_TTL_S, 3600, 60, 86400) * 1000,
   };
+  const proxy = trustedProxyConfig(env);
   if (cfg.clientId === "REPLACE_WITH_EKAM_CLIENT_ID" && env.BUZZ_HOSTED_ALLOW_PLACEHOLDER !== "1" && listen)
     process.stderr.write("[buzz-mcp] ⚠ BUZZ_HOSTED_CLIENT_ID is the placeholder — token exchange will fail until Ekam issues a client id.\n");
   const write = logSink || ((o) => process.stdout.write(JSON.stringify(o) + "\n"));
@@ -90,10 +144,16 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
   const validate = createTokenValidator(cfg, { fetch: fetchFn, now, metadata: meta });
   const store = createEncryptedTokenStore({ path: cfg.tokenStorePath, keyB64: cfg.tokenStoreKey, now });
   const exchanger = createTokenExchanger(cfg, { fetch: fetchFn, now, metadata: meta, store });
-  const userLimit = bucket(O.perMin, now), anonLimit = bucket(O.anonPerMin, now);
+  // preAuthLimit: per client address, charged BEFORE validate() for every bearer this pod has not
+  // already validated (so junk bearers can't buy upstream introspection / JWKS work). userLimit: per
+  // person, after validation.
+  const userLimit = bucket(O.perMin, now), preAuthLimit = bucket(O.anonPerMin, now);
   const CORE_ENV = coreEnv(env);
   const signBase = cfg.signBase;
-  const pubkeys = new Map();            // sub → person's pubkey (learned via a wire-sign probe, never a key fetch)
+  const pubkeys = new Map();            // sub → { pk, at }: person's pubkey (learned via a wire-sign probe, never a key fetch)
+  const PUBKEYS_MAX = 50_000;
+  const pubkeyGet = (sub) => { const e = pubkeys.get(sub); if (!e) return null; if (now() - e.at < O.pubkeyTtlMs) return e.pk; pubkeys.delete(sub); return null; };
+  const pubkeySet = (sub, pk) => { pubkeys.delete(sub); pubkeys.set(sub, { pk, at: now() }); while (pubkeys.size > PUBKEYS_MAX) pubkeys.delete(pubkeys.keys().next().value); };
   const writeGuards = new Map();        // sub → per-USER write guard (shared across that person's sessions)
   const guardFor = (sub) => { let g = writeGuards.get(sub); if (!g) { g = createWriteGuard({ perMin: writeLimitFromEnv(env) }); writeGuards.set(sub, g); } return g; };
   const sessions = new Map();           // sid → session
@@ -110,7 +170,7 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
     if (s.coreP) return s.coreP;
     s.coreP = (async () => {
       const getToken = async (force = false) => (s.wireToken = await exchanger.get(s.principal, s.subjectToken, force));
-      let pk = pubkeys.get(s.sub);
+      let pk = pubkeyGet(s.sub);         // re-probed after BUZZ_HOSTED_PUBKEY_TTL_S (key rotation / re-provisioning)
       if (!pk) {
         const t0 = await getToken(false);   // exchange errors are already sanitised; don't relabel them
         try { pk = await probeWirePubkey(signBase, t0, fetchFn); }
@@ -119,7 +179,7 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
           else if (e.code === "buzz_app_signin_required" || isBuzzAppSigninError({ status: e.status, error: e.ekamError === "forbidden" ? null : e.ekamError })) { const x = new Error(BUZZ_APP_SIGNIN_MESSAGE); x.code = "buzz_app_signin_required"; throw x; }
           else throw hostedWireError(e, 27235);
         }
-        pubkeys.set(s.sub, pk);
+        pubkeySet(s.sub, pk);
       }
       const signer = makeHostedWireSigner({ pubkey: pk, getToken, base: signBase, fetch: fetchFn });
       const core = await createBuzzServer({ hosted: true, env: CORE_ENV, signer, displayName: s.principal.name || null, writeGuard: guardFor(s.sub) });
@@ -193,7 +253,11 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
-  const clientIp = (req) => String(req.socket.remoteAddress || "?");
+  const clientIp = makeClientIp(proxy);
+  // Every 429 on /mcp still carries the Bearer challenge (resource_metadata), so a client that is
+  // throttled can still discover the AS and re-authenticate instead of being stuck.
+  const limited = (res, wait, why) => send(res, 429, { error: "rate_limited", error_description: why },
+    { "Retry-After": String(wait), "WWW-Authenticate": challenge(null) });
 
   async function handle(req, res) {
     const t0 = now();
@@ -217,18 +281,25 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
 
     const auth = String(req.headers.authorization || "");
     const m = /^Bearer[ ]+([^\s]+)$/i.exec(auth);
-    if (!m) { const wait = anonLimit(clientIp(req)); if (wait) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait) }); return send(res, 401, { error: "unauthorized" }, { "WWW-Authenticate": challenge(null) }); }
-    let principal;
-    try { principal = await validate(m[1]); }
-    catch (e) {
-      const wait = anonLimit(clientIp(req)); if (wait) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait) });
-      const ae = e instanceof AuthError ? e : new AuthError(401, "invalid_token", "token could not be validated");
-      if (!(e instanceof AuthError)) log("auth_error", { err: scrub(e && e.message, m[1]) });
-      return send(res, ae.status, { error: ae.error, error_description: ae.description }, { "WWW-Authenticate": challenge(ae) });
+    // No bearer: the 401 challenge is static and costs nothing upstream, so it is never rate limited —
+    // a client must always be able to learn where to (re-)authenticate.
+    if (!m) return send(res, 401, { error: "unauthorized" }, { "WWW-Authenticate": challenge(null) });
+    let principal = validate.cached(m[1]);
+    if (!principal) {
+      // Charge the client address BEFORE validate(): an unknown bearer may cost an introspection call
+      // (or a JWKS refetch) at Ekam, so junk bearers are capped per client, not per pod.
+      const pre = preAuthLimit(clientIp(req));
+      if (pre) return limited(res, pre, "too many unauthenticated requests from this address");
+      try { principal = await validate(m[1]); }
+      catch (e) {
+        const ae = e instanceof AuthError ? e : new AuthError(401, "invalid_token", "token could not be validated");
+        if (!(e instanceof AuthError)) log("auth_error", { err: scrub(e && e.message, m[1]) });
+        return send(res, ae.status, { error: ae.error, error_description: ae.description }, { "WWW-Authenticate": challenge(ae) });
+      }
     }
     user = hashSub(principal.sub);
     const wait = userLimit(principal.sub);
-    if (wait) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait) });
+    if (wait) return limited(res, wait, "too many requests");
 
     let body;
     if (req.method === "POST") {
@@ -273,5 +344,5 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
     const stop = () => { log("shutdown", {}); close().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 10_000).unref(); };
     process.once("SIGTERM", stop); process.once("SIGINT", stop);
   }
-  return { httpServer, close, sessions, config: cfg, exchanger, tools: TOOLS, handle };
+  return { httpServer, close, sessions, config: cfg, exchanger, tools: TOOLS, handle, proxy, pubkeyCacheSize: () => pubkeys.size };
 }

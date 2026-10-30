@@ -6,13 +6,16 @@
 //   hostedConfig(env)              → config (endpoints + client id from env; placeholders, no secrets)
 //   createAsMetadata(cfg, deps)    → cached Ekam authorization-server metadata (RFC 8414)
 //   createTokenValidator(cfg, deps)→ validate(bearer) → principal {sub, name, email, scopes, exp}
-//                                     JWKS (RFC 7515/7517/7519) or introspection (RFC 7662)
+//                                     JWKS (RFC 7515/7517/7519) or introspection (RFC 7662);
+//                                     validate.cached(bearer) → principal | null, synchronous, no I/O
+//                                     (lets the HTTP layer charge its pre-auth limit before any
+//                                     upstream work for a bearer it has not already validated)
 //   createTokenExchanger(cfg, deps)→ get(principal, subjectToken, force) → wire:sign access token
 //                                     RFC 8693 token exchange, cached per user in memory (+ optional
 //                                     AES-256-GCM encrypted-at-rest store)
 //   protectedResourceMetadata(cfg) → RFC 9728 document
 import { createHash, createPublicKey, verify as cryptoVerify, createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync, writeFileSync, renameSync, existsSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, chmodSync, unlinkSync } from "node:fs";
 import { isBuzzAppSigninError, buzzAppSigninError } from "./signer.mjs";
 
 export const DEFAULT_RESOURCE = "https://mcp.buzz.ola.in";
@@ -115,7 +118,11 @@ function principalFrom(c, exp) {
   return Object.freeze({ sub, name: nm, email: typeof c.email === "string" ? c.email : null, scopes: scopeList(c), exp, clientId: c.client_id || c.azp || null });
 }
 
-function checkClaims(cfg, c, nowS) {
+// requireIss: a JWT must name its issuer (RFC 9068 §2.2 makes iss REQUIRED in a JWT access token).
+// An RFC 7662 introspection response may omit iss (it is OPTIONAL there and the response came from
+// the issuer's own endpoint), but when present it must still match.
+function checkClaims(cfg, c, nowS, { requireIss = false } = {}) {
+  if (requireIss && (typeof c.iss !== "string" || !c.iss.trim())) throw new AuthError(401, "invalid_token", "token has no issuer");
   if (c.iss != null && trimSlash(c.iss) !== cfg.issuer) throw new AuthError(401, "invalid_token", "token issuer is not Ekam");
   if (!audList(c.aud).includes(cfg.resource) && !audList(c.resource).includes(cfg.resource))
     throw new AuthError(401, "invalid_token", `token audience is not ${cfg.resource}`);
@@ -143,8 +150,15 @@ function verifyJwtSig(alg, jwk, signingInput, sig) {
 export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.now, metadata } = {}) {
   const meta = metadata || createAsMetadata(cfg, { fetch: fetchFn, now });
   let jwks = null, jwksAt = 0, jwksMissAt = 0;
-  const introCache = new Map(); // sha256(token) → { p, until }
+  const introCache = new Map(); // sha256(token) → { p, until }   (introspection results)
+  const jwtCache = new Map();   // sha256(token) → { p, until }   (signature + claims already verified)
   const INTRO_TTL = 60_000, INTRO_MAX = 10_000;
+  const tokenKey = (t) => createHash("sha256").update(t).digest("hex");
+  const remember = (m, key, p) => {
+    if (m.size >= INTRO_MAX) m.delete(m.keys().next().value);
+    m.set(key, { p, until: Math.min(now() + INTRO_TTL, p.exp * 1000) });
+  };
+  const recall = (m, key) => { const hit = m.get(key); if (!hit) return null; if (hit.until > now()) return hit.p; m.delete(key); return null; };
 
   async function jwksUri() { return cfg.jwksUri || (await meta()).jwks_uri || null; }
   async function loadJwks(force) {
@@ -156,6 +170,9 @@ export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.n
     return jwks;
   }
   async function viaJwks(token) {
+    const key = tokenKey(token);
+    const hit = recall(jwtCache, key);
+    if (hit) return hit;
     const [h, p, s] = token.split(".");
     let header, claims;
     try { header = b64urlJson(h); claims = b64urlJson(p); } catch { throw new AuthError(401, "invalid_token", "malformed token"); }
@@ -167,12 +184,14 @@ export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.n
     const sig = Buffer.from(s, "base64url");
     const good = cands.some((k) => { try { return verifyJwtSig(header.alg, k, `${h}.${p}`, sig); } catch { return false; } });
     if (!good) throw new AuthError(401, "invalid_token", "token signature invalid");
-    return checkClaims(cfg, claims, Math.floor(now() / 1000));
+    const pr = checkClaims(cfg, claims, Math.floor(now() / 1000), { requireIss: true });
+    remember(jwtCache, key, pr);
+    return pr;
   }
   async function viaIntrospection(token) {
-    const key = createHash("sha256").update(token).digest("hex");
-    const hit = introCache.get(key);
-    if (hit && hit.until > now()) return hit.p;
+    const key = tokenKey(token);
+    const hit = recall(introCache, key);
+    if (hit) return hit;
     const ep = cfg.introspectionEndpoint || (await meta()).introspection_endpoint;
     if (!ep) throw new AuthError(401, "invalid_token", "no introspection endpoint configured");
     const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
@@ -184,21 +203,34 @@ export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.n
     catch (e) { throw new AuthError(401, "invalid_token", `token could not be introspected (${e.status ? `HTTP ${e.status}` : "unreachable"})`); }
     if (j.active !== true) throw new AuthError(401, "invalid_token", "token is not active");
     const p = checkClaims(cfg, j, Math.floor(now() / 1000));
-    if (introCache.size >= INTRO_MAX) introCache.delete(introCache.keys().next().value);
-    introCache.set(key, { p, until: Math.min(now() + INTRO_TTL, p.exp * 1000) });
+    remember(introCache, key, p);
     return p;
   }
-  return async function validate(token) {
+  async function validate(token) {
     if (typeof token !== "string" || !token || token.length > 8192) throw new AuthError(401, "invalid_token", "missing or oversized bearer token");
     if (cfg.validation === "introspection") return viaIntrospection(token);
     if (cfg.validation === "jwks") { if (!looksJwt(token)) throw new AuthError(401, "invalid_token", "token is not a JWT"); return viaJwks(token); }
     return looksJwt(token) ? viaJwks(token) : viaIntrospection(token); // auto
+  }
+  // Synchronous, no I/O: the principal for a bearer this validator already accepted (still within
+  // its cache window and its exp), else null. Only successes are cached, so junk never hits here.
+  validate.cached = (token) => {
+    if (typeof token !== "string" || !token || token.length > 8192) return null;
+    const key = tokenKey(token);
+    if (cfg.validation !== "introspection" && looksJwt(token)) return recall(jwtCache, key);
+    if (cfg.validation !== "jwks") return recall(introCache, key);
+    return null;
   };
+  return validate;
 }
 
 // ---- optional encrypted-at-rest token store (AES-256-GCM; never plaintext) ----
 const STORE_AAD = Buffer.from("buzz-mcp-hosted-tokens-v1");
-export function createEncryptedTokenStore({ path, keyB64, now = Date.now } = {}) {
+// tmpName is injectable for tests only; the default is unpredictable so a stale or planted file can't
+// collide, and the temp file is opened O_CREAT|O_EXCL ("wx"): it is never truncated or followed if
+// something already exists at that path (symlink included).
+const defaultTmpName = (path) => `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+export function createEncryptedTokenStore({ path, keyB64, now = Date.now, tmpName = defaultTmpName } = {}) {
   if (!path) return null;
   const key = keyB64 ? Buffer.from(keyB64, "base64") : null;
   if (!key || key.length !== 32) throw new Error("BUZZ_HOSTED_TOKEN_STORE is set but BUZZ_HOSTED_TOKEN_STORE_KEY is missing or not 32 bytes (base64) — refusing to store tokens without encryption");
@@ -216,10 +248,12 @@ export function createEncryptedTokenStore({ path, keyB64, now = Date.now } = {})
     const iv = randomBytes(12);
     const c = createCipheriv("aes-256-gcm", key, iv); c.setAAD(STORE_AAD);
     const ct = Buffer.concat([c.update(JSON.stringify(Object.fromEntries(m)), "utf8"), c.final()]);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ v: 1, iv: iv.toString("base64"), tag: c.getAuthTag().toString("base64"), ct: ct.toString("base64") }), { mode: 0o600 });
-    try { chmodSync(tmp, 0o600); } catch {}
-    renameSync(tmp, path);
+    const tmp = tmpName(path);
+    writeFileSync(tmp, JSON.stringify({ v: 1, iv: iv.toString("base64"), tag: c.getAuthTag().toString("base64"), ct: ct.toString("base64") }), { mode: 0o600, flag: "wx" });
+    try {
+      try { chmodSync(tmp, 0o600); } catch {}
+      renameSync(tmp, path);
+    } catch (e) { try { unlinkSync(tmp); } catch {} throw e; }
   };
   return { load, save };
 }
