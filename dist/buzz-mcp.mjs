@@ -13019,8 +13019,8 @@ var require_utils = __commonJS({
     var HOST_DELIMS = { "@": "%40", "/": "%2F", "?": "%3F", "#": "%23", ":": "%3A" };
     var HOST_DELIM_RE = /[@/?#:]/g;
     var HOST_DELIM_NO_COLON_RE = /[@/?#]/g;
-    function reescapeHostDelimiters(host, isIP) {
-      const re = isIP ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
+    function reescapeHostDelimiters(host, isIP2) {
+      const re = isIP2 ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
       re.lastIndex = 0;
       return host.replace(re, (ch) => HOST_DELIMS[ch]);
     }
@@ -13717,12 +13717,12 @@ var require_fast_uri = __commonJS({
       const host = matches[4];
       return hasMalformedPercentEncoding(matches[3]) || host !== void 0 && !isIPLiteral(host) && hasMalformedPercentEncoding(host) || hasMalformedPercentEncoding(matches[6]) || hasMalformedPercentEncoding(matches[7]) || hasMalformedPercentEncoding(matches[8]);
     }
-    function canonicalizeHost(parsed, options, schemeHandler, isIP) {
-      if (hasForbiddenDomainHost(parsed, options, schemeHandler, isIP)) {
+    function canonicalizeHost(parsed, options, schemeHandler, isIP2) {
+      if (hasForbiddenDomainHost(parsed, options, schemeHandler, isIP2)) {
         parsed.error = parsed.error || MALFORMED_HOST_ERROR;
         return true;
       }
-      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP === false && nonSimpleDomain(parsed.host)) {
+      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP2 === false && nonSimpleDomain(parsed.host)) {
         let url;
         try {
           url = new URL("http://" + parsed.host);
@@ -13738,9 +13738,9 @@ var require_fast_uri = __commonJS({
       }
       return false;
     }
-    function hasForbiddenDomainHost(parsed, options, schemeHandler, isIP) {
+    function hasForbiddenDomainHost(parsed, options, schemeHandler, isIP2) {
       return Boolean(
-        parsed.host && isIP === false && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && FORBIDDEN_DOMAIN_HOST_CHARACTER.test(parsed.host)
+        parsed.host && isIP2 === false && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && FORBIDDEN_DOMAIN_HOST_CHARACTER.test(parsed.host)
       );
     }
     function isHostOnlyURL(url) {
@@ -13763,7 +13763,7 @@ var require_fast_uri = __commonJS({
       let malformedHost = false;
       let malformedIPLiteral = false;
       let malformedScheme = false;
-      let isIP = false;
+      let isIP2 = false;
       if (options.reference === "suffix") {
         if (options.scheme) {
           uri = options.scheme + ":" + uri;
@@ -13825,15 +13825,15 @@ var require_fast_uri = __commonJS({
             const bracketedIPLiteral = isIPLiteral(parsed.host);
             const hasIPLiteralBracket = parsed.host.indexOf("[") !== -1 || parsed.host.indexOf("]") !== -1;
             const ipv6result = normalizeIPv6(parsed.host);
-            isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true;
+            isIP2 = ipv6result.isIPV6 || ipv6result.isIPVFuture === true;
             malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true);
-            parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase();
+            parsed.host = isIP2 ? ipv6result.host : ipv6result.host.toLowerCase();
             if (malformedIPLiteral) {
               parsed.error = parsed.error || MALFORMED_HOST_ERROR;
               malformedAuthorityOrPort = true;
             }
           } else {
-            isIP = true;
+            isIP2 = true;
           }
         }
         if (parsed.scheme === void 0 && parsed.userinfo === void 0 && parsed.host === void 0 && parsed.port === void 0 && parsed.query === void 0 && !parsed.path) {
@@ -13850,14 +13850,14 @@ var require_fast_uri = __commonJS({
         }
         const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme);
         if (!malformedIPLiteral) {
-          malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP);
+          malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP2);
         }
         if (uri.indexOf("%") !== -1 && parsed.host !== void 0 && !malformedIPLiteral) {
-          let host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true);
-          if (!isIP) {
+          let host = isIP2 ? parsed.host : normalizePercentEncoding(parsed.host, true);
+          if (!isIP2) {
             host = normalizePercentEncoding(host.toLowerCase());
           }
-          parsed.host = isIP || options.scheme !== "null" ? reescapeHostDelimiters(host, isIP) : host;
+          parsed.host = isIP2 || options.scheme !== "null" ? reescapeHostDelimiters(host, isIP2) : host;
         }
         if (!schemeHandler || schemeHandler && !schemeHandler.skipNormalize) {
           if (parsed.path) {
@@ -25038,7 +25038,7 @@ var init_streamableHttp = __esm({
 
 // hosted-auth.mjs
 import { createHash as createHash3, createPublicKey, verify as cryptoVerify, createCipheriv, createDecipheriv, randomBytes as randomBytes5, timingSafeEqual } from "node:crypto";
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, existsSync as existsSync3, chmodSync as chmodSync4 } from "node:fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, existsSync as existsSync3, chmodSync as chmodSync4, unlinkSync } from "node:fs";
 function hostedConfig(env = process.env) {
   const resource = trimSlash(env.BUZZ_HOSTED_RESOURCE || DEFAULT_RESOURCE);
   const issuer = trimSlash(env.BUZZ_HOSTED_ISSUER || env.BUZZ_EKAM_BASE || DEFAULT_ISSUER);
@@ -25124,7 +25124,8 @@ function principalFrom(c, exp) {
   const nm = [c.name, c.preferred_username, [c.given_name, c.family_name].filter(Boolean).join(" "), typeof c.email === "string" ? c.email.split("@")[0] : ""].map((x) => typeof x === "string" ? x.trim() : "").find(Boolean) || null;
   return Object.freeze({ sub, name: nm, email: typeof c.email === "string" ? c.email : null, scopes: scopeList(c), exp, clientId: c.client_id || c.azp || null });
 }
-function checkClaims(cfg, c, nowS) {
+function checkClaims(cfg, c, nowS, { requireIss = false } = {}) {
+  if (requireIss && (typeof c.iss !== "string" || !c.iss.trim())) throw new AuthError(401, "invalid_token", "token has no issuer");
   if (c.iss != null && trimSlash(c.iss) !== cfg.issuer) throw new AuthError(401, "invalid_token", "token issuer is not Ekam");
   if (!audList(c.aud).includes(cfg.resource) && !audList(c.resource).includes(cfg.resource))
     throw new AuthError(401, "invalid_token", `token audience is not ${cfg.resource}`);
@@ -25151,7 +25152,20 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
   const meta2 = metadata || createAsMetadata(cfg, { fetch: fetchFn, now: now2 });
   let jwks = null, jwksAt = 0, jwksMissAt = 0;
   const introCache = /* @__PURE__ */ new Map();
+  const jwtCache = /* @__PURE__ */ new Map();
   const INTRO_TTL = 6e4, INTRO_MAX = 1e4;
+  const tokenKey = (t) => createHash3("sha256").update(t).digest("hex");
+  const remember = (m, key, p) => {
+    if (m.size >= INTRO_MAX) m.delete(m.keys().next().value);
+    m.set(key, { p, until: Math.min(now2() + INTRO_TTL, p.exp * 1e3) });
+  };
+  const recall = (m, key) => {
+    const hit = m.get(key);
+    if (!hit) return null;
+    if (hit.until > now2()) return hit.p;
+    m.delete(key);
+    return null;
+  };
   async function jwksUri() {
     return cfg.jwksUri || (await meta2()).jwks_uri || null;
   }
@@ -25165,6 +25179,9 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     return jwks;
   }
   async function viaJwks(token) {
+    const key = tokenKey(token);
+    const hit = recall(jwtCache, key);
+    if (hit) return hit;
     const [h, p, s] = token.split(".");
     let header, claims;
     try {
@@ -25190,12 +25207,14 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
       }
     });
     if (!good) throw new AuthError(401, "invalid_token", "token signature invalid");
-    return checkClaims(cfg, claims, Math.floor(now2() / 1e3));
+    const pr = checkClaims(cfg, claims, Math.floor(now2() / 1e3), { requireIss: true });
+    remember(jwtCache, key, pr);
+    return pr;
   }
   async function viaIntrospection(token) {
-    const key = createHash3("sha256").update(token).digest("hex");
-    const hit = introCache.get(key);
-    if (hit && hit.until > now2()) return hit.p;
+    const key = tokenKey(token);
+    const hit = recall(introCache, key);
+    if (hit) return hit;
     const ep = cfg.introspectionEndpoint || (await meta2()).introspection_endpoint;
     if (!ep) throw new AuthError(401, "invalid_token", "no introspection endpoint configured");
     const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
@@ -25210,11 +25229,10 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     }
     if (j.active !== true) throw new AuthError(401, "invalid_token", "token is not active");
     const p = checkClaims(cfg, j, Math.floor(now2() / 1e3));
-    if (introCache.size >= INTRO_MAX) introCache.delete(introCache.keys().next().value);
-    introCache.set(key, { p, until: Math.min(now2() + INTRO_TTL, p.exp * 1e3) });
+    remember(introCache, key, p);
     return p;
   }
-  return async function validate2(token) {
+  async function validate2(token) {
     if (typeof token !== "string" || !token || token.length > 8192) throw new AuthError(401, "invalid_token", "missing or oversized bearer token");
     if (cfg.validation === "introspection") return viaIntrospection(token);
     if (cfg.validation === "jwks") {
@@ -25222,9 +25240,17 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
       return viaJwks(token);
     }
     return looksJwt(token) ? viaJwks(token) : viaIntrospection(token);
+  }
+  validate2.cached = (token) => {
+    if (typeof token !== "string" || !token || token.length > 8192) return null;
+    const key = tokenKey(token);
+    if (cfg.validation !== "introspection" && looksJwt(token)) return recall(jwtCache, key);
+    if (cfg.validation !== "jwks") return recall(introCache, key);
+    return null;
   };
+  return validate2;
 }
-function createEncryptedTokenStore({ path, keyB64, now: now2 = Date.now } = {}) {
+function createEncryptedTokenStore({ path, keyB64, now: now2 = Date.now, tmpName = defaultTmpName } = {}) {
   if (!path) return null;
   const key = keyB64 ? Buffer.from(keyB64, "base64") : null;
   if (!key || key.length !== 32) throw new Error("BUZZ_HOSTED_TOKEN_STORE is set but BUZZ_HOSTED_TOKEN_STORE_KEY is missing or not 32 bytes (base64) \u2014 refusing to store tokens without encryption");
@@ -25247,13 +25273,21 @@ function createEncryptedTokenStore({ path, keyB64, now: now2 = Date.now } = {}) 
     const c = createCipheriv("aes-256-gcm", key, iv);
     c.setAAD(STORE_AAD);
     const ct = Buffer.concat([c.update(JSON.stringify(Object.fromEntries(m)), "utf8"), c.final()]);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync3(tmp, JSON.stringify({ v: 1, iv: iv.toString("base64"), tag: c.getAuthTag().toString("base64"), ct: ct.toString("base64") }), { mode: 384 });
+    const tmp = tmpName(path);
+    writeFileSync3(tmp, JSON.stringify({ v: 1, iv: iv.toString("base64"), tag: c.getAuthTag().toString("base64"), ct: ct.toString("base64") }), { mode: 384, flag: "wx" });
     try {
-      chmodSync4(tmp, 384);
-    } catch {
+      try {
+        chmodSync4(tmp, 384);
+      } catch {
+      }
+      renameSync(tmp, path);
+    } catch (e) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+      }
+      throw e;
     }
-    renameSync(tmp, path);
   };
   return { load, save };
 }
@@ -25332,7 +25366,7 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     size: () => cache.size
   };
 }
-var DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, hashSub;
+var DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, defaultTmpName, hashSub;
 var init_hosted_auth = __esm({
   async "hosted-auth.mjs"() {
     await init_signer();
@@ -25363,6 +25397,7 @@ var init_hosted_auth = __esm({
     audList = (a) => (Array.isArray(a) ? a : a == null ? [] : [a]).map((x) => trimSlash(x));
     scopeList = (c) => Array.isArray(c.scp) ? c.scp : list(c.scope || c.scp || "");
     STORE_AAD = Buffer.from("buzz-mcp-hosted-tokens-v1");
+    defaultTmpName = (path) => `${path}.${process.pid}.${randomBytes5(8).toString("hex")}.tmp`;
     hashSub = (sub) => createHash3("sha256").update(String(sub)).digest("hex").slice(0, 12);
   }
 });
@@ -25372,11 +25407,15 @@ var http_server_exports = {};
 __export(http_server_exports, {
   HOSTED_CORE_ENV_ALLOW: () => HOSTED_CORE_ENV_ALLOW,
   coreEnv: () => coreEnv,
+  makeClientIp: () => makeClientIp,
+  normIp: () => normIp,
   redact: () => redact,
   scrub: () => scrub,
-  startHttpServer: () => startHttpServer
+  startHttpServer: () => startHttpServer,
+  trustedProxyConfig: () => trustedProxyConfig
 });
 import { createServer } from "node:http";
+import { isIP, BlockList } from "node:net";
 import { randomUUID, createHash as createHash4 } from "node:crypto";
 function coreEnv(env) {
   const o = { BUZZ_HARNESS: "ola-buzz-hosted", BUZZ_INTERFACE: "mcp-http", BUZZ_WIRE_SIGN: "1" };
@@ -25394,6 +25433,40 @@ function scrubResult(r, ...secrets) {
 }
 function redact(s) {
   return String(s ?? "").replace(/Bearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer [redacted]").replace(/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[jwt]").replace(/\bnsec1[02-9ac-hj-np-z]{20,}/gi, "[nsec]").replace(/("?(?:access_token|subject_token|refresh_token|id_token|client_secret|token)"?\s*[:=]\s*"?)[^"\s,&}]+/gi, "$1[redacted]");
+}
+function trustedProxyConfig(env = process.env) {
+  const rawHops = String(env.BUZZ_HOSTED_TRUSTED_PROXY_HOPS ?? "").trim();
+  let hops = 0;
+  if (rawHops !== "") {
+    if (!/^\d+$/.test(rawHops) || Number(rawHops) > 10) throw new Error(`BUZZ_HOSTED_TRUSTED_PROXY_HOPS must be an integer 0..10 (got "${rawHops}")`);
+    hops = Number(rawHops);
+  }
+  const cidrs = list2(env.BUZZ_HOSTED_TRUSTED_PROXY_CIDRS);
+  if (cidrs.length && !hops) throw new Error("BUZZ_HOSTED_TRUSTED_PROXY_CIDRS is set but BUZZ_HOSTED_TRUSTED_PROXY_HOPS is 0 \u2014 set the hop count too (X-Forwarded-For is only read when HOPS \u2265 1)");
+  let trusted = null;
+  if (cidrs.length) {
+    trusted = new BlockList();
+    for (const c of cidrs) {
+      const [addr, bits, extra] = c.split("/");
+      const a = normIp(addr), fam = a ? isIP(a) : 0, max = fam === 6 ? 128 : 32;
+      const n = bits == null ? max : /^\d+$/.test(bits) ? Number(bits) : NaN;
+      if (!a || extra != null || !Number.isInteger(n) || n < 0 || n > max) throw new Error(`BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: bad entry "${c}"`);
+      trusted.addSubnet(a, n, fam === 6 ? "ipv6" : "ipv4");
+    }
+  }
+  return Object.freeze({ hops, trusted, cidrs });
+}
+function makeClientIp({ hops = 0, trusted = null } = {}) {
+  return (req) => {
+    const sock = normIp(req.socket && req.socket.remoteAddress) || "?";
+    if (!hops) return sock;
+    if (trusted && (sock === "?" || !trusted.check(sock, isIP(sock) === 6 ? "ipv6" : "ipv4"))) return sock;
+    const raw = req.headers && req.headers["x-forwarded-for"];
+    if (raw == null) return sock;
+    const parts = (Array.isArray(raw) ? raw.join(",") : String(raw)).split(",").map((x) => x.trim());
+    if (parts.length < hops) return sock;
+    return normIp(parts[parts.length - hops]) || sock;
+  };
 }
 function bucket(perMin, now2) {
   const m = /* @__PURE__ */ new Map();
@@ -25434,8 +25507,10 @@ async function startHttpServer({
     idleMs: int3(env.BUZZ_HOSTED_SESSION_IDLE_S, 1800, 30, 86400) * 1e3,
     allowedOrigins: list2(env.BUZZ_HOSTED_ALLOWED_ORIGINS),
     allowedHosts: list2(env.BUZZ_HOSTED_ALLOWED_HOSTS).map((h) => h.toLowerCase()),
-    jsonResponse: env.BUZZ_HOSTED_JSON_RESPONSE === "1"
+    jsonResponse: env.BUZZ_HOSTED_JSON_RESPONSE === "1",
+    pubkeyTtlMs: int3(env.BUZZ_HOSTED_PUBKEY_TTL_S, 3600, 60, 86400) * 1e3
   };
+  const proxy = trustedProxyConfig(env);
   if (cfg.clientId === "REPLACE_WITH_EKAM_CLIENT_ID" && env.BUZZ_HOSTED_ALLOW_PLACEHOLDER !== "1" && listen)
     process.stderr.write("[buzz-mcp] \u26A0 BUZZ_HOSTED_CLIENT_ID is the placeholder \u2014 token exchange will fail until Ekam issues a client id.\n");
   const write = logSink || ((o) => process.stdout.write(JSON.stringify(o) + "\n"));
@@ -25451,10 +25526,23 @@ async function startHttpServer({
   const validate2 = createTokenValidator(cfg, { fetch: fetchFn, now: now2, metadata: meta2 });
   const store = createEncryptedTokenStore({ path: cfg.tokenStorePath, keyB64: cfg.tokenStoreKey, now: now2 });
   const exchanger = createTokenExchanger(cfg, { fetch: fetchFn, now: now2, metadata: meta2, store });
-  const userLimit = bucket(O.perMin, now2), anonLimit = bucket(O.anonPerMin, now2);
+  const userLimit = bucket(O.perMin, now2), preAuthLimit = bucket(O.anonPerMin, now2);
   const CORE_ENV = coreEnv(env);
   const signBase = cfg.signBase;
   const pubkeys = /* @__PURE__ */ new Map();
+  const PUBKEYS_MAX = 5e4;
+  const pubkeyGet = (sub) => {
+    const e = pubkeys.get(sub);
+    if (!e) return null;
+    if (now2() - e.at < O.pubkeyTtlMs) return e.pk;
+    pubkeys.delete(sub);
+    return null;
+  };
+  const pubkeySet = (sub, pk) => {
+    pubkeys.delete(sub);
+    pubkeys.set(sub, { pk, at: now2() });
+    while (pubkeys.size > PUBKEYS_MAX) pubkeys.delete(pubkeys.keys().next().value);
+  };
   const writeGuards = /* @__PURE__ */ new Map();
   const guardFor = (sub) => {
     let g = writeGuards.get(sub);
@@ -25483,7 +25571,7 @@ async function startHttpServer({
     if (s.coreP) return s.coreP;
     s.coreP = (async () => {
       const getToken = async (force = false) => s.wireToken = await exchanger.get(s.principal, s.subjectToken, force);
-      let pk = pubkeys.get(s.sub);
+      let pk = pubkeyGet(s.sub);
       if (!pk) {
         const t0 = await getToken(false);
         try {
@@ -25500,7 +25588,7 @@ async function startHttpServer({
             throw x;
           } else throw hostedWireError(e, 27235);
         }
-        pubkeys.set(s.sub, pk);
+        pubkeySet(s.sub, pk);
       }
       const signer = makeHostedWireSigner({ pubkey: pk, getToken, base: signBase, fetch: fetchFn });
       const core = await createBuzzServer2({ hosted: true, env: CORE_ENV, signer, displayName: s.principal.name || null, writeGuard: guardFor(s.sub) });
@@ -25613,7 +25701,13 @@ async function startHttpServer({
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
-  const clientIp = (req) => String(req.socket.remoteAddress || "?");
+  const clientIp = makeClientIp(proxy);
+  const limited = (res, wait, why) => send(
+    res,
+    429,
+    { error: "rate_limited", error_description: why },
+    { "Retry-After": String(wait), "WWW-Authenticate": challenge2(null) }
+  );
   async function handle(req, res) {
     const t0 = now2();
     const url = new URL(req.url || "/", "http://x");
@@ -25638,24 +25732,22 @@ async function startHttpServer({
     if (origin && !O.allowedOrigins.includes(origin)) return send(res, 403, { error: "origin_not_allowed" });
     const auth = String(req.headers.authorization || "");
     const m = /^Bearer[ ]+([^\s]+)$/i.exec(auth);
-    if (!m) {
-      const wait2 = anonLimit(clientIp(req));
-      if (wait2) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait2) });
-      return send(res, 401, { error: "unauthorized" }, { "WWW-Authenticate": challenge2(null) });
-    }
-    let principal;
-    try {
-      principal = await validate2(m[1]);
-    } catch (e) {
-      const wait2 = anonLimit(clientIp(req));
-      if (wait2) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait2) });
-      const ae = e instanceof AuthError ? e : new AuthError(401, "invalid_token", "token could not be validated");
-      if (!(e instanceof AuthError)) log("auth_error", { err: scrub(e && e.message, m[1]) });
-      return send(res, ae.status, { error: ae.error, error_description: ae.description }, { "WWW-Authenticate": challenge2(ae) });
+    if (!m) return send(res, 401, { error: "unauthorized" }, { "WWW-Authenticate": challenge2(null) });
+    let principal = validate2.cached(m[1]);
+    if (!principal) {
+      const pre = preAuthLimit(clientIp(req));
+      if (pre) return limited(res, pre, "too many unauthenticated requests from this address");
+      try {
+        principal = await validate2(m[1]);
+      } catch (e) {
+        const ae = e instanceof AuthError ? e : new AuthError(401, "invalid_token", "token could not be validated");
+        if (!(e instanceof AuthError)) log("auth_error", { err: scrub(e && e.message, m[1]) });
+        return send(res, ae.status, { error: ae.error, error_description: ae.description }, { "WWW-Authenticate": challenge2(ae) });
+      }
     }
     user = hashSub(principal.sub);
     const wait = userLimit(principal.sub);
-    if (wait) return send(res, 429, { error: "rate_limited" }, { "Retry-After": String(wait) });
+    if (wait) return limited(res, wait, "too many requests");
     let body;
     if (req.method === "POST") {
       const ct = String(req.headers["content-type"] || "");
@@ -25722,9 +25814,9 @@ async function startHttpServer({
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
   }
-  return { httpServer, close, sessions, config: cfg, exchanger, tools: TOOLS, handle };
+  return { httpServer, close, sessions, config: cfg, exchanger, tools: TOOLS, handle, proxy, pubkeyCacheSize: () => pubkeys.size };
 }
-var int3, list2, HOSTED_CORE_ENV_ALLOW;
+var int3, list2, HOSTED_CORE_ENV_ALLOW, normIp;
 var init_http_server = __esm({
   async "http-server.mjs"() {
     init_server2();
@@ -25749,6 +25841,14 @@ var init_http_server = __esm({
       "BUZZ_HOSTED_ATTACHMENT_MAX_MB",
       "BUZZ_ONBOARDING_GUIDE"
     ];
+    normIp = (a) => {
+      let s = String(a ?? "").trim();
+      if (/^\[[0-9a-f:.]+\](?::\d+)?$/i.test(s)) s = s.slice(1, s.indexOf("]"));
+      else if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(s)) s = s.slice(0, s.lastIndexOf(":"));
+      s = s.toLowerCase();
+      if (s.startsWith("::ffff:") && isIP(s.slice(7)) === 4) s = s.slice(7);
+      return isIP(s) ? s : null;
+    };
   }
 });
 
@@ -26897,7 +26997,7 @@ ${url}
 
 // buzz-mcp.mjs
 import { createHash as createHash5, randomBytes as randomBytes6, randomUUID as randomUUID2 } from "node:crypto";
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { Readable as Readable2 } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
@@ -27425,7 +27525,7 @@ async function createBuzzServer(opts = {}) {
       closeSync2(fd);
       if (!ok) {
         try {
-          unlinkSync(part);
+          unlinkSync2(part);
         } catch {
         }
       }
@@ -28924,7 +29024,7 @@ ${fence.replace("BEGIN", "END")}`);
         const got = await sha256File(dest);
         if (got !== att.sha256) {
           try {
-            unlinkSync(dest);
+            unlinkSync2(dest);
           } catch {
           }
           throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}\u2026 \u2260 imeta ${att.sha256.slice(0, 12)}\u2026 \u2014 discarded`);
