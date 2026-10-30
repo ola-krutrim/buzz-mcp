@@ -4,7 +4,7 @@
 process.env.BUZZ_MCP_AS_LIBRARY = "1";
 import { createServer } from "node:http";
 import { generateKeyPairSync, sign as cSign, randomBytes, createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, statSync, rmSync, writeFileSync, symlinkSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -13,7 +13,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 import { getPublicKey, finalizeEvent, verifyEvent } from "nostr-tools/pure";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { startHttpServer, redact, coreEnv } from "./http-server.mjs";
+import { startHttpServer, redact, coreEnv, makeClientIp, trustedProxyConfig, normIp } from "./http-server.mjs";
 import { hostedConfig, createTokenValidator, createTokenExchanger, createEncryptedTokenStore, protectedResourceMetadata } from "./hosted-auth.mjs";
 import { makeHostedWireSigner, BUZZ_APP_SIGNIN_MESSAGE } from "./signer.mjs";
 
@@ -44,7 +44,7 @@ const { privateKey: ROGUE } = generateKeyPairSync("rsa", { modulusLength: 2048 }
 const jwk = { ...RSAPUB.export({ format: "jwk" }), kid: "k1", alg: "RS256", use: "sig" };
 const minted = new Set();
 const leaks = [];      // any client (MCP) access token seen where it must never go
-const stats = { exchanges: 0, introspections: 0, exchangeBodies: [], wireSign: 0 };
+const stats = { exchanges: 0, introspections: 0, exchangeBodies: [], wireSign: 0, probes: 0, jwks: 0 };
 let ISS;
 function mint(sub, over = {}, key = RSA, header = {}) {
   const h = Buffer.from(JSON.stringify({ alg: "RS256", kid: "k1", typ: "at+jwt", ...header })).toString("base64url");
@@ -62,7 +62,7 @@ const ekam = createServer(async (rq, rs) => {
   const reply = (st, o) => { rs.writeHead(st, { "Content-Type": "application/json" }); rs.end(JSON.stringify(o)); };
   const url = rq.url;
   if (url === "/.well-known/oauth-authorization-server") return reply(200, { issuer: ISS, token_endpoint: `${ISS}/oauth/token`, jwks_uri: `${ISS}/jwks`, introspection_endpoint: `${ISS}/oauth/introspect`, grant_types_supported: ["urn:ietf:params:oauth:grant-type:token-exchange"] });
-  if (url === "/jwks") return reply(200, { keys: [jwk] });
+  if (url === "/jwks") { stats.jwks++; return reply(200, { keys: [jwk] }); }
   if (url === "/oauth/introspect") {
     stats.introspections++;
     const t = new URLSearchParams(body).get("token");
@@ -93,6 +93,7 @@ const ekam = createServer(async (rq, rs) => {
     const u = USERS[sub];
     if (u.unprovisioned) return reply(403, { error: "not_governed" });
     const { event } = JSON.parse(body);
+    if (event.kind === 27235 && (event.tags || []).some((t) => t[0] === "u" && String(t[1]).endsWith("/whoami"))) stats.probes++;
     if (u.echo && event.kind !== 27235) {
       const rt = refreshOf.get(tok);
       if (!daveSeen.has(sub)) { daveSeen.add(sub); return reply(401, { error: "invalid_token", error_description: `token ${tok} expired; refresh ${rt}` }); }
@@ -141,8 +142,8 @@ const baseEnv = {
   BUZZ_RELAY_HTTP: `http://127.0.0.1:${RELAY_PORT}`, BUZZ_HOSTED_RATE_PER_MIN: "1000",
   BUZZ_PRIVATE_KEY: "11".repeat(32), BUZZ_AUTH_TAG: "should-never-be-used", // must be IGNORED by hosted cores
 };
-async function boot(extra = {}) {
-  const srv = await startHttpServer({ createBuzzServer, version: "0.2.35", env: { ...baseEnv, ...extra }, listen: false, log: (o) => logs.push(JSON.stringify(o)) });
+async function boot(extra = {}, opts = {}) {
+  const srv = await startHttpServer({ createBuzzServer, version: "0.2.35", env: { ...baseEnv, ...extra }, listen: false, log: (o) => logs.push(JSON.stringify(o)), ...opts });
   const port = await listenAny(srv.httpServer);
   return { srv, base: `http://127.0.0.1:${port}` };
 }
@@ -373,6 +374,151 @@ console.log("\nhosted 9: tokens (client bearer, exchanged wire:sign, refresh) ne
   ok(leaked([...refreshOf.values()]) === 0, "no refresh token in any output");
   ok(!/\b(?:wt|rt|idt)_[0-9a-f]{8,}/.test(hay) && !/eyJ[A-Za-z0-9_-]{10,}\./.test(hay), "no token-shaped strings at all");
   ok(logs.slice(L0).length > 5, `checked ${seen.length} output chunks incl. ${logs.slice(L0).length} log lines`);
+}
+
+const RM = `resource_metadata="${RESOURCE}/.well-known/oauth-protected-resource"`;
+const hexTok = (p = "op_") => p + randomBytes(10).toString("hex");
+const junkInit = (b, tok, xff) => rawInit(b, { Authorization: `Bearer ${tok}`, ...(xff ? { "X-Forwarded-For": xff } : {}) });
+
+console.log("\nhosted 10: pre-auth limit charged BEFORE validate() (introspection); no-token 401 never limited; 429 keeps the challenge");
+{
+  const { srv: s, base: b } = await boot({ BUZZ_HOSTED_TOKEN_VALIDATION: "introspection", BUZZ_HOSTED_ANON_RATE_PER_MIN: "5" });
+  const good = hexTok(); opaque.set(good, { sub: "alice", aud: RESOURCE, iss: ISS, exp: nowS() + 600, name: "Alice A" });
+  const r0 = await junkInit(b, good);
+  ok(r0.status === 200, "a real user validated before the flood → 200 (charges 1 of 5)");
+  const i0 = stats.introspections; const codes = []; let last = null;
+  for (let i = 0; i < 200; i++) { last = await junkInit(b, hexTok("junk_")); codes.push(last.status); }
+  const n401 = codes.filter((c) => c === 401).length, n429 = codes.filter((c) => c === 429).length;
+  ok(stats.introspections - i0 === 4, `200 junk bearers from one address → ${stats.introspections - i0} introspection calls to Ekam (want 4: the bucket's remaining tokens)`);
+  ok(n401 === 4 && n429 === 196, `junk → 4×401 then 196×429 (got ${n401}×401, ${n429}×429)`);
+  ok(last.status === 429 && Number(last.headers.get("retry-after")) > 0 && (last.headers.get("www-authenticate") || "").includes(RM), "pre-auth 429 carries Retry-After AND WWW-Authenticate resource_metadata");
+  const nt = await rawInit(b);
+  ok(nt.status === 401 && (nt.headers.get("www-authenticate") || "").includes(RM), "no token while the address is exhausted → still 401 + challenge (never limited)");
+  const nts = []; for (let i = 0; i < 20; i++) nts.push((await rawInit(b)).status);
+  ok(nts.every((c) => c === 401), "20 more no-token requests → all 401, none 429");
+  const i1 = stats.introspections;
+  const r1 = await junkInit(b, good);
+  ok(r1.status === 200 && stats.introspections === i1, "already-validated bearer is served from cache: 200, no new introspection, not charged");
+  const expired = hexTok(); opaque.set(expired, { sub: "bob", aud: RESOURCE, iss: ISS, exp: nowS() - 3600 });
+  const r2 = await junkInit(b, expired);
+  ok(r2.status === 429 && (r2.headers.get("www-authenticate") || "").includes(RM) && stats.introspections === i1, "expired token from the flooded address → 429 WITH WWW-Authenticate (can re-auth), no Ekam call");
+  await s.close();
+}
+
+console.log("\nhosted 11: pre-auth limit also covers the JWKS path; per-user 429 keeps the challenge");
+{
+  const { srv: s, base: b } = await boot({ BUZZ_HOSTED_ANON_RATE_PER_MIN: "5" });
+  const codes = []; const j0 = stats.jwks;
+  for (let i = 0; i < 20; i++) codes.push((await junkInit(b, mint("alice", { jti: hexTok("j") }, ROGUE, { kid: `nope-${i}` }))).status);
+  ok(codes.slice(0, 5).every((c) => c === 401) && codes.slice(5).every((c) => c === 429), `20 junk JWTs (unknown kid) → 5×401 then 429 (${codes.join(",")})`);
+  ok(stats.jwks - j0 <= 2, `unknown-kid JWTs caused ${stats.jwks - j0} JWKS fetches (≤2: first load + one rotation refetch)`);
+  await s.close();
+  const { srv: s2, base: b2 } = await boot({ BUZZ_HOSTED_RATE_PER_MIN: "1" });
+  const t = mint("bob"); await rawInit(b2, { Authorization: `Bearer ${t}` });
+  const r = await rawInit(b2, { Authorization: `Bearer ${t}` });
+  ok(r.status === 429 && Number(r.headers.get("retry-after")) > 0 && (r.headers.get("www-authenticate") || "").includes(RM), "per-user 429 also carries Retry-After + WWW-Authenticate resource_metadata");
+  await s2.close();
+}
+
+console.log("\nhosted 12: client address from X-Forwarded-For only when a trusted hop count is configured");
+{
+  const env = { BUZZ_HOSTED_TOKEN_VALIDATION: "introspection", BUZZ_HOSTED_ANON_RATE_PER_MIN: "3" };
+  { // default: XFF never read — rotating it does not buy a fresh bucket
+    const { srv: s, base: b } = await boot(env); const codes = [];
+    for (let i = 0; i < 4; i++) codes.push((await junkInit(b, hexTok("junk_"), `198.51.100.${i + 1}`)).status);
+    ok(codes.join(",") === "401,401,401,429", `HOPS unset: rotating X-Forwarded-For is ignored, socket address limited (${codes.join(",")})`);
+    await s.close();
+  }
+  { // HOPS=1: keyed on the right-most entry
+    const { srv: s, base: b } = await boot({ ...env, BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1" }); const codes = [];
+    for (let i = 0; i < 4; i++) codes.push((await junkInit(b, hexTok("junk_"), "203.0.113.7")).status);
+    ok(codes.join(",") === "401,401,401,429", `HOPS=1: one client (203.0.113.7) behind the proxy is limited (${codes.join(",")})`);
+    const other = await junkInit(b, hexTok("junk_"), "203.0.113.8");
+    ok(other.status === 401, "HOPS=1: a different client behind the same proxy has its own bucket (401, not 429)");
+    const spoof = await junkInit(b, hexTok("junk_"), "192.0.2.99, 203.0.113.7");
+    ok(spoof.status === 429, "HOPS=1: a client-supplied left-hand entry is ignored (still keyed on 203.0.113.7 → 429)");
+    const bare = await junkInit(b, hexTok("junk_"));
+    ok(bare.status === 401, "HOPS=1: no X-Forwarded-For → falls back to the socket address (own bucket)");
+    await s.close();
+  }
+  { // CIDR gate: socket peer 127.0.0.1 is not a trusted proxy → XFF ignored
+    const { srv: s, base: b } = await boot({ ...env, BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1", BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "10.0.0.0/8" }); const codes = [];
+    for (let i = 0; i < 4; i++) codes.push((await junkInit(b, hexTok("junk_"), `198.51.100.${i + 1}`)).status);
+    ok(codes.join(",") === "401,401,401,429", `CIDRS=10.0.0.0/8: XFF from an untrusted peer is ignored (${codes.join(",")})`);
+    await s.close();
+    const { srv: s2, base: b2 } = await boot({ ...env, BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1", BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "127.0.0.0/8, ::1/128" }); const c2 = [];
+    for (let i = 0; i < 4; i++) c2.push((await junkInit(b2, hexTok("junk_"), `198.51.100.${i + 1}`)).status);
+    ok(c2.every((c) => c === 401), `CIDRS=127.0.0.0/8: XFF from the trusted peer is honoured (${c2.join(",")})`);
+    await s2.close();
+  }
+  const R = (sock, xff) => ({ socket: { remoteAddress: sock }, headers: xff == null ? {} : { "x-forwarded-for": xff } });
+  const f0 = makeClientIp(trustedProxyConfig({})), f2 = makeClientIp(trustedProxyConfig({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "2" }));
+  ok(f0(R("10.0.0.5", "1.1.1.1")) === "10.0.0.5", "makeClientIp default → socket address, XFF ignored");
+  ok(f2(R("10.0.0.5", "6.6.6.6, 1.1.1.1, 10.0.0.9")) === "1.1.1.1", "HOPS=2 → 2nd entry from the right");
+  ok(f2(R("10.0.0.5", "1.1.1.1")) === "10.0.0.5", "HOPS=2 with only one entry → socket address (fail closed)");
+  ok(f2(R("10.0.0.5", "evil, 10.0.0.9")) === "10.0.0.5", "HOPS=2 with a non-IP at the hop → socket address");
+  ok(f2(R("10.0.0.5", ["2.2.2.2", "[2001:db8::1]:443, 10.0.0.9"])) === "2001:db8::1", "repeated XFF headers joined; [v6]:port normalised");
+  ok(f0(R("::ffff:192.0.2.1")) === "192.0.2.1" && normIp("198.51.100.4:8080") === "198.51.100.4", "v4-mapped IPv6 and v4:port normalised");
+  const bad = (e) => { try { trustedProxyConfig(e); return false; } catch { return true; } };
+  ok(bad({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "x" }) && bad({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "11" }) && bad({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "-1" }), "bad HOPS values refuse to start");
+  ok(bad({ BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "10.0.0.0/8" }), "CIDRS without HOPS refuses to start");
+  ok(bad({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1", BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "10.0.0.0/33" }) && bad({ BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1", BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "nope/8" }), "malformed CIDR refuses to start");
+}
+
+console.log("\nhosted 13: JWT access tokens must carry iss");
+{
+  const noIss = mint("alice", { iss: undefined });
+  const { srv: s, base: b } = await boot();
+  const r = await rawInit(b, { Authorization: `Bearer ${noIss}` });
+  ok(r.status === 401 && /error="invalid_token"/.test(r.headers.get("www-authenticate") || "") && /no issuer/.test(r.headers.get("www-authenticate") || ""), "JWT without iss → 401 invalid_token (token has no issuer)");
+  const empty = await rawInit(b, { Authorization: `Bearer ${mint("alice", { iss: "" })}` });
+  ok(empty.status === 401, "JWT with empty iss → 401");
+  const okr = await rawInit(b, { Authorization: `Bearer ${mint("alice")}` });
+  ok(okr.status === 200, "JWT with the right iss → 200");
+  await s.close();
+  const v = createTokenValidator(hostedConfig({ BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_TOKEN_VALIDATION: "introspection", BUZZ_HOSTED_CLIENT_ID: "test-client" }));
+  const op = hexTok(); opaque.set(op, { sub: "bob", aud: RESOURCE, exp: nowS() + 300 });
+  ok((await v(op)).sub === "bob", "introspection response without iss is still accepted (iss is OPTIONAL in RFC 7662)");
+  const op2 = hexTok(); opaque.set(op2, { sub: "bob", aud: RESOURCE, iss: "https://evil.example", exp: nowS() + 300 });
+  let e = null; try { await v(op2); } catch (x) { e = x; }
+  ok(e && e.status === 401, "introspection response with a foreign iss → rejected");
+  ok(v.cached(op) && v.cached(op).sub === "bob" && v.cached(op2) === null && v.cached("never-seen") === null, "validate.cached(): hit only for accepted tokens, never for rejected/unknown");
+}
+
+console.log("\nhosted 14: pubkey cache has a TTL");
+{
+  let off = 0; const clk = () => Date.now() + off;
+  const { srv: s, base: b } = await boot({ BUZZ_HOSTED_PUBKEY_TTL_S: "60" }, { now: clk });
+  const t = mint("alice", { exp: nowS() + 3600 });
+  const p0 = stats.probes;
+  const S1 = await connect(b, t); await S1.call("buzz_whoami");
+  const d1 = stats.probes - p0;
+  const S2 = await connect(b, t); await S2.call("buzz_whoami");
+  const d2 = stats.probes - p0 - d1;
+  off += 61_000;
+  const S3 = await connect(b, t); const w3 = await S3.call("buzz_whoami");
+  const d3 = stats.probes - p0 - d1 - d2;
+  ok(d1 === 1 && d2 === 0, `first core probes the pubkey once, a second session within the TTL reuses it (probes ${d1}, ${d2})`);
+  ok(d3 === 1 && !w3.isError && w3.text.includes(USERS.alice.pk), `after BUZZ_HOSTED_PUBKEY_TTL_S the next core re-probes (probes ${d3})`);
+  ok(s.pubkeyCacheSize() === 1, "pubkey cache holds one entry per person");
+  await S1.c.close(); await S2.c.close(); await S3.c.close(); await s.close();
+}
+
+console.log("\nhosted 15: token-store temp file is created O_EXCL (never follows or truncates an existing path)");
+{
+  const dir = mkdtempSync(join(tmpdir(), "bh-x-")); const path = join(dir, "tokens.enc");
+  const victim = join(dir, "victim"); writeFileSync(victim, "keep-me");
+  const planted = join(dir, "planted.tmp"); symlinkSync(victim, planted);
+  const key = randomBytes(32).toString("base64");
+  const st = createEncryptedTokenStore({ path, keyB64: key, tmpName: () => planted });
+  let e = null; try { st.save(new Map([["sub", { token: "wt_x", exp: Date.now() + 60_000 }]])); } catch (x) { e = x; }
+  ok(e && e.code === "EEXIST", `save() with a pre-existing temp path → EEXIST (${e && e.code})`);
+  ok(readFileSync(victim, "utf8") === "keep-me" && !existsSync(path), "symlink target untouched, no store file written");
+  const st2 = createEncryptedTokenStore({ path, keyB64: key });
+  st2.save(new Map([["a", { token: "wt_1", exp: Date.now() + 60_000 }]])); st2.save(new Map([["a", { token: "wt_2", exp: Date.now() + 60_000 }]]));
+  ok(st2.load().get("a").token === "wt_2" && (statSync(path).mode & 0o777) === 0o600, "default temp names: repeated saves work, file 0600, latest value wins");
+  ok(!readdirSync(dir).some((n) => n.startsWith("tokens.enc.") && n.endsWith(".tmp")), "no temp files left behind");
+  rmSync(dir, { recursive: true, force: true });
 }
 
 ekam.close(); relay.close();
