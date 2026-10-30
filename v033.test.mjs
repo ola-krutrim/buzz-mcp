@@ -232,7 +232,7 @@ console.log("\ncase B: buzz_profile_set (agent) — merge keeps picture/about; v
   ok(bootP && !("junk" in bootP) && bootP.picture !== "https://evil/x.png", "unknown fields dropped; forged-signature kind 0 ignored");
   ok(!res[1].isError && has(res[1].text, /profile updated: about/), `about set → ${res[1].text}`);
   const p2 = k0[1];
-  ok(p2 && p2.about === "new bio\nline 2" && p2.picture === "https://cdn.example/me.png" && p2.client_version === "0.2.34", "about replaced, picture kept, client_version 0.2.34");
+  ok(p2 && p2.about === "new bio\nline 2" && p2.picture === "https://cdn.example/me.png" && p2.client_version === "0.2.35", "about replaced, picture kept, client_version 0.2.35");
   ok(res[2].isError && has(res[2].text, /https/), "http picture refused");
   ok(res[3].isError && has(res[3].text, /bidi|control/), "bidi name refused");
   ok(res[4].isError && has(res[4].text, /at least one/), "empty patch refused");

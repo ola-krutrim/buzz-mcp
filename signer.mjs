@@ -425,7 +425,9 @@ export async function wireSign(base, token, template, fetchFn = fetch) {
                : res.status === 401 ? " (token revoked/expired, or wrong audience — must be minted resource=ISSUER)"
                : res.status === 503 ? " (escrow/Vault unavailable — transient)"
                : "";
-    throw new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);
+    const err = new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);
+    err.status = res.status; err.ekamError = j && typeof j === "object" && typeof j.error === "string" ? j.error : null; // v0.2.35: typed, for hosted mapping
+    throw err;
   }
   let parsed;
   try { parsed = JSON.parse(text); }
@@ -531,4 +533,82 @@ export async function resolveSigner(opts = {}) {
       );
     },
   };
+}
+
+// ---- v0.2.35 hosted (multi-user HTTP) wire signer ----
+// The hosted connector holds NO key and NO refresh token on disk. Each session gets a signer whose
+// wire:sign access token comes from `getToken(force)` — an RFC 8693 token exchange of the person's
+// own validated Ekam access token (http-server.mjs / hosted-auth.mjs), cached in memory per user.
+// Same allowlist + NEVER_SIGN as the stdio wire signer, plus an identity binding: every event Ekam
+// returns MUST carry the pubkey this session was bound to, or it is refused (never relayed).
+// The one message a hosted user sees when Ekam can't sign for them because their Buzz identity isn't
+// provisioned yet (they've never opened the Buzz app / signed in there with Ekam).
+// ASSUMPTION (unverified against live Ekam): that state surfaces as 403 from /v1/me/wire-sign, or as
+// one of these error codes from wire-sign / the token exchange. Ekam to confirm the exact codes.
+export const BUZZ_APP_SIGNIN_MESSAGE = "Open the Buzz app once and sign in with Ekam, then try again.";
+export const BUZZ_APP_SIGNIN_RE = /Open the Buzz app once and sign in with Ekam/;
+const BUZZ_APP_SIGNIN_CODES = new Set(["not_governed", "no_wire_key", "wire_key_not_found", "wire_key_missing", "not_provisioned", "human_not_found", "user_not_provisioned", "buzz_identity_missing"]);
+export function isBuzzAppSigninError({ status, error } = {}) {
+  if (error && BUZZ_APP_SIGNIN_CODES.has(String(error))) return true;
+  return status === 403 && !error; // bare 403 from wire-sign after a successful wire:sign exchange
+}
+export function buzzAppSigninError(cause) {
+  const e = new Error(BUZZ_APP_SIGNIN_MESSAGE);
+  e.code = "buzz_app_signin_required"; e.cause = cause;
+  return e;
+}
+
+// Hosted: never surface Ekam's raw response body (it could echo a token) — keep only HTTP status + a
+// well-formed error code. Typed kind_not_allowed and the not-provisioned message pass through.
+const SAFE_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+export function hostedWireError(e, kind) {
+  if (!e || e.code === "kind_not_allowed" || e.code === "buzz_app_signin_required" || e.status == null) return e;
+  const code = typeof e.ekamError === "string" && SAFE_CODE.test(e.ekamError) ? ` ${e.ekamError}` : "";
+  const err = new Error(`wire-sign${kind != null ? ` kind ${kind}` : ""} -> HTTP ${e.status}${code} — Ekam could not sign; try again`);
+  err.status = e.status; err.ekamError = code ? e.ekamError : null;
+  return err;
+}
+
+export function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = fetch } = {}) {
+  const pk = normalizePubkey(pubkey);
+  if (!pk) throw new Error("hosted signer: a 64-hex user pubkey is required");
+  if (typeof getToken !== "function") throw new Error("hosted signer: getToken(force) is required");
+  if (!base) throw new Error("hosted signer: the Ekam base URL is required");
+  return {
+    mode: "wire",
+    hosted: true,
+    pubkey: pk,
+    canSign: (kind) => WIRE_ALLOWLIST.has(kind) && !NEVER_SIGN.has(kind),
+    wipe() { /* holds no key */ },
+    selfCipher: null,
+    ekamToken: () => getToken(false),
+    ekamBase: () => base,
+    async sign(template) {
+      if (NEVER_SIGN.has(template.kind)) throw neverSignError(template.kind);
+      if (!WIRE_ALLOWLIST.has(template.kind))
+        throw new Error(`wire mode refuses kind ${template.kind} (allowlist {${[...WIRE_ALLOWLIST].sort((a, b) => a - b).join(", ")}})`);
+      let ev;
+      // 403 (bare / "forbidden") or a not-provisioned code → the one friendly message; anything else unchanged.
+      const mapped = (e) => (e && isBuzzAppSigninError({ status: e.status, error: e.ekamError === "forbidden" ? null : e.ekamError }) ? buzzAppSigninError(e) : hostedWireError(e, template.kind));
+      try { ev = await wireSign(base, await getToken(false), template, fetchFn); }
+      catch (e) {
+        if (e.status !== 401) throw mapped(e);
+        try { ev = await wireSign(base, await getToken(true), template, fetchFn); } // one forced re-exchange
+        catch (e2) { throw mapped(e2); }
+      }
+      if (String(ev.pubkey).toLowerCase() !== pk)
+        throw new Error("wire-sign returned an event for a different identity than this session — refused, nothing was sent");
+      return ev;
+    },
+  };
+}
+
+// Learn the person's pubkey without ever fetching key material: sign a throwaway NIP-98 (27235)
+// for a non-routable URL and read the pubkey off the signed event (same probe as wirelogin.mjs).
+// The event is never sent anywhere.
+export async function probeWirePubkey(base, token, fetchFn = fetch) {
+  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn);
+  const pk = normalizePubkey(ev.pubkey);
+  if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
+  return pk;
 }

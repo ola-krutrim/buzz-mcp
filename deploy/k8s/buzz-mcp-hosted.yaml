@@ -1,0 +1,71 @@
+# Sample only — relay_sre to adapt (namespace, image registry, ingress class, cert issuer, Secret source).
+# No secret values here: create `buzz-mcp-hosted` Secret out-of-band (External Secrets / KMS).
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: buzz-mcp-hosted, namespace: buzz }
+data:
+  BUZZ_HOSTED_RESOURCE: "https://mcp.buzz.ola.in"
+  BUZZ_EKAM_BASE: "https://ekam.olakrutrim.com"
+  BUZZ_HOSTED_TOKEN_VALIDATION: "auto"          # jwks | introspection | auto
+  BUZZ_HOSTED_EXCHANGE_FORMAT: "json"
+  BUZZ_RELAY_HTTP: "https://buzz.ola.in"        # placeholder — the relay's HTTP bridge URL
+  BUZZ_HOSTED_ALLOWED_HOSTS: "mcp.buzz.ola.in"
+  BUZZ_HOSTED_RATE_PER_MIN: "120"
+  BUZZ_HOSTED_MAX_BODY_KB: "1024"
+  BUZZ_HOSTED_MAX_SESSIONS: "200"
+---
+# Secret (create separately; keys expected):
+#   BUZZ_HOSTED_CLIENT_ID        — Ekam-issued client id for the connector (not secret, but env-sourced)
+#   BUZZ_HOSTED_CLIENT_SECRET    — only if Ekam requires a confidential client for token exchange
+#   BUZZ_HOSTED_TOKEN_STORE_KEY  — only if BUZZ_HOSTED_TOKEN_STORE is set (base64 32 bytes; KMS-managed)
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: buzz-mcp-hosted, namespace: buzz, labels: { app: buzz-mcp-hosted } }
+spec:
+  replicas: 2   # sessions are in-memory: the Ingress below pins a client to one pod by Mcp-Session-Id
+  selector: { matchLabels: { app: buzz-mcp-hosted } }
+  template:
+    metadata: { labels: { app: buzz-mcp-hosted } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: buzz-mcp
+          image: REGISTRY/buzz-mcp-hosted:0.2.35   # pin by digest in prod
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom:
+            - configMapRef: { name: buzz-mcp-hosted }
+            - secretRef: { name: buzz-mcp-hosted }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 30 }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { medium: Memory, sizeLimit: 16Mi } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: buzz-mcp-hosted, namespace: buzz }
+spec:
+  selector: { app: buzz-mcp-hosted }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: buzz-mcp-hosted
+  namespace: buzz
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"     # SSE streams
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_mcp_session_id"   # session affinity
+    cert-manager.io/cluster-issuer: REPLACE_ISSUER
+spec:
+  ingressClassName: nginx
+  tls: [{ hosts: [mcp.buzz.ola.in], secretName: buzz-mcp-hosted-tls }]
+  rules:
+    - host: mcp.buzz.ola.in
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: buzz-mcp-hosted, port: { name: http } } } }

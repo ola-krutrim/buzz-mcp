@@ -354,6 +354,102 @@ Address a person with `to` = **npub / hex pubkey / exact display-name**, or thei
 
 DMs are membership-gated plaintext (kind:9) — the shim never encrypts/decrypts; the relay enforces who can read.
 
+## Hosted mode (`buzz-mcp --http`) — the "Ola Buzz" connector (v0.2.35, Phase 1)
+
+One server, many people: MCP **Streamable HTTP** at `https://mcp.buzz.ola.in/mcp` (stateful
+`Mcp-Session-Id` sessions). stdio mode is unchanged; `--http` (or `BUZZ_MCP_HTTP=1`) switches.
+
+**Auth (OAuth 2.1 resource server, MCP authorization 2025-06-18).**
+- `GET /.well-known/oauth-protected-resource` (RFC 9728): `resource` = `BUZZ_HOSTED_RESOURCE`
+  (default `https://mcp.buzz.ola.in`), `authorization_servers` = [Ekam].
+- No/invalid token → `401` + `WWW-Authenticate: Bearer resource_metadata="…"` (`error="invalid_token"`).
+- Bearer validated for **audience = the resource**, issuer = Ekam, `exp`/`nbf` (60 s skew), `sub` —
+  via Ekam JWKS (asymmetric algs only; `none`/HS refused) or RFC 7662 introspection
+  (`BUZZ_HOSTED_TOKEN_VALIDATION=jwks|introspection|auto`).
+- The client's token **never** goes to the relay or to wire-sign. It is RFC 8693-exchanged at Ekam's
+  token endpoint for a short-lived **`wire:sign`** token for the same person (`resource` = Ekam issuer),
+  cached in memory per user until 60 s before expiry. Optional encrypted-at-rest cache:
+  `BUZZ_HOSTED_TOKEN_STORE=<path>` + `BUZZ_HOSTED_TOKEN_STORE_KEY=<base64 32 bytes>` (AES-256-GCM,
+  0600; refuses to start without the key — never plaintext).
+- The person's pubkey is learned from a throwaway signed NIP-98 probe — `/v1/me/wire-key` is never called.
+
+**Isolation.** Each session has its own core (identity, channel/profile/relay-info caches, confirm gate);
+a session id presented with another person's token → `403`. Write guard and rate limit are per user.
+Hosted cores see an allowlisted env only — server `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are ignored.
+
+**Hosted differences.** 54 tools (no `buzz_login`); no local file paths (`attachment` removed;
+`buzz_attachment_read` returns text inline / describes binaries, nothing is saved); no
+`CLAUDE_CONFIG_DIR` isolation check; no profile publish. `buzz_whoami` → `Ola Buzz — posting as you
+(<name>)` + shim version; write results end `— posted as you (<name>)`. Not provisioned in Buzz →
+"Open the Buzz app once and sign in with Ekam, then try again."
+
+**Ops.** `GET /healthz`; JSON logs on stdout (hashed user, session prefix, tool, status, ms — never
+tokens); `413` over `BUZZ_HOSTED_MAX_BODY_KB` (1024); `429` + `Retry-After` over
+`BUZZ_HOSTED_RATE_PER_MIN` (120/user); browser `Origin` refused unless in `BUZZ_HOSTED_ALLOWED_ORIGINS`;
+`BUZZ_HOSTED_ALLOWED_HOSTS` (Host check); session caps (`BUZZ_HOSTED_MAX_SESSIONS_PER_USER` 8,
+`BUZZ_HOSTED_MAX_SESSIONS` 200, idle `BUZZ_HOSTED_SESSION_IDLE_S` 1800). Sessions are in memory —
+use session affinity (`deploy/k8s/buzz-mcp-hosted.yaml`). `Dockerfile`: base pinned by digest, runs as uid 1000,
+no install/build step — it copies the prebuilt, checksum-verified `dist/buzz-mcp.mjs` only. Resource
+numbers: `node bench/hosted-load.mjs` (see the v0.2.35 PR).
+
+**Port / health.** Listens on `PORT` (default **8080**, also `BUZZ_HOSTED_PORT`), host `BUZZ_HOSTED_HOST`
+(`0.0.0.0`). Health: **`GET /healthz`** → `200 {"ok":true,"name":"Ola Buzz","version":…,"sessions":…}` (no auth). MCP: `/mcp`.
+Metadata: `/.well-known/oauth-protected-resource` (and `…/mcp`).
+
+**Secrets** (mount from a Secret / KMS; never in a ConfigMap or the image):
+
+| secret env | required | |
+|---|---|---|
+| `BUZZ_HOSTED_CLIENT_ID` | **yes** (not secret, but Ekam-issued; placeholder `REPLACE_WITH_EKAM_CLIENT_ID`) | exchange client |
+| `BUZZ_HOSTED_CLIENT_SECRET` | only if Ekam makes the client confidential | HTTP Basic at the token endpoint |
+| `BUZZ_HOSTED_TOKEN_STORE_KEY` | only with `BUZZ_HOSTED_TOKEN_STORE` | base64 32-byte AES-256-GCM key |
+
+No other secret is read. `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are **ignored** in hosted mode — do not set them.
+
+**All environment variables (hosted mode):**
+
+| env | default | meaning |
+|---|---|---|
+| `BUZZ_MCP_HTTP` | — | `1` = same as `--http` |
+| `PORT` / `BUZZ_HOSTED_PORT` | `8080` | listen port |
+| `BUZZ_HOSTED_HOST` | `0.0.0.0` | listen address |
+| `BUZZ_HOSTED_RESOURCE` | `https://mcp.buzz.ola.in` | resource id = required token audience |
+| `BUZZ_HOSTED_PUBLIC_URL` | = resource | public base URL used in metadata / `WWW-Authenticate` |
+| `BUZZ_HOSTED_MCP_PATH` | `/mcp` | MCP endpoint path |
+| `BUZZ_HOSTED_ISSUER` | `BUZZ_EKAM_BASE` | expected `iss` / AS |
+| `BUZZ_EKAM_BASE` | `https://ekam.olakrutrim.com` | Ekam base (AS metadata, wire-sign) |
+| `BUZZ_HOSTED_TOKEN_VALIDATION` | `auto` | `auto` (JWKS, else introspection) \| `jwks` \| `introspection` |
+| `BUZZ_HOSTED_JWKS_URI` | from AS metadata | override |
+| `BUZZ_HOSTED_INTROSPECTION_ENDPOINT` | from AS metadata | override |
+| `BUZZ_HOSTED_TOKEN_ENDPOINT` | from AS metadata | override |
+| `BUZZ_HOSTED_METADATA_TTL_S` | `3600` | AS metadata / JWKS cache |
+| `BUZZ_HOSTED_CLOCK_SKEW_S` | `60` | `exp`/`nbf` leeway (max 300) |
+| `BUZZ_HOSTED_EXCHANGE_FORMAT` | `json` | `form` = urlencoded RFC 6749 body |
+| `BUZZ_HOSTED_EXCHANGE_SCOPE` | `wire:sign` | scope requested in exchange |
+| `BUZZ_HOSTED_EXCHANGE_RESOURCE` | = issuer | `resource` for the exchanged token |
+| `BUZZ_HOSTED_REQUIRED_SCOPES` | — | scopes the client token must carry (else 403 `insufficient_scope`) |
+| `BUZZ_HOSTED_SCOPES_SUPPORTED` | `openid,profile,email` | advertised in PRM |
+| `BUZZ_HOSTED_TOKEN_STORE` | — (memory only) | path of the encrypted wire:sign cache |
+| `BUZZ_HOSTED_ALLOWED_ORIGINS` | — (no browser origins) | comma list of allowed `Origin`s |
+| `BUZZ_HOSTED_ALLOWED_HOSTS` | — (any) | comma list of allowed `Host`s (else 421) |
+| `BUZZ_HOSTED_MAX_BODY_KB` | `1024` | request body cap (413) |
+| `BUZZ_HOSTED_RATE_PER_MIN` | `120` | per-user requests/min (429) |
+| `BUZZ_HOSTED_ANON_RATE_PER_MIN` | `60` | per-IP unauthenticated / failed-auth requests/min |
+| `BUZZ_HOSTED_MAX_SESSIONS_PER_USER` | `8` | oldest evicted beyond this |
+| `BUZZ_HOSTED_MAX_SESSIONS` | `200` | per pod; 503 beyond (≈3.5 MiB RSS per active session — size the memory limit to match) |
+| `BUZZ_HOSTED_SESSION_IDLE_S` | `1800` | idle session expiry |
+| `BUZZ_HOSTED_JSON_RESPONSE` | — | `1` = JSON responses instead of SSE |
+| `BUZZ_HOSTED_ALLOW_PLACEHOLDER` | — | `1` silences the placeholder-client-id warning (tests) |
+| `BUZZ_HOSTED_ATTACHMENT_MAX_MB` | `5` (max 50) | in-memory `buzz_attachment_read` cap |
+| `BUZZ_RELAY_HTTP` | `http://localhost:3000` | relay HTTP bridge (**set it**) |
+| `BUZZ_SIGN_BASE` | = relay | NIP-98 `u` base |
+| `BUZZ_TZ` | `UTC` | display zone (Ola: `Asia/Kolkata`) |
+| `BUZZ_HTTP_TIMEOUT_S` / `BUZZ_RELAYINFO_TIMEOUT_S` / `BUZZ_TRANSFER_TIMEOUT_S` | `25` / `8` / `600` | relay timeouts |
+| `BUZZ_ONBOARDING_GUIDE` | — | onboarding guide path |
+
+Per-session cores see only `BUZZ_RELAY_HTTP`, `BUZZ_SIGN_BASE`, `BUZZ_EKAM_BASE`, `BUZZ_TZ`, the three timeouts,
+`BUZZ_HOSTED_ATTACHMENT_MAX_MB` and `BUZZ_ONBOARDING_GUIDE`; the rest of the process env is invisible to them.
+
 ## Security
 
 - No macOS `security` CLI / no secret on process argv (SEC-1 #27, cleared).
@@ -402,6 +498,16 @@ source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` sheban
 in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)
 
 ## Changelog
+
+### v0.2.35
+- **Hosted mode (`buzz-mcp --http`)** for the "Ola Buzz" Grok Bot connector, Phase 1 — see *Hosted mode*.
+  Streamable HTTP, OAuth resource server (Ekam), RFC 8693 exchange to `wire:sign`, per-session
+  isolation, hosted disables, `/healthz`, rate/body limits, Dockerfile + sample k8s. stdio unchanged.
+- `createBuzzServer(opts)` factory (stdio calls it once with `process.env`). `hosted.test.mjs` (mocked Ekam + relay).
+- Token hygiene: exact-value scrub of the session's bearer / wire:sign token in every outgoing text, no raw Ekam
+  error bodies in hosted mode, refresh/id tokens from the exchange dropped (tested: `hosted.test.mjs` case 9).
+- Dockerfile base pinned by digest, uid 1000, no install/build step. `bench/hosted-load.mjs`; default
+  `BUZZ_HOSTED_MAX_SESSIONS` 200 per pod (≈3.5 MiB per active session measured).
 
 ### v0.2.34
 - **Canvases, reminders, workflows (55 tools).** `buzz_canvas_read`, `buzz_canvas_write`, `buzz_remind`,
