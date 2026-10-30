@@ -392,6 +392,29 @@ use session affinity (`deploy/k8s/buzz-mcp-hosted.yaml`). `Dockerfile`: base pin
 no install/build step — it copies the prebuilt, checksum-verified `dist/buzz-mcp.mjs` only. Resource
 numbers: `node bench/hosted-load.mjs` (see the v0.2.35 PR).
 
+**Pre-auth rate limit and client address.** A request with no bearer always gets the `401` +
+`WWW-Authenticate` challenge and is never rate limited (it costs nothing upstream). A bearer this pod has
+not already validated is charged to a per-client-address bucket (`BUZZ_HOSTED_ANON_RATE_PER_MIN`, 60/min)
+**before** it is validated, so junk tokens cannot turn into unbounded introspection / JWKS calls at Ekam;
+a bearer that was already accepted (cached ≤ 60 s and never past its `exp`) skips that bucket and goes
+straight to the per-user limit. Every `429` on `/mcp` keeps `Retry-After` **and** the
+`WWW-Authenticate: Bearer resource_metadata=…` challenge, so a throttled client can still re-authenticate.
+The client address is the socket peer by default — behind an ingress that is the ingress pod, so all
+clients share one bucket. To key on the real client, opt in with `BUZZ_HOSTED_TRUSTED_PROXY_HOPS=N`: the
+address is then the **N-th `X-Forwarded-For` entry from the right**, where N is the number of proxies you
+operate that each append the address they saw (one ingress-nginx in front → `1`; a cloud L7 LB in front of
+ingress-nginx → `2`). Entries further left are client-supplied and never used. Optionally also set
+`BUZZ_HOSTED_TRUSTED_PROXY_CIDRS` (comma list, e.g. the ingress pod CIDR) so `X-Forwarded-For` is only
+read when the socket peer is one of your proxies. With `HOPS` unset or `0`, `X-Forwarded-For` is never read;
+a missing header, fewer entries than `HOPS`, or a non-IP at that position falls back to the socket peer.
+Bad values (non-integer / >10 hops, malformed CIDR, CIDRs without hops) refuse to start.
+
+**Token checks.** JWT access tokens must carry `iss` equal to the issuer (missing `iss` → `401
+invalid_token`); introspection responses may omit `iss` (optional in RFC 7662) but a present one must match.
+The person's pubkey (learned from a wire-sign probe) is cached for `BUZZ_HOSTED_PUBKEY_TTL_S` (3600 s)
+and re-probed for the next new session after that. The optional encrypted token store writes a randomly
+named temp file opened `O_CREAT|O_EXCL` (`wx`), then renames it over the store.
+
 **Port / health.** Listens on `PORT` (default **8080**, also `BUZZ_HOSTED_PORT`), host `BUZZ_HOSTED_HOST`
 (`0.0.0.0`). Health: **`GET /healthz`** → `200 {"ok":true,"name":"Ola Buzz","version":…,"sessions":…}` (no auth). MCP: `/mcp`.
 Metadata: `/.well-known/oauth-protected-resource` (and `…/mcp`).
@@ -434,7 +457,10 @@ No other secret is read. `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are **ignored** in
 | `BUZZ_HOSTED_ALLOWED_HOSTS` | — (any) | comma list of allowed `Host`s (else 421) |
 | `BUZZ_HOSTED_MAX_BODY_KB` | `1024` | request body cap (413) |
 | `BUZZ_HOSTED_RATE_PER_MIN` | `120` | per-user requests/min (429) |
-| `BUZZ_HOSTED_ANON_RATE_PER_MIN` | `60` | per-IP unauthenticated / failed-auth requests/min |
+| `BUZZ_HOSTED_ANON_RATE_PER_MIN` | `60` | per-client-address requests/min for bearers not yet validated (charged before validation; no-token 401s are not limited) |
+| `BUZZ_HOSTED_TRUSTED_PROXY_HOPS` | `0` (off) | `N` ≥ 1: client address = N-th `X-Forwarded-For` entry from the right (max 10); `0` = socket peer, XFF never read |
+| `BUZZ_HOSTED_TRUSTED_PROXY_CIDRS` | — (any peer, when HOPS ≥ 1) | comma list of proxy CIDRs; XFF only read when the socket peer is inside one (requires HOPS ≥ 1) |
+| `BUZZ_HOSTED_PUBKEY_TTL_S` | `3600` (60–86400) | how long a person's probed pubkey is reused for new sessions |
 | `BUZZ_HOSTED_MAX_SESSIONS_PER_USER` | `8` | oldest evicted beyond this |
 | `BUZZ_HOSTED_MAX_SESSIONS` | `200` | per pod; 503 beyond (≈3.5 MiB RSS per active session — size the memory limit to match) |
 | `BUZZ_HOSTED_SESSION_IDLE_S` | `1800` | idle session expiry |
@@ -508,6 +534,11 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   error bodies in hosted mode, refresh/id tokens from the exchange dropped (tested: `hosted.test.mjs` case 9).
 - Dockerfile base pinned by digest, uid 1000, no install/build step. `bench/hosted-load.mjs`; default
   `BUZZ_HOSTED_MAX_SESSIONS` 200 per pod (≈3.5 MiB per active session measured).
+- Review fixes (buzz_security): the pre-auth per-address limit is charged **before** token validation (and
+  skipped for already-validated bearers); no-token `401` challenges are never limited; every `429` keeps
+  `WWW-Authenticate`; opt-in `BUZZ_HOSTED_TRUSTED_PROXY_HOPS` / `BUZZ_HOSTED_TRUSTED_PROXY_CIDRS` key the
+  limit on the real client from `X-Forwarded-For`; JWTs must carry `iss`; pubkey cache TTL
+  (`BUZZ_HOSTED_PUBKEY_TTL_S`); token-store temp file opened `O_EXCL`. Tests: `hosted.test.mjs` cases 10–15.
 
 ### v0.2.34
 - **Canvases, reminders, workflows (55 tools).** `buzz_canvas_read`, `buzz_canvas_write`, `buzz_remind`,

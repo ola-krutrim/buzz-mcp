@@ -13,6 +13,14 @@ data:
   BUZZ_HOSTED_RATE_PER_MIN: "120"
   BUZZ_HOSTED_MAX_BODY_KB: "1024"
   BUZZ_HOSTED_MAX_SESSIONS: "200"
+  BUZZ_HOSTED_ANON_RATE_PER_MIN: "60"           # per client address, charged before token validation
+  # Client address for that limit. Default (unset/0) = socket peer = the ingress pod, i.e. ONE shared
+  # bucket for everyone. relay_sre: once the proxy chain is confirmed, set the number of proxies YOU run
+  # that append to X-Forwarded-For (ingress-nginx alone → "1"; cloud L7 LB + ingress-nginx → "2"), and
+  # ideally the ingress pod CIDR so XFF is only read from your proxies. Never count client-supplied hops.
+  # BUZZ_HOSTED_TRUSTED_PROXY_HOPS: "1"
+  # BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "10.0.0.0/8"   # placeholder — the ingress controller pod CIDR
+  BUZZ_HOSTED_PUBKEY_TTL_S: "3600"
 ---
 # Secret (create separately; keys expected):
 #   BUZZ_HOSTED_CLIENT_ID        — Ekam-issued client id for the connector (not secret, but env-sourced)
