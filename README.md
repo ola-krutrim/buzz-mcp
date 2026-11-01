@@ -373,6 +373,43 @@ One server, many people: MCP **Streamable HTTP** at `https://mcp.buzz.ola.in/mcp
   0600; refuses to start without the key — never plaintext).
 - The person's pubkey is learned from a throwaway signed NIP-98 probe — `/v1/me/wire-key` is never called.
 
+**Two Ekam clients (sign-in vs exchange).** Ekam registers two OAuth clients for this connector:
+
+| client id | type | who uses it | for |
+|---|---|---|---|
+| `buzz-mcp-hosted` | **public**, PKCE `S256`, no secret | the MCP client (Grok Bot) | signing the person in; its access token has audience **`https://mcp.buzz.ola.in`** and is the bearer sent to `/mcp` |
+| `buzz-mcp-hosted-exchange` | **confidential** (client secret) | this server only | the RFC 8693 token exchange at Ekam's token endpoint |
+
+- `BUZZ_HOSTED_CLIENT_ID` / `BUZZ_HOSTED_CLIENT_SECRET` hold the **exchange** client's credentials
+  (`buzz-mcp-hosted-exchange`), never the sign-in client's. The secret is sent as HTTP Basic
+  (`client_id:secret`, RFC 6749 §2.3.1) on every exchange.
+- The exchange is RFC 8693 (`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
+  `subject_token` = the person's validated access token, `scope=wire:sign`, `resource` = Ekam issuer). Ekam
+  returns a **300 s** `wire:sign` access token and **no refresh token** (any refresh/id token in the
+  response is dropped); the server re-exchanges from the client's token when it nears expiry.
+- `wire:sign` is **not** advertised in `/.well-known/oauth-protected-resource` (`scopes_supported` stays
+  `openid profile email`): clients never request it; only the exchange client can obtain it.
+- **The secret is required.** With `BUZZ_HOSTED_CLIENT_SECRET` unset, empty or whitespace, or with
+  `BUZZ_HOSTED_CLIENT_ID` set to the public sign-in client, `buzz-mcp --http` refuses to start (exit 78,
+  one stderr line naming the variable; the value is never printed).
+- A `401 invalid_client` (or `400 invalid_client`) from the exchange — wrong, rotated or missing secret, or
+  the wrong client id — is reported as an operator error: the tool call returns *"Ola Buzz server
+  misconfiguration: Ekam rejected the token-exchange client credentials … Reconnecting will not help."*
+  and an `exchange_client_rejected` JSON log event is written. Neither carries the secret, the Basic header
+  or Ekam's error description.
+
+**Admin steps (Ekam + relay_sre, once per environment).**
+1. Ekam admin: after Ekam's deploy, issue the client secret for `buzz-mcp-hosted-exchange`. It is shown
+   **once** — copy it straight into the secret store, not into chat, tickets or a ConfigMap.
+2. relay_sre: store it in the Kubernetes Secret `buzz-mcp-hosted` as `BUZZ_HOSTED_CLIENT_SECRET`, with
+   `BUZZ_HOSTED_CLIENT_ID=buzz-mcp-hosted-exchange` (see `deploy/k8s/buzz-mcp-hosted.yaml`). The Deployment
+   references the Secret as required, so a pod without it does not start.
+3. Ekam admin: set the Grok Bot redirect URI(s) on the **sign-in** client `buzz-mcp-hosted` (they are empty
+   until set, so sign-in fails until then). Use the callback URL(s) Grok Bot publishes for remote MCP
+   connectors; do not guess them.
+4. Rotation: issue a new secret, update the Secret, restart the pods. Until they restart, tool calls get the
+   `invalid_client` operator error above.
+
 **Isolation.** Each session has its own core (identity, channel/profile/relay-info caches, confirm gate);
 a session id presented with another person's token → `403`. Write guard and rate limit are per user.
 Hosted cores see an allowlisted env only — server `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are ignored.
@@ -423,8 +460,8 @@ Metadata: `/.well-known/oauth-protected-resource` (and `…/mcp`).
 
 | secret env | required | |
 |---|---|---|
-| `BUZZ_HOSTED_CLIENT_ID` | **yes** (not secret, but Ekam-issued; placeholder `REPLACE_WITH_EKAM_CLIENT_ID`) | exchange client |
-| `BUZZ_HOSTED_CLIENT_SECRET` | only if Ekam makes the client confidential | HTTP Basic at the token endpoint |
+| `BUZZ_HOSTED_CLIENT_ID` | **yes** — `buzz-mcp-hosted-exchange` (not secret, but Ekam-issued; placeholder `REPLACE_WITH_EKAM_CLIENT_ID`; the public sign-in client `buzz-mcp-hosted` is refused) | exchange client id |
+| `BUZZ_HOSTED_CLIENT_SECRET` | **yes** — the server refuses to start without it | exchange client secret (issued once by an Ekam admin), HTTP Basic at the token endpoint |
 | `BUZZ_HOSTED_TOKEN_STORE_KEY` | only with `BUZZ_HOSTED_TOKEN_STORE` | base64 32-byte AES-256-GCM key |
 
 No other secret is read. `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are **ignored** in hosted mode — do not set them.
@@ -539,6 +576,11 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   `WWW-Authenticate`; opt-in `BUZZ_HOSTED_TRUSTED_PROXY_HOPS` / `BUZZ_HOSTED_TRUSTED_PROXY_CIDRS` key the
   limit on the real client from `X-Forwarded-For`; JWTs must carry `iss`; pubkey cache TTL
   (`BUZZ_HOSTED_PUBKEY_TTL_S`); token-store temp file opened `O_EXCL`. Tests: `hosted.test.mjs` cases 10–15.
+- Ekam #481 two-client model: `BUZZ_HOSTED_CLIENT_ID` / `BUZZ_HOSTED_CLIENT_SECRET` are the confidential
+  exchange client `buzz-mcp-hosted-exchange`; the secret is now **required** (hosted mode refuses to start
+  without it, exit 78, value never printed), the public sign-in client id is refused as the exchange client,
+  and a `401 invalid_client` from the exchange is a clear operator error (`exchange_client_rejected`) with no
+  secret or Ekam description in it. Sample k8s references a required Secret. Tests: `hosted.test.mjs` case 16.
 
 ### v0.2.34
 - **Canvases, reminders, workflows (55 tools).** `buzz_canvas_read`, `buzz_canvas_write`, `buzz_remind`,
