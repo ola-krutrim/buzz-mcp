@@ -53,7 +53,7 @@ ISS = `http://127.0.0.1:${await listen(ekam)}`;
 const RELAY = `http://127.0.0.1:${await listen(relay)}`;
 const child = spawn(process.execPath, [join(HERE, "..", "dist", "buzz-mcp.mjs"), "--http"], { stdio: ["ignore", "pipe", "inherit"], env: {
   PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), "bench-")), PORT: "0", BUZZ_HOSTED_HOST: "127.0.0.1", BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS,
-  BUZZ_RELAY_HTTP: RELAY, BUZZ_HOSTED_CLIENT_ID: "bench", BUZZ_HOSTED_RATE_PER_MIN: "100000", BUZZ_HOSTED_MAX_SESSIONS: "100000" } });
+  BUZZ_RELAY_HTTP: RELAY, BUZZ_HOSTED_CLIENT_ID: "bench", BUZZ_HOSTED_CLIENT_SECRET: "bench-secret-not-real", BUZZ_HOSTED_RATE_PER_MIN: "100000", BUZZ_HOSTED_MAX_SESSIONS: "100000" } });
 let out = ""; const port = await new Promise((r) => child.stdout.on("data", (d) => { out += d; const m = /"evt":"listening","port":(\d+)/.exec(out); if (m) r(+m[1]); }));
 child.stdout.resume();
 const base = `http://127.0.0.1:${port}`, TICK = 100;

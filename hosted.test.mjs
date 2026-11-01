@@ -14,7 +14,7 @@ import { getPublicKey, finalizeEvent, verifyEvent } from "nostr-tools/pure";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startHttpServer, redact, coreEnv, makeClientIp, trustedProxyConfig, normIp } from "./http-server.mjs";
-import { hostedConfig, createTokenValidator, createTokenExchanger, createEncryptedTokenStore, protectedResourceMetadata } from "./hosted-auth.mjs";
+import { hostedConfig, assertHostedStartup, createTokenValidator, createTokenExchanger, createEncryptedTokenStore, protectedResourceMetadata, SIGNIN_CLIENT_ID, EXCHANGE_CLIENT_ID } from "./hosted-auth.mjs";
 import { makeHostedWireSigner, BUZZ_APP_SIGNIN_MESSAGE } from "./signer.mjs";
 
 // dynamic import AFTER setting BUZZ_MCP_AS_LIBRARY (static imports are hoisted and would start a stdio shim)
@@ -26,6 +26,14 @@ const listenAny = (srv) => new Promise((r) => srv.listen(0, "127.0.0.1", () => r
 const readAll = (rq) => new Promise((r) => { let b = ""; rq.on("data", (c) => (b += c)); rq.on("end", () => r(b)); });
 const nowS = () => Math.floor(Date.now() / 1000);
 const RESOURCE = "https://mcp.buzz.test";
+// Exchange-client secret for the mock Ekam (test-only, random per run). Ekam #481: the exchange client is
+// confidential, so the mock token endpoint answers 401 invalid_client unless HTTP Basic carries it.
+const CLIENT_SECRET = "cs_test_" + randomBytes(12).toString("hex");
+const basicOk = (h, id = "test-client", sec = CLIENT_SECRET) => {
+  const m = /^Basic\s+(.+)$/.exec(String(h || "")); if (!m) return false;
+  const [u, p] = Buffer.from(m[1], "base64").toString("utf8").split(":");
+  try { return decodeURIComponent(u) === id && decodeURIComponent(p) === sec; } catch { return false; }
+};
 
 // ---- people ----
 const USERS = {
@@ -72,6 +80,8 @@ const ekam = createServer(async (rq, rs) => {
   }
   if (url === "/oauth/token") {
     stats.exchanges++;
+    stats.lastExchangeAuth = String(rq.headers.authorization || "");
+    if (!basicOk(rq.headers.authorization)) return reply(401, { error: "invalid_client", error_description: `client authentication failed for ${rq.headers.authorization || "none"}` });
     let j = {}; try { j = JSON.parse(body); } catch {}
     stats.exchangeBodies.push({ grant_type: j.grant_type, scope: j.scope, resource: j.resource, subject_token_type: j.subject_token_type, client_id: j.client_id });
     if (j.grant_type !== "urn:ietf:params:oauth:grant-type:token-exchange" || j.scope !== "wire:sign") return reply(400, { error: "invalid_request" });
@@ -138,7 +148,7 @@ const EKAM_PORT = await listenAny(ekam); ISS = `http://127.0.0.1:${EKAM_PORT}`;
 const RELAY_PORT = await listenAny(relay);
 const logs = [];
 const baseEnv = {
-  BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_CLIENT_ID: "test-client",
+  BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_CLIENT_ID: "test-client", BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET,
   BUZZ_RELAY_HTTP: `http://127.0.0.1:${RELAY_PORT}`, BUZZ_HOSTED_RATE_PER_MIN: "1000",
   BUZZ_PRIVATE_KEY: "11".repeat(32), BUZZ_AUTH_TAG: "should-never-be-used", // must be IGNORED by hosted cores
 };
@@ -274,7 +284,7 @@ await srv.close();
 
 console.log("\nhosted 7: introspection mode, exchanger cache/expiry, encrypted store, signer binding");
 {
-  const cfg = hostedConfig({ BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_TOKEN_VALIDATION: "introspection", BUZZ_HOSTED_CLIENT_ID: "test-client" });
+  const cfg = hostedConfig({ BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_TOKEN_VALIDATION: "introspection", BUZZ_HOSTED_CLIENT_ID: "test-client", BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET });
   const v = createTokenValidator(cfg);
   const op = "op_" + randomBytes(8).toString("hex");
   opaque.set(op, { sub: "bob", aud: RESOURCE, iss: ISS, exp: nowS() + 300, name: "Bob B" });
@@ -323,7 +333,7 @@ console.log("\nhosted 7: introspection mode, exchanger cache/expiry, encrypted s
 console.log("\nhosted 8: `buzz-mcp --http` entry (source + bundled dist) boots, serves /healthz, stdio untouched");
 for (const entry of ["buzz-mcp.mjs", "dist/buzz-mcp.mjs"]) {
   if (!existsSync(join(HERE, entry))) { console.log(`  (skip: ${entry} not built)`); continue; }
-  const child = spawn(process.execPath, [join(HERE, entry), "--http"], { env: { PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), "bh-home-")), PORT: "0", BUZZ_HOSTED_HOST: "127.0.0.1", BUZZ_EKAM_BASE: "http://127.0.0.1:9", BUZZ_HOSTED_CLIENT_ID: "test" }, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [join(HERE, entry), "--http"], { env: { PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), "bh-home-")), PORT: "0", BUZZ_HOSTED_HOST: "127.0.0.1", BUZZ_EKAM_BASE: "http://127.0.0.1:9", BUZZ_HOSTED_CLIENT_ID: "test", BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET }, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   const port = await new Promise((res) => { const to = setTimeout(() => res(null), 15000); child.stdout.on("data", (d) => { out += d; const m = /"evt":"listening","port":(\d+)/.exec(out); if (m) { clearTimeout(to); res(Number(m[1])); } }); });
   let h = null; if (port) try { h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json(); } catch {}
@@ -519,6 +529,68 @@ console.log("\nhosted 15: token-store temp file is created O_EXCL (never follows
   ok(st2.load().get("a").token === "wt_2" && (statSync(path).mode & 0o777) === 0o600, "default temp names: repeated saves work, file 0600, latest value wins");
   ok(!readdirSync(dir).some((n) => n.startsWith("tokens.enc.") && n.endsWith(".tmp")), "no temp files left behind");
   rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("\nhosted 16: exchange client secret is required (Ekam #481 confidential exchange client); invalid_client is an operator error");
+{
+  // startup gate (pure)
+  const cfgOf = (extra) => hostedConfig({ BUZZ_HOSTED_RESOURCE: RESOURCE, BUZZ_EKAM_BASE: ISS, BUZZ_HOSTED_CLIENT_ID: "test-client", ...extra });
+  const gate = (extra) => { try { assertHostedStartup(cfgOf(extra)); return null; } catch (e) { return e; } };
+  const g1 = gate({}), g2 = gate({ BUZZ_HOSTED_CLIENT_SECRET: "" }), g3 = gate({ BUZZ_HOSTED_CLIENT_SECRET: "   \t " });
+  ok(g1 && g2 && g3 && [g1, g2, g3].every((e) => /BUZZ_HOSTED_CLIENT_SECRET is missing or empty/.test(e.message) && /Refusing to start/.test(e.message)), "assertHostedStartup: unset / empty / whitespace-only secret → refuses to start");
+  ok(g1 && g1.message.includes(EXCHANGE_CLIENT_ID), "the refusal names the exchange client it needs");
+  ok(gate({ BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET }) === null, "assertHostedStartup: a secret present → starts");
+  const g4 = gate({ BUZZ_HOSTED_CLIENT_ID: SIGNIN_CLIENT_ID, BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET });
+  ok(g4 && /public sign-in client/.test(g4.message) && !g4.message.includes(CLIENT_SECRET), "BUZZ_HOSTED_CLIENT_ID = the public sign-in client → refuses to start (secret value not echoed)");
+  ok(SIGNIN_CLIENT_ID === "buzz-mcp-hosted" && EXCHANGE_CLIENT_ID === "buzz-mcp-hosted-exchange", "client ids match Ekam #481 (sign-in vs exchange)");
+
+  // startHttpServer refuses (in-process), even with listen:false
+  let e5 = null; try { await startHttpServer({ createBuzzServer, version: "0.2.35", env: { ...baseEnv, BUZZ_HOSTED_CLIENT_SECRET: "" }, listen: false, log: () => {} }); } catch (e) { e5 = e; }
+  ok(e5 && /BUZZ_HOSTED_CLIENT_SECRET is missing or empty/.test(e5.message), "startHttpServer without the secret → throws before serving");
+
+  // the real entry refuses: exit 78, clear stderr, nothing on stdout, never listens
+  for (const entry of ["buzz-mcp.mjs", "dist/buzz-mcp.mjs"]) {
+    if (!existsSync(join(HERE, entry))) { console.log(`  (skip: ${entry} not built)`); continue; }
+    const child = spawn(process.execPath, [join(HERE, entry), "--http"], { env: { PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), "bh-home-")), PORT: "0", BUZZ_HOSTED_HOST: "127.0.0.1", BUZZ_EKAM_BASE: "http://127.0.0.1:9", BUZZ_HOSTED_CLIENT_ID: "test", BUZZ_HOSTED_CLIENT_SECRET: " " }, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => (out += d)); child.stderr.on("data", (d) => (err += d));
+    const k = setTimeout(() => child.kill("SIGKILL"), 15000);
+    const code = await new Promise((r) => child.once("exit", (c) => r(c))); clearTimeout(k);
+    ok(code === 78 && /\[buzz-mcp\] hosted mode: BUZZ_HOSTED_CLIENT_SECRET is missing or empty/.test(err) && !/listening/.test(out), `${entry} --http without the secret → exit 78 with a clear error, never listens (exit ${code})`);
+  }
+
+  // 401 invalid_client from the exchange → clear operator error, no secret / description leak
+  const WRONG = "cs_wrong_" + randomBytes(12).toString("hex");
+  const bad = createTokenExchanger(cfgOf({ BUZZ_HOSTED_CLIENT_SECRET: WRONG }));
+  const T = mint("bob");
+  let e6 = null; try { await bad.get({ sub: "bob" }, T); } catch (e) { e6 = e; }
+  ok(e6 && e6.code === "exchange_client_rejected" && e6.status === 401 && e6.oauthError === "invalid_client", "exchange 401 invalid_client → code exchange_client_rejected");
+  ok(e6 && /server misconfiguration/.test(e6.message) && /BUZZ_HOSTED_CLIENT_SECRET/.test(e6.message) && /Reconnecting will not help/.test(e6.message), "…with an operator-facing message (names the env vars, says reconnect won't help)");
+  const b64 = Buffer.from(`test-client:${WRONG}`).toString("base64");
+  ok(e6 && ![WRONG, b64, T, "client authentication failed"].some((x) => e6.message.includes(x)), "…that never carries the secret, the Basic header, the subject token or Ekam's echoing description");
+  ok(basicOk(stats.lastExchangeAuth, "test-client", WRONG), "the secret is sent as HTTP Basic (client_id:secret) at the token endpoint");
+  const good = createTokenExchanger(cfgOf({ BUZZ_HOSTED_CLIENT_SECRET: CLIENT_SECRET }));
+  ok(typeof (await good.get({ sub: "bob" }, T)) === "string" && basicOk(stats.lastExchangeAuth), "the right secret → exchange succeeds");
+  const viaForm = createTokenExchanger(cfgOf({ BUZZ_HOSTED_CLIENT_SECRET: WRONG, BUZZ_HOSTED_EXCHANGE_FORMAT: "form" }));
+  let e7 = null; try { await viaForm.get({ sub: "bob" }, T); } catch (e) { e7 = e; }
+  ok(e7 && e7.code === "exchange_client_rejected", "form-encoded exchange: same invalid_client mapping");
+
+  // end to end: a server booted with a wrong secret → tool error is the operator message; logs/stdout/stderr never see the secret
+  const seen = []; const oo = process.stdout.write.bind(process.stdout), oe = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (c, ...a) => { seen.push(String(c)); return oo(c, ...a); };
+  process.stderr.write = (c, ...a) => { seen.push(String(c)); return oe(c, ...a); };
+  const L0 = logs.length;
+  try {
+    const { srv: s, base: b } = await boot({ BUZZ_HOSTED_CLIENT_SECRET: WRONG });
+    const S = await connect(b, mint("alice"));
+    const w = await S.call("buzz_whoami");
+    ok(w.isError && /server misconfiguration/.test(w.text) && /invalid_client/.test(w.text), "tool call with a rejected exchange client → operator error text");
+    const L = logs.slice(L0).join("\n");
+    ok(/"evt":"exchange_client_rejected"/.test(L), "an exchange_client_rejected log event is emitted for operators");
+    const all = L + "\n" + seen.join("") + "\n" + w.text;
+    ok(![WRONG, b64, encodeURIComponent(WRONG)].some((x) => all.includes(x)), "the (wrong) secret never appears in logs, stdout/stderr or tool output");
+    await S.c.close(); await s.close();
+  } finally { process.stdout.write = oo; process.stderr.write = oe; }
 }
 
 ekam.close(); relay.close();
