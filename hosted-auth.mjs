@@ -4,6 +4,8 @@
 // client's access token anywhere except Ekam's own token / introspection endpoints (the issuer).
 //
 //   hostedConfig(env)              → config (endpoints + client id from env; placeholders, no secrets)
+//   assertHostedStartup(cfg)       → throws (never echoing a value) unless the exchange client's
+//                                     id + secret are configured: hosted mode refuses to start without them
 //   createAsMetadata(cfg, deps)    → cached Ekam authorization-server metadata (RFC 8414)
 //   createTokenValidator(cfg, deps)→ validate(bearer) → principal {sub, name, email, scopes, exp}
 //                                     JWKS (RFC 7515/7517/7519) or introspection (RFC 7662);
@@ -21,6 +23,14 @@ import { isBuzzAppSigninError, buzzAppSigninError } from "./signer.mjs";
 export const DEFAULT_RESOURCE = "https://mcp.buzz.ola.in";
 export const DEFAULT_ISSUER = "https://ekam.olakrutrim.com";
 export const CLIENT_ID_PLACEHOLDER = "REPLACE_WITH_EKAM_CLIENT_ID";
+// Ekam (#481) registers TWO OAuth clients for the connector:
+//   SIGNIN_CLIENT_ID   — public, PKCE S256; the MCP client (Grok Bot) signs the person in with it and
+//                        sends us the resulting access token (aud = BUZZ_HOSTED_RESOURCE). We never use it.
+//   EXCHANGE_CLIENT_ID — confidential; THIS server authenticates as it (HTTP Basic) at Ekam's token
+//                        endpoint for the RFC 8693 exchange → wire:sign (300 s, no refresh token).
+// BUZZ_HOSTED_CLIENT_ID / BUZZ_HOSTED_CLIENT_SECRET are the EXCHANGE client's credentials.
+export const SIGNIN_CLIENT_ID = "buzz-mcp-hosted";
+export const EXCHANGE_CLIENT_ID = "buzz-mcp-hosted-exchange";
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 export const ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 const ALLOWED_ALGS = new Set(["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"]);
@@ -52,7 +62,7 @@ export function hostedConfig(env = process.env) {
     introspectionEndpoint: trimSlash(env.BUZZ_HOSTED_INTROSPECTION_ENDPOINT || ""),
     tokenEndpoint: trimSlash(env.BUZZ_HOSTED_TOKEN_ENDPOINT || ""),
     clientId: (env.BUZZ_HOSTED_CLIENT_ID || CLIENT_ID_PLACEHOLDER).trim(),
-    clientSecret: (env.BUZZ_HOSTED_CLIENT_SECRET || "").trim() || null,   // env/secret only; optional
+    clientSecret: (env.BUZZ_HOSTED_CLIENT_SECRET || "").trim() || null,   // env/secret only; REQUIRED to start (assertHostedStartup)
     exchangeFormat,
     exchangeScope: (env.BUZZ_HOSTED_EXCHANGE_SCOPE || "wire:sign").trim(),
     exchangeResource: trimSlash(env.BUZZ_HOSTED_EXCHANGE_RESOURCE || issuer), // wire-sign wants aud = ISSUER
@@ -63,6 +73,17 @@ export function hostedConfig(env = process.env) {
     tokenStorePath: (env.BUZZ_HOSTED_TOKEN_STORE || "").trim() || null,
     tokenStoreKey: (env.BUZZ_HOSTED_TOKEN_STORE_KEY || "").trim() || null,  // base64 32 bytes, from a Secret / KMS
   });
+}
+
+// Hosted-mode startup gate. The exchange client is confidential (Ekam #481): without its secret every
+// token exchange would fail with 401 invalid_client, so refuse to start instead of serving a connector
+// that can never post. Messages name the variable, never its value.
+export function assertHostedStartup(cfg) {
+  if (!cfg.clientSecret)
+    throw new Error(`BUZZ_HOSTED_CLIENT_SECRET is missing or empty — hosted mode needs the secret of the confidential Ekam exchange client (${EXCHANGE_CLIENT_ID}), issued once by an Ekam admin and mounted from a Kubernetes Secret. Refusing to start.`);
+  if (cfg.clientId === SIGNIN_CLIENT_ID)
+    throw new Error(`BUZZ_HOSTED_CLIENT_ID is the public sign-in client (${SIGNIN_CLIENT_ID}) — set it to the exchange client (${EXCHANGE_CLIENT_ID}) whose secret is in BUZZ_HOSTED_CLIENT_SECRET. Refusing to start.`);
+  return cfg;
 }
 
 export function protectedResourceMetadata(cfg) {
@@ -285,6 +306,13 @@ export function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now = Date.n
     try { j = await readJson(await fetchFn(ep, { method: "POST", headers, body }), "token exchange"); }
     catch (e) {
       if (e.oauthError && isBuzzAppSigninError({ error: e.oauthError })) throw buzzAppSigninError(e); // only explicit codes (ASSUMPTION)
+      if (e.oauthError === "invalid_client" && (e.status === 401 || e.status === 400)) {
+        // Ekam rejected OUR client credentials (wrong/rotated BUZZ_HOSTED_CLIENT_SECRET, or the wrong
+        // BUZZ_HOSTED_CLIENT_ID). An operator problem — reconnecting won't help. Never echoes Ekam's
+        // description or any credential.
+        const err = new Error(`Ola Buzz server misconfiguration: Ekam rejected the token-exchange client credentials (HTTP ${e.status} invalid_client). Operator: check that BUZZ_HOSTED_CLIENT_ID / BUZZ_HOSTED_CLIENT_SECRET hold the ${EXCHANGE_CLIENT_ID} client's id and current secret (an Ekam admin can re-issue it). Reconnecting will not help.`);
+        err.status = e.status; err.oauthError = "invalid_client"; err.code = "exchange_client_rejected"; throw err;
+      }
       const err = new Error(`Ekam token exchange failed (${e.status ? `HTTP ${e.status}${e.oauthError ? ` ${e.oauthError}` : ""}` : "unreachable"}) — reconnect Ola Buzz and try again`);
       err.status = e.status; err.oauthError = e.oauthError; throw err;
     }

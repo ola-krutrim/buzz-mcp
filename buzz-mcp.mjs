@@ -3078,7 +3078,8 @@ return {
 if (process.env.BUZZ_MCP_AS_LIBRARY !== "1") {
   if (process.argv.includes("--http") || process.env.BUZZ_MCP_HTTP === "1") {
     const { startHttpServer } = await import("./http-server.mjs");
-    await startHttpServer({ createBuzzServer, version: SHIM_VERSION_EXPORT });
+    try { await startHttpServer({ createBuzzServer, version: SHIM_VERSION_EXPORT }); }
+    catch (e) { process.stderr.write(`[buzz-mcp] hosted mode: ${String((e && e.message) || e).slice(0, 500)}\n`); process.exit(78); } // EX_CONFIG; message never carries a secret value
   } else {
     const { server } = await createBuzzServer();
     await server.connect(new StdioServerTransport());
