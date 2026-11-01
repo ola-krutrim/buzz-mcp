@@ -188,6 +188,12 @@ export function makeWireTokenProvider(env, fetchFn) {
 export const WIRE_ALLOWLIST = new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005, 9007, 9002, 9021, 40003, 9022]);
 // Kinds Ekam refuses to wire-sign BY DESIGN (not "not yet"): the shim names them as such.
 export const EKAM_REFUSED_BY_DESIGN = new Map([[9008, "delete channel"], [5, "deletion / remove reaction"], [41012, "hide a DM"]]);
+// v0.2.34: kinds buzz-mcp NEVER signs, in ANY mode (local, wire, dry run). Workflow approval grant /
+// deny (46030/46031) is a human decision: an agent must never approve (or deny on someone's behalf)
+// a workflow step — least of all one it triggered itself (buzz_workflow_run). There is deliberately
+// no approval tool; this guard makes that fail closed even if a future code path tries to sign one.
+export const NEVER_SIGN = new Map([[46030, "workflow approval (grant)"], [46031, "workflow approval (deny)"]]);
+const neverSignError = (kind) => new Error(`buzz-mcp never signs kind ${kind} (${NEVER_SIGN.get(kind)}) — workflow approvals are a human decision; approve or deny in the Buzz app. Nothing was signed.`);
 
 // NIP-29 governed moderation (kinds 9000 add-member / 9001 remove-member / 9005 delete-message),
 // live server-side via Ekam v206 (allowlist {…,9000,9001,9005}). Ekam stays content-agnostic; the
@@ -460,7 +466,7 @@ export async function resolveSigner(opts = {}) {
     return {
       mode: "wire",
       pubkey,
-      canSign: (kind) => WIRE_ALLOWLIST.has(kind),
+      canSign: (kind) => WIRE_ALLOWLIST.has(kind) && !NEVER_SIGN.has(kind),
       wipe() { /* wire mode holds no key */ },
       // v0.2.33: no encrypt-to-self in wire mode — the user's key is escrowed at Ekam and Ekam offers
       // no NIP-44 endpoint, so NIP-44 features (read state, private saved items) are agent-mode only.
@@ -470,6 +476,7 @@ export async function resolveSigner(opts = {}) {
       ekamToken: () => tokens.get(false),
       ekamBase: () => base,
       async sign(template) {
+        if (NEVER_SIGN.has(template.kind)) throw neverSignError(template.kind);
         if (!WIRE_ALLOWLIST.has(template.kind))
           throw new Error(`wire mode refuses kind ${template.kind} (allowlist {${[...WIRE_ALLOWLIST].sort((a, b) => a - b).join(", ")}})`);
         const token = await tokens.get(false);
@@ -509,7 +516,7 @@ export async function resolveSigner(opts = {}) {
   return {
     mode: "local",
     pubkey,
-    canSign: () => true,
+    canSign: (kind) => !NEVER_SIGN.has(kind),
     selfCipher,
     // v0.2.31 (item 8): zero the in-memory secret key on shutdown. After wipe() the signer refuses
     // rather than signing with an all-zero key. (Best effort: JS strings the key passed through as
@@ -517,6 +524,7 @@ export async function resolveSigner(opts = {}) {
     wipe() { wiped = true; sk.fill(0); if (convKey) convKey.fill(0); },
     async sign(template) {
       if (wiped) throw new Error("signer: key already wiped (shutting down)");
+      if (NEVER_SIGN.has(template.kind)) throw neverSignError(template.kind);
       return finalizeEvent(
         { kind: template.kind, created_at: template.created_at ?? now(), tags: template.tags || [], content: template.content ?? "" },
         sk,

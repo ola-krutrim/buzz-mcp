@@ -98,6 +98,8 @@ export const KIND_LABELS = {
   9002: "edit channel metadata", 9005: "delete message", 9007: "create channel", 9008: "delete channel",
   9021: "join channel", 9022: "leave channel", 20001: "presence", 30315: "user status", 40003: "edit message",
   41010: "open DM", 41011: "add to DM", 41012: "hide DM", 24242: "blossom upload auth",
+  30300: "reminder (encrypted to self)", 40100: "channel canvas", 46020: "workflow trigger",
+  46030: "workflow approval (grant) — never signed", 46031: "workflow approval (deny) — never signed",
 };
 export function dryRunPreview(tool, template, { notes = [] } = {}) {
   const t = template || {};

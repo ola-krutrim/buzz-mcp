@@ -3,7 +3,7 @@
 // dependency). Integration against the LIVE endpoint is deferred until ekam ships
 // 27235 (requirement C) and confirms the contract (requirement D).
 
-import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet, EKAM_REFUSED_BY_DESIGN, parseAllowedKinds } from "./signer.mjs";
+import { resolveSigner, wireSign, WIRE_ALLOWLIST, wirePersistId, wireBleedVars, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, BLOSSOM_MAX_TTL, parseImeta, messageAttachments, buildImeta, mediaCapCheck, MEDIA_MB, makeWireTokenProvider, wireNameGet, wireNameSet, EKAM_REFUSED_BY_DESIGN, parseAllowedKinds, NEVER_SIGN } from "./signer.mjs";
 import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 let pass = 0, fail = 0;
@@ -391,6 +391,25 @@ console.log("wire display name (ekam #335 name capture):");
   ok(wireNameSet(id + "-empty", "   ") === false, "wireNameSet refuses an empty/whitespace name");
   ok(wireNameGet("absent-" + Date.now()) === null, "wireNameGet returns null when absent");
   try { const nfs = await import("node:fs"); const { join } = await import("node:path"); const { homedir } = await import("node:os"); nfs.rmSync(join(homedir(), ".config", "buzz-cli", "wire-refresh", id + ".name"), { force: true }); } catch { /* throwaway */ }
+}
+
+// v0.2.34: workflow approvals (46030 grant / 46031 deny) are NEVER signed, in any mode.
+{
+  console.log("\nv0.2.34 NEVER_SIGN (workflow approvals)");
+  ok(NEVER_SIGN.has(46030) && NEVER_SIGN.has(46031) && NEVER_SIGN.size === 2, "NEVER_SIGN = {46030, 46031}");
+  ok(!WIRE_ALLOWLIST.has(46030) && !WIRE_ALLOWLIST.has(46031) && !WIRE_ALLOWLIST.has(46020) && !WIRE_ALLOWLIST.has(40100) && !WIRE_ALLOWLIST.has(30300), "v0.2.34 added no kinds to WIRE_ALLOWLIST (46020/40100/30300/46030/46031 absent)");
+  const ns = await resolveSigner({ env: { BUZZ_NAME: "ns_agent", BUZZ_PRIVATE_KEY: "c3".repeat(32) }, sessionId: "ns" });
+  ok(ns.canSign(46030) === false && ns.canSign(46031) === false, "local canSign(46030/46031) === false");
+  ok(ns.canSign(46020) && ns.canSign(40100) && ns.canSign(30300), "local canSign(46020/40100/30300) === true (agent mode)");
+  for (const k of [46030, 46031]) {
+    try { await ns.sign({ kind: k, tags: [["e", "a".repeat(64)]], content: "" }); ok(false, `local sign(${k}) should throw`); }
+    catch (e) { ok(/never signs kind/.test(e.message) && /human decision/.test(e.message), `local sign(${k}) refused → ${e.message.slice(0, 60)}…`); }
+    ok(wsigner.canSign(k) === false, `wire canSign(${k}) === false`);
+    try { await wsigner.sign({ kind: k, tags: [], content: "" }); ok(false, `wire sign(${k}) should throw`); }
+    catch (e) { ok(/never signs kind/.test(e.message), `wire sign(${k}) refused before any Ekam call`); }
+  }
+  ok([46020, 40100, 30300].every((k) => wsigner.canSign(k) === false), "wire canSign(46020/40100/30300) === false (pending relay_sre/releng)");
+  ns.wipe();
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
