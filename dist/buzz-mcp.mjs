@@ -27699,7 +27699,7 @@ import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir as homedir4, hostname, tmpdir as tmpdir2 } from "node:os";
 import { join as join5, basename as basename2, extname } from "node:path";
 import { execSync, spawn as spawn2 } from "node:child_process";
-var SHIM_VERSION_EXPORT = "0.2.35";
+var SHIM_VERSION_EXPORT = "0.2.36";
 var ERROR_TEXT_CAP = 1500;
 async function createBuzzServer(opts = {}) {
   const ENV = opts.env ?? process.env;
