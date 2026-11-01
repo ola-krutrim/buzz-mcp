@@ -37,7 +37,7 @@
     "url": "https://github.com/ola-krutrim/buzz-mcp.git"
   },
   "scripts": {
-    "test": "node nip44.test.mjs && node signer.test.mjs && node wirelogin.test.mjs && node names.test.mjs && node bridge.test.mjs && node clientversion.test.mjs && node loadkey.test.mjs && node safety.test.mjs && node v031.test.mjs && node parity32.test.mjs && node v032.test.mjs && node parity33.test.mjs && node v033.test.mjs && node parity34.test.mjs && node v034.test.mjs && node hosted.test.mjs",
+    "test": "node nip44.test.mjs && node signer.test.mjs && node attach.test.mjs && node attach-r3.test.mjs && node attach-relay.test.mjs && node wirelogin.test.mjs && node names.test.mjs && node bridge.test.mjs && node clientversion.test.mjs && node loadkey.test.mjs && node safety.test.mjs && node v031.test.mjs && node parity32.test.mjs && node v032.test.mjs && node parity33.test.mjs && node v033.test.mjs && node parity34.test.mjs && node v034.test.mjs && node hosted.test.mjs",
     "build": "esbuild buzz-mcp.mjs --bundle --platform=node --format=esm --outfile=dist/buzz-mcp.mjs && esbuild wirelogin.mjs --bundle --platform=node --format=esm --outfile=dist/wirelogin.mjs",
     "start:http": "node dist/buzz-mcp.mjs --http",
     "gen:confusables": "node scripts/gen-confusables.mjs"
