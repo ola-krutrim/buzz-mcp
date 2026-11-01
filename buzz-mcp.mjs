@@ -17,7 +17,7 @@ import {
   createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
   openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
 } from "./safety.mjs";
-export const SHIM_VERSION_EXPORT = "0.2.35"; // keep in sync with package.json
+export const SHIM_VERSION_EXPORT = "0.2.36"; // keep in sync with package.json
 const ERROR_TEXT_CAP = 1500; // v0.2.31 re-check: catch-all error text cap (code points)
 import { AsyncLocalStorage } from "node:async_hooks";
 // v0.2.32 Slack-parity helpers (message links, search dates, dry-run previews, open-channel

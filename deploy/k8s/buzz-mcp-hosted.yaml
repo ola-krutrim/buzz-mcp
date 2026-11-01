@@ -47,7 +47,7 @@ spec:
       securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: buzz-mcp
-          image: REGISTRY/buzz-mcp-hosted:0.2.35   # pin by digest in prod
+          image: REGISTRY/buzz-mcp-hosted:0.2.36   # pin by digest in prod
           ports: [{ containerPort: 8080, name: http }]
           envFrom:
             - configMapRef: { name: buzz-mcp-hosted }

@@ -395,7 +395,7 @@ One server, many people: MCP **Streamable HTTP** at `https://mcp.buzz.ola.in/mcp
   response is dropped); the server re-exchanges from the client's token when it nears expiry.
 - `wire:sign` is **not** advertised in `/.well-known/oauth-protected-resource` (`scopes_supported` stays
   `openid profile email`): clients never request it; only the exchange client can obtain it.
-- **The secret is required.** With `BUZZ_HOSTED_CLIENT_SECRET` unset, empty or whitespace, or with
+- **The secret is required (v0.2.36+).** With `BUZZ_HOSTED_CLIENT_SECRET` unset, empty or whitespace, or with
   `BUZZ_HOSTED_CLIENT_ID` set to the public sign-in client, `buzz-mcp --http` refuses to start (exit 78,
   one stderr line naming the variable; the value is never printed).
 - A `401 invalid_client` (or `400 invalid_client`) from the exchange — wrong, rotated or missing secret, or
@@ -467,7 +467,7 @@ Metadata: `/.well-known/oauth-protected-resource` (and `…/mcp`).
 | secret env | required | |
 |---|---|---|
 | `BUZZ_HOSTED_CLIENT_ID` | **yes** — `buzz-mcp-hosted-exchange` (not secret, but Ekam-issued; placeholder `REPLACE_WITH_EKAM_CLIENT_ID`; the public sign-in client `buzz-mcp-hosted` is refused) | exchange client id |
-| `BUZZ_HOSTED_CLIENT_SECRET` | **yes** — the server refuses to start without it | exchange client secret (issued once by an Ekam admin), HTTP Basic at the token endpoint |
+| `BUZZ_HOSTED_CLIENT_SECRET` | **yes** — the server refuses to start without it (v0.2.36+; v0.2.35 treats it as optional) | exchange client secret (issued once by an Ekam admin), HTTP Basic at the token endpoint |
 | `BUZZ_HOSTED_TOKEN_STORE_KEY` | only with `BUZZ_HOSTED_TOKEN_STORE` | base64 32-byte AES-256-GCM key |
 
 No other secret is read. `BUZZ_PRIVATE_KEY` / `BUZZ_AUTH_TAG` are **ignored** in hosted mode — do not set them.
@@ -568,14 +568,24 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 
 ## Changelog
 
-### Unreleased — attach-hardening (buzz_security attachment ruling)
-- **Attachment type allow-list, from the bytes.** `signer.mjs classifyAttachment` replaces the
-  extension→MIME map: images jpeg/png/gif/webp, mp4, and pdf/docx/xlsx/pptx/odt/ods/odp/txt/csv/md/json.
-  HTML/SVG/XML, zip and other archives, OLE, OOXML with `vbaProject.bin`, ODF with Basic/Scripts,
-  and executables are refused before any upload. Text must be UTF-8, no controls, no markup.
-- **Names.** Sanitised (NFC; Cf/bidi, C0/C1, `/` `\` stripped; dots/spaces trimmed; ≤120 bytes),
-  extension forced to the sniffed type; non-media files post as `[escaped name](url)`.
-- **Folders** classify every file first (no partial post); disallowed types are skipped and listed.
+### v0.2.36
+- Version bump to 0.2.36. The changes below are already on `main` (#27, #22, #28); this release tags them.
+- Hosted secret startup check (#27). Ekam #481 two-client model: `BUZZ_HOSTED_CLIENT_ID` / `BUZZ_HOSTED_CLIENT_SECRET` are the confidential
+  exchange client `buzz-mcp-hosted-exchange`; the secret is now **required** (hosted mode refuses to start
+  without it, exit 78, value never printed), the public sign-in client id is refused as the exchange client,
+  and a `401 invalid_client` from the exchange is a clear operator error (`exchange_client_rejected`) with no
+  secret or Ekam description in it. Sample k8s references a required Secret. Tests: `hosted.test.mjs` case 16.
+- v0.2.35 hosted mode sends the secret if set but does not require it; v0.2.36 refuses to start without it.
+- **Attachment hardening** (buzz_security attachment ruling, #22; three review rounds):
+  - **Attachment type allow-list, from the bytes.** `signer.mjs classifyAttachment` replaces the
+    extension→MIME map: images jpeg/png/gif/webp, mp4, and pdf/docx/xlsx/pptx/odt/ods/odp/txt/csv/md/json.
+    HTML/SVG/XML, zip and other archives, OLE, OOXML with `vbaProject.bin`, ODF with Basic/Scripts,
+    and executables are refused before any upload. Text must be UTF-8, no controls, no markup.
+  - **Names.** Sanitised (NFC; Cf/bidi, C0/C1, `/` `\` stripped; dots/spaces trimmed; ≤120 bytes),
+    extension forced to the sniffed type; non-media files post as `[escaped name](url)`.
+  - **Folders** classify every file first (no partial post); disallowed types are skipped and listed.
+- `@hono/node-server` 2.1.5 (clears GHSA-rmxm-3fg6-px4f in the unused `serveStatic`; `npm audit` 0).
+- **Licence: Apache-2.0** (#28): `LICENSE` added and `package.json` `license` set to `Apache-2.0`.
 
 ### v0.2.35
 - **Hosted mode (`buzz-mcp --http`)** for the "Ola Buzz" Grok Bot connector, Phase 1 — see *Hosted mode*.
@@ -591,11 +601,6 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   `WWW-Authenticate`; opt-in `BUZZ_HOSTED_TRUSTED_PROXY_HOPS` / `BUZZ_HOSTED_TRUSTED_PROXY_CIDRS` key the
   limit on the real client from `X-Forwarded-For`; JWTs must carry `iss`; pubkey cache TTL
   (`BUZZ_HOSTED_PUBKEY_TTL_S`); token-store temp file opened `O_EXCL`. Tests: `hosted.test.mjs` cases 10–15.
-- Ekam #481 two-client model: `BUZZ_HOSTED_CLIENT_ID` / `BUZZ_HOSTED_CLIENT_SECRET` are the confidential
-  exchange client `buzz-mcp-hosted-exchange`; the secret is now **required** (hosted mode refuses to start
-  without it, exit 78, value never printed), the public sign-in client id is refused as the exchange client,
-  and a `401 invalid_client` from the exchange is a clear operator error (`exchange_client_rejected`) with no
-  secret or Ekam description in it. Sample k8s references a required Secret. Tests: `hosted.test.mjs` case 16.
 
 ### v0.2.34
 - **Canvases, reminders, workflows (55 tools).** `buzz_canvas_read`, `buzz_canvas_write`, `buzz_remind`,
