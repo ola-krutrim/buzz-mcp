@@ -2543,14 +2543,17 @@ async function wireSign(base, token, template, fetchFn = fetch) {
     } catch {
     }
     if (res.status === 400 && j && typeof j === "object" && j.error === "kind_not_allowed") {
-      const err = new Error(kindNotAllowedMessage(template.kind, j));
-      err.code = "kind_not_allowed";
-      err.kind = template.kind;
-      err.allowedKinds = parseAllowedKinds(j);
-      throw err;
+      const err2 = new Error(kindNotAllowedMessage(template.kind, j));
+      err2.code = "kind_not_allowed";
+      err2.kind = template.kind;
+      err2.allowedKinds = parseAllowedKinds(j);
+      throw err2;
     }
     const hint = res.status === 403 ? " (token likely missing the wire:sign scope, or human suspended)" : res.status === 401 ? " (token revoked/expired, or wrong audience \u2014 must be minted resource=ISSUER)" : res.status === 503 ? " (escrow/Vault unavailable \u2014 transient)" : "";
-    throw new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);
+    const err = new Error(`wire-sign kind ${template.kind} -> HTTP ${res.status}: ${detail}${hint}`);
+    err.status = res.status;
+    err.ekamError = j && typeof j === "object" && typeof j.error === "string" ? j.error : null;
+    throw err;
   }
   let parsed;
   try {
