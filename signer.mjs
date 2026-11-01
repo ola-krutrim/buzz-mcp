@@ -16,6 +16,9 @@
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import * as nip19 from "nostr-tools/nip19";
 import { resolveKey } from "./loadkey_v2.mjs";
+import { getConversationKey as nip44ConvKey, encrypt as nip44Encrypt, decrypt as nip44Decrypt } from "./nip44.mjs";
+import { hmac } from "@noble/hashes/hmac.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -459,6 +462,9 @@ export async function resolveSigner(opts = {}) {
       pubkey,
       canSign: (kind) => WIRE_ALLOWLIST.has(kind),
       wipe() { /* wire mode holds no key */ },
+      // v0.2.33: no encrypt-to-self in wire mode — the user's key is escrowed at Ekam and Ekam offers
+      // no NIP-44 endpoint, so NIP-44 features (read state, private saved items) are agent-mode only.
+      selfCipher: null,
       // Expose a valid wire:sign access token for authed Ekam reads (e.g. the
       // email→pubkey directory resolve) — same WHO-gate as signing, no new credential.
       ekamToken: () => tokens.get(false),
@@ -484,14 +490,31 @@ export async function resolveSigner(opts = {}) {
   const sk = await resolveKey(opts);
   const pubkey = getPublicKey(sk);
   let wiped = false;
+  // v0.2.33: NIP-44 v2 encrypt-to-SELF (conversation key = ECDH(own sk, own pk)), used for NIP-RS read
+  // state (kind 30078) and private NIP-51 saved items. The secret key never leaves this closure; the
+  // derived conversation key is computed lazily, held only here, and zeroed by wipe(). Only three
+  // narrow operations are exposed: encrypt/decrypt to self, and derive(label) = HMAC-SHA256(convKey,
+  // label) for stable per-identity identifiers (read-state slot / client_id) that reveal nothing.
+  let convKey = null;
+  const ck = () => {
+    if (wiped) throw new Error("signer: key already wiped (shutting down)");
+    if (!convKey) convKey = nip44ConvKey(sk, pubkey);
+    return convKey;
+  };
+  const selfCipher = Object.freeze({
+    encrypt: (plaintext) => nip44Encrypt(plaintext, ck()),
+    decrypt: (payload) => nip44Decrypt(payload, ck()),
+    derive: (label) => Buffer.from(hmac(sha256, ck(), new TextEncoder().encode(String(label)))).toString("hex"),
+  });
   return {
     mode: "local",
     pubkey,
     canSign: () => true,
+    selfCipher,
     // v0.2.31 (item 8): zero the in-memory secret key on shutdown. After wipe() the signer refuses
     // rather than signing with an all-zero key. (Best effort: JS strings the key passed through as
     // hex cannot be wiped; the Uint8Array the signer holds can.)
-    wipe() { wiped = true; sk.fill(0); },
+    wipe() { wiped = true; sk.fill(0); if (convKey) convKey.fill(0); },
     async sign(template) {
       if (wiped) throw new Error("signer: key already wiped (shutting down)");
       return finalizeEvent(
