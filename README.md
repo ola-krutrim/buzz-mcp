@@ -133,7 +133,7 @@ outside the set are refused by the gate before any network call — including 90
 channel), 5 (deletion / remove reaction) and 41012 (DM hide), which Ekam deliberately never signs
 for "post as me" (use an agent's own key for those).
 
-## Tools (48)
+## Tools (55)
 
 Reads, posts, DMs and reactions all act as your identity (as you in wire-sign mode; as the
 agent in local mode).
@@ -182,6 +182,13 @@ agent in local mode).
 | `buzz_save` / `buzz_saved` | save / unsave a message (`remove: true`) and list saved items — NIP-51 bookmark list (kind 10003), private (NIP-44 to self) by default, `private: false` for a public entry. Save: agent mode only; list: read-only |
 | `buzz_post_diff` | post a code diff (kind 40008, rendered with highlighting) with `repo` + `commit` (+ optional file, parent commit, branches, PR, language, description, truncated); `event` = thread reply. Diff ≤ 60 KB. Agent mode only for now |
 | `buzz_status_set` / `buzz_status_clear` | set / clear your live status (NIP-38 kind 30315). Agent mode only — refused in wire mode until Ekam allows 30315 |
+| `buzz_canvas_read` | read a channel's canvas (kind 40100, newest signature-verified one; shown as untrusted, fenced text) and its `expected_head` |
+| `buzz_canvas_write` | replace a channel's canvas (≤ 128 KB) — **read first**: pass the `expected_head` from `buzz_canvas_read` (`none` for a first canvas); refused if the head changed since. Head check, not compare-and-swap (see changelog). Agent mode only |
+| `buzz_remind` | set a reminder for yourself (kind 30300, NIP-44 encrypted to you, `not_before`) — a note and/or a message (`channel` + `event`); `when` = `30m` / `2h` / `1d` / `1w`, epoch seconds, or ISO with a zone. Agent mode only |
+| `buzz_reminders` | list your reminders (due ones marked ⏰), `include_done` for done / cancelled. Agent mode only |
+| `buzz_reminder_done` | mark a due reminder done, or `cancel: true` (any time). Idempotent. Agent mode only |
+| `buzz_workflows` | list a channel's workflows (kind 30620) or show one's definition — untrusted, fenced text |
+| `buzz_workflow_run` | trigger **your own** enabled workflow (kind 46020) with optional flat `inputs`. A workflow with an approval step needs `confirm: true`, and **buzz-mcp never approves a step** — a human does, in Buzz. Agent mode only |
 
 **`dry_run: true` on every write tool** (not `buzz_login`): the shim builds the event exactly as the
 real call would — resolution, mentions, thread tags, attachment checks — then shows it and stops.
@@ -191,7 +198,7 @@ are redacted from the preview. Hard confirmations (`confirm: true` on delete-cha
 `confirm_make_public`) still refuse in a dry run rather than being previewed past. Read tools refuse
 `dry_run` as an unknown argument.
 
-### Slack parity (v0.2.33)
+### Slack parity (v0.2.34)
 
 | Slack | Buzz MCP | status |
 |---|---|---|
@@ -212,8 +219,11 @@ are redacted from the preview. Hard confirmations (`confirm: true` on delete-cha
 | saved items | `buzz_save` / `buzz_saved` | ✅ NIP-51 kind 10003, private by default (save: agent mode; wire needs Ekam to allow 10003) |
 | post a code snippet / diff | `buzz_post_diff` | ✅ kind 40008 (agent mode; wire needs Ekam to allow 40008) |
 | set your status | `buzz_status_set` / `buzz_status_clear` | ✅ agent mode (wire needs Ekam to allow 30315) |
+| channel canvas | `buzz_canvas_read` / `buzz_canvas_write` | ✅ kind 40100 (write: agent mode, head check — real CAS pending; wire needs the backend to accept 40100) |
+| reminders | `buzz_remind` / `buzz_reminders` / `buzz_reminder_done` | ✅ kind 30300, NIP-44 to self (agent mode; wire has no encrypt-to-self) |
+| workflows | `buzz_workflows` / `buzz_workflow_run` | ✅ list (kind 30620) + run your own (kind 46020, agent mode). Approvals: ❌ never — by design |
 | delete your own message (as author) | — | ⏳ gated: needs the relay to accept an author-signed delete (relay SRE) |
-| pins, reminders, scheduled send, polls/workflows, huddles | — | ❌ not in Buzz yet (needs relay support) |
+| pins, scheduled send, polls, huddles | — | ❌ not in Buzz yet (needs relay support) |
 | personal emoji list (kind 10030) | — | ⏳ deferred |
 
 **Reads surface an event id + attachment marker.** Each `buzz_read` / `buzz_dm_read` row is
@@ -382,7 +392,7 @@ npm ci          # install pinned deps from package-lock.json into a REAL node_mo
                 # (not a symlink — a symlinked node_modules bakes absolute paths into
                 # the bundle comments)
 npm run build   # esbuild → dist/buzz-mcp.mjs + dist/wirelogin.mjs (esbuild is a pinned devDep)
-npm test        # signer + wirelogin + names + bridge + clientversion + loadkey suites (~500 assertions)
+npm test        # all suites, serially (~1,800 assertions)
 sha256sum -c dist/SHA256SUMS   # CI (.github/workflows/ci.yml) enforces this after a rebuild
 ```
 
@@ -392,6 +402,34 @@ source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` sheban
 in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)
 
 ## Changelog
+
+### v0.2.34
+- **Canvases, reminders, workflows (55 tools).** `buzz_canvas_read`, `buzz_canvas_write`, `buzz_remind`,
+  `buzz_reminders`, `buzz_reminder_done`, `buzz_workflows`, `buzz_workflow_run`. See the parity table.
+- **Canvas (kind 40100).** Read shows the newest signature-verified canvas as untrusted, fenced text
+  plus its `expected_head`. Write is read-before-write: `expected_head` is required (`none` for a first
+  canvas, a full 64-hex id otherwise) and the head is re-queried just before signing; if it moved, the
+  write is refused ("re-read"). ⚠ This is a **head check, not compare-and-swap** — two writers racing
+  inside the same instant can still both land. TODO(buzz_dx): switch to upstream's after-head CAS once
+  ported. ≤ 131072 bytes; empty content needs `clear: true`; `created_at` is kept above the head's.
+- **Reminders (kind 30300).** NIP-44 encrypted to yourself (the v0.2.33 `nip44.mjs`), `not_before` for
+  due time, 128-bit random `d`. Target-message reminders use the desktop shape (`eventId`, `channelId`,
+  `preview`, `authorPubkey`) plus the NIP-ER `id`. Only your own, signature-verified events are read
+  (verification happens *before* picking the newest per `d`, so a forged newer one can't hide the real
+  one). Done before due is refused (use `cancel: true`); done / cancelled reminders carry an
+  `expiration` and no `not_before`. Agent mode only.
+- **Workflows (kinds 30620 / 46020).** Definitions are untrusted: names escaped, YAML fenced line by
+  line and capped. `buzz_workflow_run` resolves your **own** workflows first and refuses someone
+  else's or a disabled one. **Approvals fail closed:** there is no approval tool, and the signer refuses
+  kinds 46030 / 46031 (`NEVER_SIGN`) in every mode, including dry run — so the agent can never approve
+  a step it (or anyone) triggered. A workflow with an approval step needs `confirm: true` to trigger and
+  then waits for a human.
+- **Wire mode:** no new kinds on `WIRE_ALLOWLIST`. Canvas write and workflow run are refused clearly
+  (TODO: pending relay_sre / releng on which kinds the backend accepts); reminders are agent-mode only
+  (no encrypt-to-self at Ekam). Canvas read and workflow list work in both modes.
+- `validateArgs` accepts `object`-typed arguments (workflow `inputs`: flat, ≤ 32 keys, string / number /
+  boolean values, each ≤ 4096 chars, ≤ 16 KB total).
+- New write tools get `dry_run` automatically.
 
 ### v0.2.33
 - **Slack parity batch 2 (48 tools).** `buzz_profile_set`, `buzz_mark_read`, `buzz_save`, `buzz_saved`,
