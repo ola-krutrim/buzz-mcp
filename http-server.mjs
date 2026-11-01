@@ -19,7 +19,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema, isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { hostedConfig, protectedResourceMetadata, resourceMetadataUrl, createAsMetadata, createTokenValidator, createTokenExchanger, createEncryptedTokenStore, AuthError, hashSub } from "./hosted-auth.mjs";
+import { hostedConfig, assertHostedStartup, protectedResourceMetadata, resourceMetadataUrl, createAsMetadata, createTokenValidator, createTokenExchanger, createEncryptedTokenStore, AuthError, hashSub } from "./hosted-auth.mjs";
 import { makeHostedWireSigner, hostedWireError, probeWirePubkey, isBuzzAppSigninError, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE } from "./signer.mjs";
 import { createWriteGuard, writeLimitFromEnv } from "./safety.mjs";
 
@@ -121,7 +121,7 @@ function bucket(perMin, now) {
 export async function startHttpServer({ createBuzzServer, version = "?", env = process.env, fetch: fetchFn = fetch, now = Date.now,
   listen = true, port, host, log: logSink } = {}) {
   if (typeof createBuzzServer !== "function") throw new Error("startHttpServer needs the createBuzzServer factory");
-  const cfg = hostedConfig(env);
+  const cfg = assertHostedStartup(hostedConfig(env));   // refuses to start without the exchange client secret
   const O = {
     maxBody: int(env.BUZZ_HOSTED_MAX_BODY_KB, 1024, 1, 16384) * 1024,
     perMin: int(env.BUZZ_HOSTED_RATE_PER_MIN, 120, 1, 100_000),
@@ -138,7 +138,7 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
   if (cfg.clientId === "REPLACE_WITH_EKAM_CLIENT_ID" && env.BUZZ_HOSTED_ALLOW_PLACEHOLDER !== "1" && listen)
     process.stderr.write("[buzz-mcp] ⚠ BUZZ_HOSTED_CLIENT_ID is the placeholder — token exchange will fail until Ekam issues a client id.\n");
   const write = logSink || ((o) => process.stdout.write(JSON.stringify(o) + "\n"));
-  const log = (evt, f = {}) => { try { const o = { ts: new Date(now()).toISOString(), evt, ...f }; if (o.err) o.err = redact(o.err).slice(0, 300); write(o); } catch {} };
+  const log = (evt, f = {}) => { try { const o = { ts: new Date(now()).toISOString(), evt, ...f }; if (o.err) o.err = scrub(o.err, cfg.clientSecret).slice(0, 300); write(o); } catch {} };
 
   const meta = createAsMetadata(cfg, { fetch: fetchFn, now });
   const validate = createTokenValidator(cfg, { fetch: fetchFn, now, metadata: meta });
@@ -201,8 +201,9 @@ export async function startHttpServer({ createBuzzServer, version = "?", env = p
         return r;
       } catch (e) {
         const friendly = e && (e.code === "buzz_app_signin_required" || BUZZ_APP_SIGNIN_RE.test(String(e.message)));
-        log("tool", { user: s.user, sid: s.sid && s.sid.slice(0, 8), tool, ok: false, ms: now() - t0, err: friendly ? "not_provisioned" : scrub(e && e.message, s.subjectToken, s.wireToken) });
-        return { content: [{ type: "text", text: friendly ? BUZZ_APP_SIGNIN_MESSAGE : `error: ${scrub(e && e.message, s.subjectToken, s.wireToken).slice(0, 400)}` }], isError: true };
+        if (e && e.code === "exchange_client_rejected") log("exchange_client_rejected", { user: s.user, status: e.status });
+        log("tool", { user: s.user, sid: s.sid && s.sid.slice(0, 8), tool, ok: false, ms: now() - t0, err: friendly ? "not_provisioned" : scrub(e && e.message, s.subjectToken, s.wireToken, cfg.clientSecret) });
+        return { content: [{ type: "text", text: friendly ? BUZZ_APP_SIGNIN_MESSAGE : `error: ${scrub(e && e.message, s.subjectToken, s.wireToken, cfg.clientSecret).slice(0, 400)}` }], isError: true };
       }
     });
     const transport = new StreamableHTTPServerTransport({

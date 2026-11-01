@@ -22,10 +22,18 @@ data:
   # BUZZ_HOSTED_TRUSTED_PROXY_CIDRS: "10.0.0.0/8"   # placeholder — the ingress controller pod CIDR
   BUZZ_HOSTED_PUBKEY_TTL_S: "3600"
 ---
-# Secret (create separately; keys expected):
-#   BUZZ_HOSTED_CLIENT_ID        — Ekam-issued client id for the connector (not secret, but env-sourced)
-#   BUZZ_HOSTED_CLIENT_SECRET    — only if Ekam requires a confidential client for token exchange
+# Secret `buzz-mcp-hosted` — REQUIRED; create it out-of-band (External Secrets / KMS), never commit values.
+# Ekam (#481) has two clients: the public PKCE sign-in client `buzz-mcp-hosted` (used by Grok Bot; no
+# secret, not configured here) and the confidential exchange client `buzz-mcp-hosted-exchange` (this server).
+#   BUZZ_HOSTED_CLIENT_ID        — REQUIRED: "buzz-mcp-hosted-exchange" (not secret, but kept with its secret)
+#   BUZZ_HOSTED_CLIENT_SECRET    — REQUIRED: the exchange client's secret. An Ekam admin issues it after
+#                                  Ekam's deploy and it is shown ONCE. The pod refuses to start without it
+#                                  (exit 78); a wrong/rotated one makes every tool call fail with an
+#                                  `exchange_client_rejected` operator error until the Secret is fixed.
 #   BUZZ_HOSTED_TOKEN_STORE_KEY  — only if BUZZ_HOSTED_TOKEN_STORE is set (base64 32 bytes; KMS-managed)
+# e.g.  kubectl -n buzz create secret generic buzz-mcp-hosted \
+#         --from-literal=BUZZ_HOSTED_CLIENT_ID=buzz-mcp-hosted-exchange \
+#         --from-file=BUZZ_HOSTED_CLIENT_SECRET=/dev/stdin      # paste, then Ctrl-D; keeps it out of shell history
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: buzz-mcp-hosted, namespace: buzz, labels: { app: buzz-mcp-hosted } }
@@ -43,7 +51,12 @@ spec:
           ports: [{ containerPort: 8080, name: http }]
           envFrom:
             - configMapRef: { name: buzz-mcp-hosted }
-            - secretRef: { name: buzz-mcp-hosted }
+            - secretRef: { name: buzz-mcp-hosted, optional: false }   # the Secret above is required
+          env:   # explicit, non-optional keys: the pod fails to start (CreateContainerConfigError) if either is absent
+            - name: BUZZ_HOSTED_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: buzz-mcp-hosted, key: BUZZ_HOSTED_CLIENT_ID, optional: false } }
+            - name: BUZZ_HOSTED_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: buzz-mcp-hosted, key: BUZZ_HOSTED_CLIENT_SECRET, optional: false } }
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
           resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
           readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }

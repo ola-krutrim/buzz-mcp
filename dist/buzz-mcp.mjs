@@ -25059,7 +25059,7 @@ function hostedConfig(env = process.env) {
     tokenEndpoint: trimSlash(env.BUZZ_HOSTED_TOKEN_ENDPOINT || ""),
     clientId: (env.BUZZ_HOSTED_CLIENT_ID || CLIENT_ID_PLACEHOLDER).trim(),
     clientSecret: (env.BUZZ_HOSTED_CLIENT_SECRET || "").trim() || null,
-    // env/secret only; optional
+    // env/secret only; REQUIRED to start (assertHostedStartup)
     exchangeFormat,
     exchangeScope: (env.BUZZ_HOSTED_EXCHANGE_SCOPE || "wire:sign").trim(),
     exchangeResource: trimSlash(env.BUZZ_HOSTED_EXCHANGE_RESOURCE || issuer),
@@ -25072,6 +25072,13 @@ function hostedConfig(env = process.env) {
     tokenStoreKey: (env.BUZZ_HOSTED_TOKEN_STORE_KEY || "").trim() || null
     // base64 32 bytes, from a Secret / KMS
   });
+}
+function assertHostedStartup(cfg) {
+  if (!cfg.clientSecret)
+    throw new Error(`BUZZ_HOSTED_CLIENT_SECRET is missing or empty \u2014 hosted mode needs the secret of the confidential Ekam exchange client (${EXCHANGE_CLIENT_ID}), issued once by an Ekam admin and mounted from a Kubernetes Secret. Refusing to start.`);
+  if (cfg.clientId === SIGNIN_CLIENT_ID)
+    throw new Error(`BUZZ_HOSTED_CLIENT_ID is the public sign-in client (${SIGNIN_CLIENT_ID}) \u2014 set it to the exchange client (${EXCHANGE_CLIENT_ID}) whose secret is in BUZZ_HOSTED_CLIENT_SECRET. Refusing to start.`);
+  return cfg;
 }
 function protectedResourceMetadata(cfg) {
   return {
@@ -25328,6 +25335,13 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
       j = await readJson(await fetchFn(ep, { method: "POST", headers, body }), "token exchange");
     } catch (e) {
       if (e.oauthError && isBuzzAppSigninError({ error: e.oauthError })) throw buzzAppSigninError(e);
+      if (e.oauthError === "invalid_client" && (e.status === 401 || e.status === 400)) {
+        const err2 = new Error(`Ola Buzz server misconfiguration: Ekam rejected the token-exchange client credentials (HTTP ${e.status} invalid_client). Operator: check that BUZZ_HOSTED_CLIENT_ID / BUZZ_HOSTED_CLIENT_SECRET hold the ${EXCHANGE_CLIENT_ID} client's id and current secret (an Ekam admin can re-issue it). Reconnecting will not help.`);
+        err2.status = e.status;
+        err2.oauthError = "invalid_client";
+        err2.code = "exchange_client_rejected";
+        throw err2;
+      }
       const err = new Error(`Ekam token exchange failed (${e.status ? `HTTP ${e.status}${e.oauthError ? ` ${e.oauthError}` : ""}` : "unreachable"}) \u2014 reconnect Ola Buzz and try again`);
       err.status = e.status;
       err.oauthError = e.oauthError;
@@ -25366,13 +25380,15 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     size: () => cache.size
   };
 }
-var DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, defaultTmpName, hashSub;
+var DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, SIGNIN_CLIENT_ID, EXCHANGE_CLIENT_ID, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, defaultTmpName, hashSub;
 var init_hosted_auth = __esm({
   async "hosted-auth.mjs"() {
     await init_signer();
     DEFAULT_RESOURCE = "https://mcp.buzz.ola.in";
     DEFAULT_ISSUER = "https://ekam.olakrutrim.com";
     CLIENT_ID_PLACEHOLDER = "REPLACE_WITH_EKAM_CLIENT_ID";
+    SIGNIN_CLIENT_ID = "buzz-mcp-hosted";
+    EXCHANGE_CLIENT_ID = "buzz-mcp-hosted-exchange";
     TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
     ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
     ALLOWED_ALGS = /* @__PURE__ */ new Set(["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"]);
@@ -25497,7 +25513,7 @@ async function startHttpServer({
   log: logSink
 } = {}) {
   if (typeof createBuzzServer2 !== "function") throw new Error("startHttpServer needs the createBuzzServer factory");
-  const cfg = hostedConfig(env);
+  const cfg = assertHostedStartup(hostedConfig(env));
   const O = {
     maxBody: int3(env.BUZZ_HOSTED_MAX_BODY_KB, 1024, 1, 16384) * 1024,
     perMin: int3(env.BUZZ_HOSTED_RATE_PER_MIN, 120, 1, 1e5),
@@ -25517,7 +25533,7 @@ async function startHttpServer({
   const log = (evt, f = {}) => {
     try {
       const o = { ts: new Date(now2()).toISOString(), evt, ...f };
-      if (o.err) o.err = redact(o.err).slice(0, 300);
+      if (o.err) o.err = scrub(o.err, cfg.clientSecret).slice(0, 300);
       write(o);
     } catch {
     }
@@ -25614,8 +25630,9 @@ async function startHttpServer({
         return r;
       } catch (e) {
         const friendly = e && (e.code === "buzz_app_signin_required" || BUZZ_APP_SIGNIN_RE.test(String(e.message)));
-        log("tool", { user: s.user, sid: s.sid && s.sid.slice(0, 8), tool, ok: false, ms: now2() - t0, err: friendly ? "not_provisioned" : scrub(e && e.message, s.subjectToken, s.wireToken) });
-        return { content: [{ type: "text", text: friendly ? BUZZ_APP_SIGNIN_MESSAGE : `error: ${scrub(e && e.message, s.subjectToken, s.wireToken).slice(0, 400)}` }], isError: true };
+        if (e && e.code === "exchange_client_rejected") log("exchange_client_rejected", { user: s.user, status: e.status });
+        log("tool", { user: s.user, sid: s.sid && s.sid.slice(0, 8), tool, ok: false, ms: now2() - t0, err: friendly ? "not_provisioned" : scrub(e && e.message, s.subjectToken, s.wireToken, cfg.clientSecret) });
+        return { content: [{ type: "text", text: friendly ? BUZZ_APP_SIGNIN_MESSAGE : `error: ${scrub(e && e.message, s.subjectToken, s.wireToken, cfg.clientSecret).slice(0, 400)}` }], isError: true };
       }
     });
     const transport = new StreamableHTTPServerTransport({
@@ -29909,7 +29926,13 @@ ${UNTRUSTED_NOTE}
 if (process.env.BUZZ_MCP_AS_LIBRARY !== "1") {
   if (process.argv.includes("--http") || process.env.BUZZ_MCP_HTTP === "1") {
     const { startHttpServer: startHttpServer2 } = await init_http_server().then(() => http_server_exports);
-    await startHttpServer2({ createBuzzServer, version: SHIM_VERSION_EXPORT });
+    try {
+      await startHttpServer2({ createBuzzServer, version: SHIM_VERSION_EXPORT });
+    } catch (e) {
+      process.stderr.write(`[buzz-mcp] hosted mode: ${String(e && e.message || e).slice(0, 500)}
+`);
+      process.exit(78);
+    }
   } else {
     const { server } = await createBuzzServer();
     await server.connect(new StdioServerTransport());
