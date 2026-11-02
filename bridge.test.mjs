@@ -20,9 +20,8 @@
 //   without presenting, spending, or revoking any real token family; a persist
 //   id nobody uses, so ~/.config/buzz-cli/wire-refresh/wire.tok is never touched.
 //
-// Network: case 1 reaches Ekam to get the 400 (safe, junk refresh). If Ekam is
-// unreachable the case is reported SKIP rather than FAIL, so an offline CI run
-// does not go red for the wrong reason. Case 2 is fully offline (unroutable host).
+// Network: case 1 gets its 400 from a local mock Ekam (no prod /oauth/token traffic);
+// case 2 is fully offline (unroutable host).
 
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -155,7 +154,17 @@ console.log("bridge.test.mjs — runtime string a client receives\n");
 // ---- Case 1: wire auth-400 → legible remedy, never unknown_transport ---------
 console.log("case 1: wire mint auth-400 (junk refresh)");
 {
+  // refresh-singleflight: the 400 now comes from a LOCAL mock Ekam (no prod /oauth/token traffic
+  // from `npm test` under the real client id), in a throwaway HOME (the refused refresh leaves a
+  // .dead tombstone), with one invalid_grant attempt so the reply lands inside probeRead's window.
+  const { createServer } = await import("node:http");
+  let ekamCalls = 0;
+  const ekam = createServer((req, res) => { ekamCalls++; req.resume(); req.on("end", () => { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"invalid_grant","error_description":"refresh token is invalid"}'); }); });
+  await new Promise((r) => ekam.listen(0, "127.0.0.1", r));
   const text = await probeRead({
+    HOME: mkdtempSync(join(tmpdir(), "bridge-case1-")),
+    BUZZ_EKAM_BASE: `http://127.0.0.1:${ekam.address().port}`,
+    BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "1",
     BUZZ_WIRE_SIGN: "1",
     BUZZ_WIRE_ID: "bridgeprobe",
     BUZZ_WIRE_REFRESH: "invalid-refresh-token-for-bridge-regression",
@@ -175,7 +184,9 @@ console.log("case 1: wire mint auth-400 (junk refresh)");
     console.log("  client sees: " + text.slice(0, 200));
     ok(!UNKNOWN_TRANSPORT.test(text), "does NOT mislabel the auth error as unknown_transport");
     ok(LOGIN_REMEDY.test(text), "carries an actionable login remedy");
+    ok(ekamCalls === 1, `refused refresh → exactly one /oauth/token call, no retry storm (got ${ekamCalls})`);
   }
+  ekam.close();
 }
 
 // ---- Case 2: genuine transport failure → restart, NOT a re-login prompt ------
@@ -236,6 +247,7 @@ console.log("\ncase 4: buzz_status_set/clear refused in wire mode (kind 30315 no
 {
   const WIRE = {
     BUZZ_WIRE_SIGN: "1", BUZZ_WIRE_ID: "statusprobe",
+    HOME: mkdtempSync(join(tmpdir(), "bridge-case4-")), BUZZ_EKAM_BASE: "http://127.0.0.1:1", // never reaches Ekam
     BUZZ_WIRE_REFRESH: "invalid-refresh-token-for-status-regression",
     BUZZ_EKAM_CLIENT_ID: process.env.BUZZ_EKAM_CLIENT_ID || "clt_37501bdddf3c4e43a0ff",
     BUZZ_USER_PUBKEY: "ab".repeat(32),

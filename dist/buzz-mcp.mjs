@@ -1809,9 +1809,9 @@ function parseURLObject(trimmed, def) {
 function stripTabAndNewline(value) {
   return value.replace(asciiTabOrNewline, "");
 }
-function urlHostnameOk(url, hostname2) {
-  hostname2.lastIndex = 0;
-  return hostname2.test(url.hostname);
+function urlHostnameOk(url, hostname3) {
+  hostname3.lastIndex = 0;
+  return hostname3.test(url.hostname);
 }
 function urlProtocolOk(url, protocol) {
   protocol.lastIndex = 0;
@@ -19806,7 +19806,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
     bits2int_modN: "function"
   });
   ecdsaOpts = Object.assign({}, ecdsaOpts);
-  const randomBytes7 = ecdsaOpts.randomBytes || randomBytes;
+  const randomBytes8 = ecdsaOpts.randomBytes || randomBytes;
   const hmac2 = ecdsaOpts.hmac || ((key, msg) => hmac(hash, key, msg));
   const { Fp, Fn } = Point;
   const { ORDER: CURVE_ORDER, BITS: fnBits } = Fn;
@@ -19948,7 +19948,7 @@ function ecdsa(Point, hash, ecdsaOpts = {}) {
       throw new Error("invalid private key");
     const seedArgs = [int2octets(d), int2octets(h1int)];
     if (extraEntropy != null && extraEntropy !== false) {
-      const e = extraEntropy === true ? randomBytes7(lengths.secretKey) : extraEntropy;
+      const e = extraEntropy === true ? randomBytes8(lengths.secretKey) : extraEntropy;
       seedArgs.push(abytes(e, void 0, "extraEntropy"));
     }
     const seed = concatBytes(...seedArgs);
@@ -20538,7 +20538,7 @@ var init_loadkey_v2 = __esm({
     REFRESH_DIR = join2(CFG_DIR, "service-refresh");
     refreshFile = (account) => join2(REFRESH_DIR, `${(account || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
     if (process.argv.includes("--test")) {
-      const { rmSync, statSync: statSync3 } = await import("node:fs");
+      const { rmSync, statSync: statSync4 } = await import("node:fs");
       let pass = 0, fail = 0;
       const ok = (c, m) => c ? (pass++, console.log("  \u2705 " + m)) : (fail++, console.log("  \u274C " + m));
       console.log("resolve \u2014 pin caches + keystore recovery (the churn fix):");
@@ -20547,7 +20547,7 @@ var init_loadkey_v2 = __esm({
       ok(skToHex(a) === pin, "named + pin \u2192 uses pin (and caches to keystore)");
       const b = await resolveKey({ env: { BUZZ_NAME: "smoke_governed" }, sessionId: "x" });
       ok(skToHex(b) === pin, "named, pin lost \u2192 RECOVERED from keystore (no random)");
-      const mode = statSync3(identityFile("smoke_governed")).mode & 511;
+      const mode = statSync4(identityFile("smoke_governed")).mode & 511;
       ok(mode === 384, `keystore file is 0600 \u2014 no Keychain argv leak (SEC-1)`);
       try {
         rmSync(identityFile("smoke_governed"));
@@ -21528,27 +21528,106 @@ var init_nip44 = __esm({
 });
 
 // signer.mjs
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2, openSync, writeSync, closeSync, fsyncSync, renameSync, unlinkSync, statSync } from "node:fs";
+import { createHash, randomBytes as randomBytes3 } from "node:crypto";
+import { homedir as homedir2, hostname } from "node:os";
 import { join as join3 } from "node:path";
 import { inflateRawSync } from "node:zlib";
-function wireRefreshGet(id) {
+function atomicWrite0600(f, data) {
+  mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+  const tmp = `${f}.tmp-${process.pid}-${randomBytes3(6).toString("hex")}`;
+  let fd;
   try {
-    const f = wireRefreshFile(id);
-    return existsSync2(f) ? readFileSync2(f, "utf8").trim() || null : null;
-  } catch {
-    return null;
+    fd = openSync(tmp, "wx", 384);
+    writeSync(fd, data);
+    try {
+      fsyncSync(fd);
+    } catch {
+    }
+    closeSync(fd);
+    fd = void 0;
+    chmodSync2(tmp, 384);
+    renameSync(tmp, f);
+  } catch (e) {
+    if (fd !== void 0) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+    unlinkQuiet(tmp);
+    throw e;
   }
+}
+function wireRefreshGet(id) {
+  return readTrim(wireRefreshFile(id));
 }
 function wireRefreshSet(id, tok) {
   try {
-    mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
-    const f = wireRefreshFile(id);
-    writeFileSync2(f, tok, { mode: 384 });
-    chmodSync2(f, 384);
+    atomicWrite0600(wireRefreshFile(id), String(tok));
+    unlinkQuiet(wireDeadFile(id));
     return true;
   } catch {
     return false;
+  }
+}
+function wireRefreshClear(id, refused) {
+  const cur = wireRefreshGet(id);
+  if (cur && refused && cur !== refused) return false;
+  unlinkQuiet(wireRefreshFile(id));
+  unlinkQuiet(wireAccessFile(id));
+  return true;
+}
+async function withWireLock(id, fn, { timeoutMs = 45e3, staleMs = 6e4, pollMs = 50, now: now2 = Date.now } = {}) {
+  mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+  const lf = wireLockFile(id);
+  const me = { pid: process.pid, host: hostname(), t: now2(), n: randomBytes3(8).toString("hex") };
+  const deadline = now2() + timeoutMs;
+  for (; ; ) {
+    try {
+      const fd = openSync(lf, "wx", 384);
+      try {
+        writeSync(fd, JSON.stringify({ ...me, t: now2() }));
+      } finally {
+        closeSync(fd);
+      }
+      break;
+    } catch (e) {
+      if (!e || e.code !== "EEXIST") throw e;
+    }
+    const held = readJson(lf);
+    let stale = false;
+    if (!held) {
+      try {
+        stale = now2() - statSync(lf).mtimeMs > staleMs;
+      } catch {
+        continue;
+      }
+    } else stale = now2() - Number(held.t || 0) > staleMs || held.host === hostname() && Number.isInteger(held.pid) && !pidAlive(held.pid);
+    if (stale) {
+      const again = readJson(lf);
+      if (again && held && again.n === held.n || !again && !held) {
+        const grave = `${lf}.stale-${randomBytes3(6).toString("hex")}`;
+        try {
+          renameSync(lf, grave);
+          unlinkQuiet(grave);
+        } catch {
+        }
+      }
+      continue;
+    }
+    if (now2() >= deadline) {
+      const err = new Error("wire:sign token refresh: another buzz-mcp process holds the refresh lock (timed out waiting) \u2014 try again shortly");
+      err.transient = true;
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, pollMs + Math.floor(Math.random() * pollMs)));
+  }
+  try {
+    return await fn();
+  } finally {
+    const cur = readJson(lf);
+    if (cur && cur.n === me.n) unlinkQuiet(lf);
   }
 }
 function wirePubkeyGet(id) {
@@ -21593,14 +21672,102 @@ function wireNameSet(id, name) {
     return false;
   }
 }
-function makeWireTokenProvider(env, fetchFn) {
+function wireInvalidGrantAttempts(env) {
+  const n = parseInt(String((env && env.BUZZ_WIRE_INVALID_GRANT_ATTEMPTS) ?? "").trim(), 10);
+  return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
+}
+function parseRetryAfter(v, nowMs = Date.now()) {
+  const s = String(v ?? "").trim();
+  if (!s) return 0;
+  if (/^\d+$/.test(s)) return Math.min(RETRY_AFTER_CAP_MS, parseInt(s, 10) * 1e3);
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? Math.min(RETRY_AFTER_CAP_MS, Math.max(0, t - nowMs)) : 0;
+}
+function transientBackoffMs(failures, rand = Math.random, retryAfterMs = 0) {
+  const raw = Math.min(TR_BACKOFF_CAP_MS, TR_BACKOFF_BASE_MS * 2 ** Math.max(0, failures - 1));
+  let d = Math.floor(raw / 2 + rand() * (raw / 2));
+  if (failures >= 2) d = Math.max(d, TR_MIN_REPEAT_MS);
+  return Math.max(d, Math.min(RETRY_AFTER_CAP_MS, retryAfterMs || 0));
+}
+function invalidGrantBackoffMs(attempt, rand = Math.random) {
+  const raw = IG_BACKOFF_BASE_MS * 4 ** Math.max(0, attempt - 1);
+  return Math.floor(raw * (0.75 + rand() * 0.5));
+}
+function signInError(detail) {
+  const e = new Error(`wire:sign token mint -> ${detail} \u2014 sign-in expired; the stored refresh was cleared. ${WIRE_SIGNIN_HINT}`);
+  e.code = "WIRE_SIGNIN_REQUIRED";
+  e.signInRequired = true;
+  return e;
+}
+function makeWireTokenProvider(env, fetchFn, opts = {}) {
   const base = ekamBase2(env);
   const clientId = (env.BUZZ_EKAM_CLIENT_ID ?? DEFAULT_EKAM_CLIENT_ID).trim();
   const persistId = wirePersistId(env);
-  let refresh = wireRefreshGet(persistId) || (env.BUZZ_WIRE_REFRESH || "").trim() || null;
-  let access = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
-  let accessExp = access ? Infinity : 0;
+  const nowMs = opts.now || Date.now;
+  const rand = opts.random || Math.random;
+  const sleep = opts.sleep || ((ms) => new Promise((r) => {
+    const t = setTimeout(r, ms);
+  }));
+  const lockOpts = { ...opts.lock || {} };
+  const maxIgAttempts = opts.invalidGrantAttempts ?? wireInvalidGrantAttempts(env);
+  const log = opts.log || ((m) => process.stderr.write(`[buzz-mcp] ${m}
+`));
+  const staticTok = (env.BUZZ_EKAM_HUMAN_TOKEN || "").trim() || null;
+  const envSeed = (env.BUZZ_WIRE_REFRESH || "").trim() || null;
   const SKEW_MS = 3e4;
+  const disk0 = wireRefreshGet(persistId);
+  const dead0 = disk0 ? null : wireDeadGet(persistId);
+  const seedBlocked = !!(dead0 && envSeed && (!dead0.seed || dead0.seed === tokFp(envSeed)));
+  let refresh = disk0 || (envSeed && !(dead0 && seedBlocked) ? envSeed : null);
+  let onDisk = !!disk0;
+  let access = staticTok;
+  let accessExp = access ? Infinity : 0;
+  let deadErr = !refresh && dead0 && !staticTok ? signInError(`refresh refused earlier (${dead0.reason || "invalid_grant"})`) : null;
+  if (!staticTok && refresh) adoptDiskAccess(false);
+  function adoptDiskAccess(force, rejected) {
+    const acc = wireAccessGet(persistId);
+    if (!acc || acc.rt !== tokFp(refresh) || !(nowMs() < acc.exp)) return false;
+    if (force && acc.access_token === rejected) return false;
+    access = acc.access_token;
+    accessExp = acc.exp;
+    return true;
+  }
+  function syncFromDisk() {
+    const d = wireRefreshGet(persistId);
+    if (d && d !== refresh) {
+      refresh = d;
+      onDisk = true;
+      if (deadErr) {
+        deadErr = null;
+        log("wire: a fresh sign-in was found on disk \u2014 resuming");
+      }
+      return true;
+    }
+    return false;
+  }
+  function markDead(detail, reason) {
+    deadErr = signInError(detail);
+    refresh = null;
+    access = staticTok;
+    accessExp = staticTok ? Infinity : 0;
+    if (renewTimer) {
+      clearTimeout(renewTimer);
+      renewTimer = null;
+    }
+    return deadErr;
+  }
+  function cooldownError(st) {
+    const secs = Math.max(1, Math.ceil((st.nextAt - nowMs()) / 1e3));
+    const e = st.igAttempts ? new Error(`wire:sign token mint -> refresh refused (${st.last || "invalid_grant"}), attempt ${st.igAttempts}/${maxIgAttempts}; next try in ~${secs}s. If it keeps failing you will be asked to sign in again (buzz_login / \`buzz-mcp-login\`).`) : new Error(`wire:sign token mint -> backing off after ${st.failures} failure(s) (${st.last || "transient"}); next try in ~${secs}s \u2014 not calling Ekam until then.`);
+    e.code = "WIRE_REFRESH_BACKOFF";
+    e.retryAt = st.nextAt;
+    e.transient = true;
+    return e;
+  }
+  const liveState = () => {
+    const st = wireStateGet(persistId);
+    return st && st.rt === tokFp(refresh) ? st : null;
+  };
   let inflightMint = null, renewTimer = null;
   function scheduleRenew() {
     if (renewTimer) {
@@ -21608,61 +21775,143 @@ function makeWireTokenProvider(env, fetchFn) {
       renewTimer = null;
     }
     if (!refresh || !isFinite(accessExp)) return;
-    const delay = Math.max(3e4, Math.floor((accessExp - Date.now()) * 0.75));
+    const delay = Math.max(3e4, Math.floor((accessExp - nowMs()) * 0.75));
     renewTimer = setTimeout(() => {
-      getToken(true).catch((e) => process.stderr.write(`[buzz-mcp] wire keep-alive renew failed (will retry on next call): ${e.message}
-`));
+      getToken(true).catch((e) => log(`wire keep-alive renew failed (will retry on next call): ${e.message}`));
     }, delay);
     if (renewTimer.unref) renewTimer.unref();
   }
-  async function mint() {
-    if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
-    if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
-    const res = await fetchFn(`${base}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, refresh_token: refresh })
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      let detail = text.slice(0, 200);
-      try {
-        const j2 = JSON.parse(text);
-        detail = j2.error_description || j2.error || detail;
-      } catch {
+  async function lockedAttempt(force, rejected) {
+    return withWireLock(persistId, async () => {
+      const d = wireRefreshGet(persistId);
+      if (d && d !== refresh) {
+        refresh = d;
+        onDisk = true;
+        if (adoptDiskAccess(force, rejected)) return "adopted";
+      } else if (!d && onDisk) {
+        const dm = wireDeadGet(persistId);
+        throw markDead(dm ? `refresh refused by Ekam (${dm.reason || "invalid_grant"}) in another buzz-mcp process` : "stored refresh was removed", dm && dm.reason);
       }
-      throw new Error(`wire:sign token mint -> HTTP ${res.status}: ${detail} (refresh revoked/expired? re-run the one-time login)`);
+      if (adoptDiskAccess(force, rejected)) return "adopted";
+      const st = liveState();
+      if (st && nowMs() < st.nextAt) throw cooldownError(st);
+      if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
+      let res, text;
+      try {
+        res = await fetchFn(`${base}/oauth/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, refresh_token: refresh }),
+          signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(MINT_TIMEOUT_MS) : void 0
+        });
+        text = await res.text();
+      } catch (e) {
+        const failures = (st && st.failures || 0) + 1;
+        const nextAt = nowMs() + transientBackoffMs(failures, rand);
+        wireStateSet(persistId, { rt: tokFp(refresh), failures, igAttempts: 0, nextAt, last: "network" });
+        const err = new Error(`wire:sign token mint -> network error (${e && (e.cause?.code || e.code || e.name) || "fetch failed"}); backing off ~${Math.ceil((nextAt - nowMs()) / 1e3)}s`);
+        err.transient = true;
+        err.code = "WIRE_REFRESH_BACKOFF";
+        err.retryAt = nextAt;
+        throw err;
+      }
+      if (!res.ok) {
+        let detail = String(text || "").slice(0, 200), code = null;
+        try {
+          const j2 = JSON.parse(text);
+          code = typeof j2.error === "string" ? j2.error : null;
+          detail = j2.error_description || j2.error || detail;
+        } catch {
+        }
+        const label = `HTTP ${res.status}: ${detail}`;
+        if (code && TERMINAL_OAUTH_ERRORS.has(code)) {
+          const attempt = (st && st.igAttempts || 0) + 1;
+          if (attempt >= maxIgAttempts) {
+            const refused = refresh;
+            wireRefreshClear(persistId, refused);
+            wireStateClear(persistId);
+            wireDeadSet(persistId, { at: new Date(nowMs()).toISOString(), reason: code, seed: envSeed ? tokFp(envSeed) : null });
+            onDisk = true;
+            log(`wire: Ekam refused the refresh (${code}) ${attempt}\xD7 \u2014 stored refresh cleared; sign in again (buzz_login / buzz-mcp-login)`);
+            throw markDead(`${label} (after ${attempt} attempt${attempt > 1 ? "s" : ""})`, code);
+          }
+          const retryIn = invalidGrantBackoffMs(attempt, rand);
+          wireStateSet(persistId, { rt: tokFp(refresh), failures: (st && st.failures || 0) + 1, igAttempts: attempt, nextAt: nowMs() + retryIn, last: code });
+          return { retryIn, label, attempt };
+        }
+        const retryable = res.status === 429 || res.status === 408 || res.status >= 500;
+        const failures = (st && st.failures || 0) + 1;
+        const ra = parseRetryAfter(res.headers && typeof res.headers.get === "function" ? res.headers.get("retry-after") : null, nowMs());
+        const nextAt = nowMs() + (retryable ? transientBackoffMs(failures, rand, ra) : Math.max(TR_BACKOFF_CAP_MS, ra));
+        wireStateSet(persistId, { rt: tokFp(refresh), failures, igAttempts: 0, nextAt, last: `HTTP ${res.status}` });
+        const err = new Error(`wire:sign token mint -> ${label} (backing off ~${Math.ceil((nextAt - nowMs()) / 1e3)}s${retryable ? "" : "; not a transient error \u2014 if this persists re-run the one-time login (buzz_login)"})`);
+        err.code = "WIRE_REFRESH_BACKOFF";
+        err.retryAt = nextAt;
+        err.transient = retryable;
+        throw err;
+      }
+      let j;
+      try {
+        j = JSON.parse(text);
+      } catch {
+        throw new Error(`token mint returned non-JSON: ${String(text).slice(0, 120)}`);
+      }
+      if (!j.access_token) throw new Error("token mint returned no access_token");
+      access = j.access_token;
+      accessExp = j.expires_in ? nowMs() + j.expires_in * 1e3 - SKEW_MS : Infinity;
+      if (j.refresh_token) {
+        refresh = j.refresh_token;
+        if (wireRefreshSet(persistId, j.refresh_token)) onDisk = true;
+        else log("wire: \u26A0 could not persist the rotated refresh \u2014 other buzz-mcp processes may replay a spent token");
+      }
+      if (isFinite(accessExp)) wireAccessSet(persistId, access, accessExp, refresh);
+      wireStateClear(persistId);
+      return "ok";
+    }, lockOpts);
+  }
+  async function refreshShared(force, rejected) {
+    syncFromDisk();
+    if (deadErr) throw deadErr;
+    if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
+    for (; ; ) {
+      const st = liveState();
+      if (st && nowMs() < st.nextAt) throw cooldownError(st);
+      const r = await lockedAttempt(force, rejected);
+      if (r === "ok" || r === "adopted") {
+        scheduleRenew();
+        return;
+      }
+      log(`wire: Ekam refused the refresh (${r.label}); attempt ${r.attempt}/${maxIgAttempts}, retrying in ~${Math.ceil(r.retryIn / 1e3)}s`);
+      await sleep(r.retryIn);
+      if (syncFromDisk() && adoptDiskAccess(force, rejected)) {
+        wireStateClear(persistId);
+        scheduleRenew();
+        return;
+      }
     }
-    let j;
-    try {
-      j = JSON.parse(text);
-    } catch {
-      throw new Error(`token mint returned non-JSON: ${text.slice(0, 120)}`);
-    }
-    if (!j.access_token) throw new Error("token mint returned no access_token");
-    access = j.access_token;
-    accessExp = j.expires_in ? Date.now() + j.expires_in * 1e3 - SKEW_MS : Infinity;
-    if (j.refresh_token) {
-      refresh = j.refresh_token;
-      wireRefreshSet(persistId, j.refresh_token);
-    }
-    scheduleRenew();
   }
   async function getToken(force) {
-    if (!force && access && Date.now() < accessExp) return access;
-    if (refresh) {
-      if (!inflightMint) inflightMint = mint().finally(() => {
-        inflightMint = null;
-      });
+    if (!force && access && nowMs() < accessExp) return access;
+    if (refresh || deadErr) {
+      if (!inflightMint) {
+        const rejected = force ? access : null;
+        inflightMint = refreshShared(!!force, rejected).finally(() => {
+          inflightMint = null;
+        });
+      }
       await inflightMint;
       return access;
     }
+    if (syncFromDisk()) return getToken(force);
     if (access) return access;
     throw new Error("wire mode: no bearer available (set BUZZ_WIRE_REFRESH+BUZZ_EKAM_CLIENT_ID, or BUZZ_EKAM_HUMAN_TOKEN)");
   }
   return {
     hasRefresh: () => !!refresh,
-    hasStatic: () => !!(env.BUZZ_EKAM_HUMAN_TOKEN || "").trim(),
+    hasStatic: () => !!staticTok,
+    // signed out after a refused refresh (tombstone): the shim still starts so buzz_login can run,
+    // but every sign fails fast with the sign-in prompt and Ekam is never called.
+    needsSignIn: () => !!deadErr,
     get: getToken,
     stopKeepAlive() {
       if (renewTimer) {
@@ -22451,7 +22700,7 @@ async function resolveSigner(opts = {}) {
     if (!pubkey2)
       throw new Error("buzz-mcp: wire mode has no user identity yet \u2014 run the one-time login (it captures your pubkey), or set BUZZ_USER_PUBKEY.");
     const tokens = makeWireTokenProvider(env, fetchFn);
-    if (!tokens.hasRefresh() && !tokens.hasStatic())
+    if (!tokens.hasRefresh() && !tokens.hasStatic() && !tokens.needsSignIn())
       throw new Error("buzz-mcp: wire mode needs BUZZ_WIRE_REFRESH (+BUZZ_EKAM_CLIENT_ID) from the one-time wire:sign login, or a static BUZZ_EKAM_HUMAN_TOKEN \u2014 refusing to start.");
     return {
       mode: "wire",
@@ -22580,7 +22829,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireRefreshFile, wirePubkeyFile, wireNameFile, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, ZIP_INFLATE_BUDGET, ZIP_MAX_ENTRIES, ZIP_MAX_NESTING, SIG, startsWith, ascii, XML_BAD_BOMS, xmlText, XML_NAMED, localName, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, CONTAINER_MACRO_EXTS, NESTED_ZIP_EXTS, EXEC_MAGICS, HEAD_INPUT_MAX, LBASE, LEXT, DBASE, DEXT, CLORDER, FIXED, MARKUP_TAGS, MARKUP_SCHEMES, HTML_NAMED, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireStem, wireRefreshFile, wireAccessFile, wireLockFile, wireDeadFile, tokFp, readTrim, readJson, unlinkQuiet, wireAccessGet, wireAccessSet, wireDeadGet, wireDeadSet, pidAlive, wirePubkeyFile, wireNameFile, WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT, TERMINAL_OAUTH_ERRORS, IG_BACKOFF_BASE_MS, TR_BACKOFF_BASE_MS, TR_MIN_REPEAT_MS, TR_BACKOFF_CAP_MS, RETRY_AFTER_CAP_MS, MINT_TIMEOUT_MS, wireStateFile, wireStateGet, wireStateSet, wireStateClear, WIRE_SIGNIN_HINT, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, ZIP_INFLATE_BUDGET, ZIP_MAX_ENTRIES, ZIP_MAX_NESTING, SIG, startsWith, ascii, XML_BAD_BOMS, xmlText, XML_NAMED, localName, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, CONTAINER_MACRO_EXTS, NESTED_ZIP_EXTS, EXEC_MAGICS, HEAD_INPUT_MAX, LBASE, LEXT, DBASE, DEXT, CLORDER, FIXED, MARKUP_TAGS, MARKUP_SCHEMES, HTML_NAMED, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22595,9 +22844,87 @@ var init_signer = __esm({
     wirePersistId = (env) => (env.BUZZ_WIRE_ID || "wire").trim() || "wire";
     wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter((k) => (env[k] || "").trim());
     WIRE_REFRESH_DIR = join3(homedir2(), ".config", "buzz-cli", "wire-refresh");
-    wireRefreshFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
+    wireStem = (id) => join3(WIRE_REFRESH_DIR, (id || "default").replace(/[^\w.-]/g, "_").slice(0, 80));
+    wireRefreshFile = (id) => `${wireStem(id)}.tok`;
+    wireAccessFile = (id) => `${wireStem(id)}.acc`;
+    wireLockFile = (id) => `${wireStem(id)}.lock`;
+    wireDeadFile = (id) => `${wireStem(id)}.dead`;
+    tokFp = (t) => t ? createHash("sha256").update(String(t)).digest("hex").slice(0, 32) : null;
+    readTrim = (f) => {
+      try {
+        return existsSync2(f) ? readFileSync2(f, "utf8").trim() || null : null;
+      } catch {
+        return null;
+      }
+    };
+    readJson = (f) => {
+      const v = readTrim(f);
+      if (!v) return null;
+      try {
+        return JSON.parse(v);
+      } catch {
+        return null;
+      }
+    };
+    unlinkQuiet = (f) => {
+      try {
+        unlinkSync(f);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    wireAccessGet = (id) => {
+      const j = readJson(wireAccessFile(id));
+      return j && typeof j.access_token === "string" && Number.isFinite(j.exp) && typeof j.rt === "string" ? j : null;
+    };
+    wireAccessSet = (id, access_token, exp, refresh) => {
+      try {
+        atomicWrite0600(wireAccessFile(id), JSON.stringify({ access_token, exp, rt: tokFp(refresh) }));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    wireDeadGet = (id) => readJson(wireDeadFile(id));
+    wireDeadSet = (id, info) => {
+      try {
+        atomicWrite0600(wireDeadFile(id), JSON.stringify(info));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    pidAlive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (e) {
+        return !!(e && e.code === "EPERM");
+      }
+    };
     wirePubkeyFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.pub`);
     wireNameFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
+    WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT = 3;
+    TERMINAL_OAUTH_ERRORS = /* @__PURE__ */ new Set(["invalid_grant", "invalid_client", "unauthorized_client"]);
+    IG_BACKOFF_BASE_MS = 2e3;
+    TR_BACKOFF_BASE_MS = 2e3;
+    TR_MIN_REPEAT_MS = 3e4;
+    TR_BACKOFF_CAP_MS = 5 * 6e4;
+    RETRY_AFTER_CAP_MS = 60 * 6e4;
+    MINT_TIMEOUT_MS = 2e4;
+    wireStateFile = (id) => `${wireStem(id)}.state`;
+    wireStateGet = (id) => readJson(wireStateFile(id));
+    wireStateSet = (id, st) => {
+      try {
+        atomicWrite0600(wireStateFile(id), JSON.stringify(st));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    wireStateClear = (id) => unlinkQuiet(wireStateFile(id));
+    WIRE_SIGNIN_HINT = "Your Buzz sign-in expired or was revoked. Sign in again: run buzz_login (or `buzz-mcp-login`), then retry. The shim will not call Ekam again until you do.";
     WIRE_ALLOWLIST = /* @__PURE__ */ new Set([9, 22242, 27235, 41010, 41011, 7, 24242, 9e3, 9001, 9005, 9007, 9002, 9021, 40003, 9022]);
     EKAM_REFUSED_BY_DESIGN = /* @__PURE__ */ new Map([[9008, "delete channel"], [5, "deletion / remove reaction"], [41012, "hide a DM"]]);
     NEVER_SIGN = /* @__PURE__ */ new Map([[46030, "workflow approval (grant)"], [46031, "workflow approval (deny)"]]);
@@ -22913,10 +23240,10 @@ var init_names = __esm({
 });
 
 // safety.mjs
-import { realpathSync, statSync, lstatSync, fstatSync, closeSync, readdirSync, readlinkSync, mkdirSync as mkdirSync3, chmodSync as chmodSync3, openSync, constants as FS } from "node:fs";
+import { realpathSync, statSync as statSync2, lstatSync, fstatSync, closeSync as closeSync2, readdirSync, readlinkSync, mkdirSync as mkdirSync3, chmodSync as chmodSync3, openSync as openSync2, constants as FS } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
 import { join as join4, basename, dirname, sep, resolve as resolvePath } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 function under(p, dir) {
   const a = lc(p), d = lc(dir);
   return a === d || a.startsWith(d.endsWith(sep) ? d : d + sep);
@@ -23082,7 +23409,7 @@ function resolveAttachment(input, { home = homedir3(), cwd = process.cwd(), extr
     return null;
   };
   const idOf = (st2) => `${st2.dev}:${st2.ino}`;
-  const st = statSync(real);
+  const st = statSync2(real);
   if (st.isFile()) {
     const hl = linkReason(st);
     if (hl) throw new Error(`attachment refused: ${typed} is ${hl}`);
@@ -23114,7 +23441,7 @@ function resolveAttachment(input, { home = homedir3(), cwd = process.cwd(), extr
     }
     let s;
     try {
-      s = statSync(r);
+      s = statSync2(r);
     } catch {
       skipped.push(`${ent} (unreadable)`);
       continue;
@@ -23138,14 +23465,14 @@ function resolveAttachment(input, { home = homedir3(), cwd = process.cwd(), extr
 function openCheckedAttachment(path, expectId) {
   let fd;
   try {
-    fd = openSync(path, FS.O_RDONLY | (FS.O_NOFOLLOW || 0));
+    fd = openSync2(path, FS.O_RDONLY | (FS.O_NOFOLLOW || 0));
   } catch (e) {
     throw new Error(`attachment ${path} could not be opened safely (${e.code || e.message})`);
   }
   const st = fstatSync(fd);
   if (!st.isFile() || expectId && `${st.dev}:${st.ino}` !== expectId) {
     try {
-      closeSync(fd);
+      closeSync2(fd);
     } catch {
     }
     throw new Error(`attachment refused: ${path} changed between the secret-path check and the upload`);
@@ -23217,7 +23544,7 @@ function privateDownloadDir({ env = process.env, home = homedir3() } = {}) {
 }
 function openExclusive(path) {
   const flags = FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | (FS.O_NOFOLLOW || 0);
-  return openSync(path, flags, 384);
+  return openSync2(path, flags, 384);
 }
 function downloadLeaf(sha, ext) {
   const e = String(ext || "").toLowerCase().replace(/[^.a-z0-9]/g, "").slice(0, 10);
@@ -23233,7 +23560,7 @@ function createWriteGuard({ perMin, dupWindowMs = 12e4, now: now2 = () => Date.n
   const recent = /* @__PURE__ */ new Map();
   const dupKey = (ev) => {
     const tag = (k) => (ev.tags || []).filter((t) => t[0] === k).map((t) => t[1]).sort().join(",");
-    return createHash("sha256").update(JSON.stringify([ev.kind, tag("h"), tag("e"), ev.content || ""])).digest("hex");
+    return createHash2("sha256").update(JSON.stringify([ev.kind, tag("h"), tag("e"), ev.content || ""])).digest("hex");
   };
   return {
     // → null if allowed (counts toward the rate), else a refusal message. Call BEFORE sending.
@@ -25715,8 +26042,8 @@ var init_streamableHttp = __esm({
 });
 
 // hosted-auth.mjs
-import { createHash as createHash3, createPublicKey, verify as cryptoVerify, createCipheriv, createDecipheriv, randomBytes as randomBytes5, timingSafeEqual } from "node:crypto";
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, existsSync as existsSync3, chmodSync as chmodSync4, unlinkSync } from "node:fs";
+import { createHash as createHash4, createPublicKey, verify as cryptoVerify, createCipheriv, createDecipheriv, randomBytes as randomBytes6, timingSafeEqual } from "node:crypto";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync as renameSync2, existsSync as existsSync3, chmodSync as chmodSync4, unlinkSync as unlinkSync2 } from "node:fs";
 function hostedConfig(env = process.env) {
   const resource = trimSlash(env.BUZZ_HOSTED_RESOURCE || DEFAULT_RESOURCE);
   const issuer = trimSlash(env.BUZZ_HOSTED_ISSUER || env.BUZZ_EKAM_BASE || DEFAULT_ISSUER);
@@ -25768,7 +26095,7 @@ function protectedResourceMetadata(cfg) {
     resource_documentation: "https://github.com/ola-krutrim/buzz-mcp#hosted-mode"
   };
 }
-async function readJson(res, what) {
+async function readJson2(res, what) {
   const text = await res.text();
   let j = null;
   try {
@@ -25791,7 +26118,7 @@ function createAsMetadata(cfg, { fetch: fetchFn = fetch, now: now2 = Date.now } 
     if (inflight) return inflight;
     inflight = (async () => {
       try {
-        const j = await readJson(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json" } }), "authorization-server metadata");
+        const j = await readJson2(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json" } }), "authorization-server metadata");
         if (j.issuer && trimSlash(j.issuer) !== cfg.issuer) throw new Error(`authorization-server metadata issuer mismatch (${j.issuer} \u2260 ${cfg.issuer})`);
         cached2 = j;
         at = now2();
@@ -25839,7 +26166,7 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
   const introCache = /* @__PURE__ */ new Map();
   const jwtCache = /* @__PURE__ */ new Map();
   const INTRO_TTL = 6e4, INTRO_MAX = 1e4;
-  const tokenKey = (t) => createHash3("sha256").update(t).digest("hex");
+  const tokenKey = (t) => createHash4("sha256").update(t).digest("hex");
   const remember = (m, key, p) => {
     if (m.size >= INTRO_MAX) m.delete(m.keys().next().value);
     m.set(key, { p, until: Math.min(now2() + INTRO_TTL, p.exp * 1e3) });
@@ -25858,7 +26185,7 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     if (!force && jwks && now2() - jwksAt < cfg.metadataTtlS * 1e3) return jwks;
     const uri = await jwksUri();
     if (!uri) throw new AuthError(401, "invalid_token", "no JWKS available to verify the token");
-    const j = await readJson(await fetchFn(uri, { headers: { Accept: "application/json" } }), "JWKS");
+    const j = await readJson2(await fetchFn(uri, { headers: { Accept: "application/json" } }), "JWKS");
     jwks = Array.isArray(j.keys) ? j.keys : [];
     jwksAt = now2();
     return jwks;
@@ -25908,7 +26235,7 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     else form.set("client_id", cfg.clientId);
     let j;
     try {
-      j = await readJson(await fetchFn(ep, { method: "POST", headers, body: form.toString() }), "introspection");
+      j = await readJson2(await fetchFn(ep, { method: "POST", headers, body: form.toString() }), "introspection");
     } catch (e) {
       throw new AuthError(401, "invalid_token", `token could not be introspected (${e.status ? `HTTP ${e.status}` : "unreachable"})`);
     }
@@ -25954,7 +26281,7 @@ function createEncryptedTokenStore({ path, keyB64, now: now2 = Date.now, tmpName
     }
   };
   const save = (m) => {
-    const iv = randomBytes5(12);
+    const iv = randomBytes6(12);
     const c = createCipheriv("aes-256-gcm", key, iv);
     c.setAAD(STORE_AAD);
     const ct = Buffer.concat([c.update(JSON.stringify(Object.fromEntries(m)), "utf8"), c.final()]);
@@ -25965,10 +26292,10 @@ function createEncryptedTokenStore({ path, keyB64, now: now2 = Date.now, tmpName
         chmodSync4(tmp, 384);
       } catch {
       }
-      renameSync(tmp, path);
+      renameSync2(tmp, path);
     } catch (e) {
       try {
-        unlinkSync(tmp);
+        unlinkSync2(tmp);
       } catch {
       }
       throw e;
@@ -26010,7 +26337,7 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     }
     let j;
     try {
-      j = await readJson(await fetchFn(ep, { method: "POST", headers, body }), "token exchange");
+      j = await readJson2(await fetchFn(ep, { method: "POST", headers, body }), "token exchange");
     } catch (e) {
       if (e.oauthError && isBuzzAppSigninError({ error: e.oauthError })) throw buzzAppSigninError(e);
       if (e.oauthError === "invalid_client" && (e.status === 401 || e.status === 400)) {
@@ -26091,8 +26418,8 @@ var init_hosted_auth = __esm({
     audList = (a) => (Array.isArray(a) ? a : a == null ? [] : [a]).map((x) => trimSlash(x));
     scopeList = (c) => Array.isArray(c.scp) ? c.scp : list(c.scope || c.scp || "");
     STORE_AAD = Buffer.from("buzz-mcp-hosted-tokens-v1");
-    defaultTmpName = (path) => `${path}.${process.pid}.${randomBytes5(8).toString("hex")}.tmp`;
-    hashSub = (sub) => createHash3("sha256").update(String(sub)).digest("hex").slice(0, 12);
+    defaultTmpName = (path) => `${path}.${process.pid}.${randomBytes6(8).toString("hex")}.tmp`;
+    hashSub = (sub) => createHash4("sha256").update(String(sub)).digest("hex").slice(0, 12);
   }
 });
 
@@ -26110,7 +26437,7 @@ __export(http_server_exports, {
 });
 import { createServer as createServer2 } from "node:http";
 import { isIP, BlockList } from "node:net";
-import { randomUUID, createHash as createHash4 } from "node:crypto";
+import { randomUUID, createHash as createHash5 } from "node:crypto";
 function coreEnv(env) {
   const o = { BUZZ_HARNESS: "ola-buzz-hosted", BUZZ_INTERFACE: "mcp-http", BUZZ_WIRE_SIGN: "1" };
   for (const k of HOSTED_CORE_ENV_ALLOW) if (env[k] != null && env[k] !== "") o[k] = String(env[k]);
@@ -26946,7 +27273,7 @@ function emojiPalette(evs) {
 
 // parity34.mjs
 init_safety();
-import { randomBytes as randomBytes3 } from "node:crypto";
+import { randomBytes as randomBytes4 } from "node:crypto";
 var HEX643 = /^[0-9a-f]{64}$/;
 var tagVals = (e, n) => (e && Array.isArray(e.tags) ? e.tags : []).filter((t) => Array.isArray(t) && t[0] === n).map((t) => t[1]);
 var oneTag = (e, n) => {
@@ -27008,7 +27335,7 @@ var REMINDER_NOTE_MAX = 1e3;
 var REMINDER_PREVIEW_MAX = 200;
 var REMINDER_STATUSES = /* @__PURE__ */ new Set(["pending", "done", "cancelled"]);
 var MAX_SAFE = 9007199254740991;
-var newReminderD = (rnd = randomBytes3) => Buffer.from(rnd(16)).toString("hex");
+var newReminderD = (rnd = randomBytes4) => Buffer.from(rnd(16)).toString("hex");
 function parseNotBefore(raw) {
   if (typeof raw !== "string" || !/^(0|[1-9][0-9]*)$/.test(raw) || raw.length > 16) return void 0;
   const v = Number(raw);
@@ -27529,13 +27856,13 @@ init_safety();
 await init_signer();
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { createHash as createHash2, randomBytes as randomBytes4 } from "node:crypto";
+import { createHash as createHash3, randomBytes as randomBytes5 } from "node:crypto";
 import { realpathSync as realpathSync2 } from "node:fs";
 import { fileURLToPath } from "node:url";
 var b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 function pkce() {
-  const verifier = b64url(randomBytes4(32));
-  const challenge2 = b64url(createHash2("sha256").update(verifier).digest());
+  const verifier = b64url(randomBytes5(32));
+  const challenge2 = b64url(createHash3("sha256").update(verifier).digest());
   return { verifier, challenge: challenge2 };
 }
 function authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource }) {
@@ -27613,7 +27940,7 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
   }
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge: challenge2 } = pkce();
-  const state = b64url(randomBytes4(16));
+  const state = b64url(randomBytes5(16));
   const { srv, port } = await bindLoopback(ports);
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   const url = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
@@ -27691,12 +28018,12 @@ ${url}
 }
 
 // buzz-mcp.mjs
-import { createHash as createHash5, randomBytes as randomBytes6, randomUUID as randomUUID2 } from "node:crypto";
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync2, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync2, createReadStream, readSync, writeSync, closeSync as closeSync2, fsyncSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { createHash as createHash6, randomBytes as randomBytes7, randomUUID as randomUUID2 } from "node:crypto";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync3, mkdirSync as mkdirSync4, existsSync as existsSync4, statSync as statSync3, createReadStream, readSync, writeSync as writeSync2, closeSync as closeSync3, fsyncSync as fsyncSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { Readable as Readable2 } from "node:stream";
 import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
 import { request as httpRequest, Agent as HttpAgent } from "node:http";
-import { homedir as homedir4, hostname, tmpdir as tmpdir2 } from "node:os";
+import { homedir as homedir4, hostname as hostname2, tmpdir as tmpdir2 } from "node:os";
 import { join as join5, basename as basename2, extname } from "node:path";
 import { execSync, spawn as spawn2 } from "node:child_process";
 var SHIM_VERSION_EXPORT = "0.2.36";
@@ -27751,7 +28078,7 @@ async function createBuzzServer(opts = {}) {
     }
     if (!ctx) {
       const b = basename2(process.cwd());
-      ctx = b && b !== basename2(homedir4()) ? b : hostname().split(".")[0].toLowerCase();
+      ctx = b && b !== basename2(homedir4()) ? b : hostname2().split(".")[0].toLowerCase();
     }
     const animal = ANIMALS[parseInt(PK.slice(0, 8), 16) % ANIMALS.length];
     return `${ctx}\xB7${animal}`;
@@ -27823,9 +28150,9 @@ async function createBuzzServer(opts = {}) {
     process.stderr.write(`[buzz-mcp] \u26A0 IMPERSONATION GUARD: config expects ${EXPECTED_PK.slice(0, 16)} but running key is ${PK.slice(0, 16)} (${MY_NAME}). WRITES DISABLED. Fix: pin the correct key, or launch with your own CLAUDE_CONFIG_DIR.
 `);
   async function nip98(url, method, body) {
-    const payload = createHash5("sha256").update(body ?? "").digest("hex");
+    const payload = createHash6("sha256").update(body ?? "").digest("hex");
     const ev = await signer.sign(
-      { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes6(12).toString("hex")]], content: "" }
+      { kind: 27235, tags: [["u", url], ["method", method], ["payload", payload], ["nonce", randomBytes7(12).toString("hex")]], content: "" }
     );
     return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
   }
@@ -28097,7 +28424,7 @@ async function createBuzzServer(opts = {}) {
   const TEXT_MIME = /^(text\/|application\/(json|xml|.*\+xml|x-yaml|yaml))/;
   function sha256File(p) {
     return new Promise((res, rej) => {
-      const h = createHash5("sha256");
+      const h = createHash6("sha256");
       const s = createReadStream(p);
       s.on("error", rej);
       s.on("data", (c) => h.update(c));
@@ -28117,7 +28444,7 @@ async function createBuzzServer(opts = {}) {
     try {
       ({ mime } = classifyAttachment({ name: basename2(filePath), size: st.size, read: fdReader(fd) }));
       sha = await new Promise((res2, rej) => {
-        const h = createHash5("sha256");
+        const h = createHash6("sha256");
         const r = createReadStream(null, { fd, start: 0, autoClose: false });
         r.on("error", rej);
         r.on("data", (c) => h.update(c));
@@ -28127,7 +28454,7 @@ async function createBuzzServer(opts = {}) {
       src = createReadStream(null, { fd, start: 0, autoClose: true });
     } catch (e) {
       try {
-        closeSync2(fd);
+        closeSync3(fd);
       } catch {
       }
       throw e;
@@ -28217,7 +28544,7 @@ async function createBuzzServer(opts = {}) {
             }
             throw overCap(start + got + value.length);
           }
-          writeSync(fd, value);
+          writeSync2(fd, value);
           got += value.length;
         }
         start += got;
@@ -28228,19 +28555,19 @@ async function createBuzzServer(opts = {}) {
         }
         if (!got) break;
       }
-      fsyncSync(fd);
+      fsyncSync2(fd);
       ok = true;
     } finally {
-      closeSync2(fd);
+      closeSync3(fd);
       if (!ok) {
         try {
-          unlinkSync2(part);
+          unlinkSync3(part);
         } catch {
         }
       }
     }
     if (existsSync4(destPath)) throw new Error(`download target already exists: ${destPath}`);
-    renameSync2(part, destPath);
+    renameSync3(part, destPath);
     return destPath;
   }
   async function blossomFetchToMemory(shaExt, cap) {
@@ -28305,7 +28632,7 @@ async function createBuzzServer(opts = {}) {
   }
   async function publishProfile(name, patch = {}, existing = void 0) {
     if (!isDryRun()) MY_NAME = name;
-    const host = hostname().split(".")[0];
+    const host = hostname2().split(".")[0];
     if (existing === void 0) existing = await ownProfile();
     const profile = mergeProfile(existing && existing.profile, {
       display_name: name,
@@ -28694,7 +29021,7 @@ async function createBuzzServer(opts = {}) {
         (r.skipped ||= []).push(`${basename2(f)} (type not allowed)`);
       } finally {
         try {
-          closeSync2(fd);
+          closeSync3(fd);
         } catch {
         }
       }
@@ -29728,13 +30055,13 @@ ${line}` : line;
         const ext = extname(shaExt) || (att.filename ? extname(att.filename) : "");
         if (HOSTED) {
           const buf = await blossomFetchToMemory(shaExt, HOSTED_ATTACH_MAX);
-          const got2 = createHash5("sha256").update(buf).digest("hex");
+          const got2 = createHash6("sha256").update(buf).digest("hex");
           if (got2 !== String(att.sha256).toLowerCase()) throw new Error(`integrity check failed: downloaded ${got2.slice(0, 12)}\u2026 \u2260 imeta ${String(att.sha256).slice(0, 12)}\u2026 \u2014 discarded`);
           const isTextH = att.mime && TEXT_MIME.test(att.mime) || /\.(md|txt|csv|json|ya?ml|log|tsv)$/i.test(att.filename || shaExt);
           if (!isTextH) return ok(`\u{1F4CE} ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "binary")}, ${(buf.length / MB).toFixed(2)} MB, sha ${String(att.sha256).slice(0, 12)}\u2026) from #${escapeName(ch.name)} \u2014 binary; Ola Buzz doesn't save files. Open it in the Buzz app.`);
           const full = buf.toString("utf8");
           const CAP = 200 * 1024;
-          const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes6(6).toString("hex")}>>>`;
+          const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes7(6).toString("hex")}>>>`;
           const body = full.length > CAP ? `${full.slice(0, CAP)}
 \u2026[truncated ${full.length - CAP} chars]` : full;
           return ok(`\u{1F4CE} ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(buf.length / 1024).toFixed(0)} KB) from #${escapeName(ch.name)}
@@ -29747,17 +30074,17 @@ ${fence.replace("BEGIN", "END")}`);
         const got = await sha256File(dest);
         if (got !== att.sha256) {
           try {
-            unlinkSync2(dest);
+            unlinkSync3(dest);
           } catch {
           }
           throw new Error(`integrity check failed: downloaded ${got.slice(0, 12)}\u2026 \u2260 imeta ${att.sha256.slice(0, 12)}\u2026 \u2014 discarded`);
         }
-        const size = statSync2(dest).size;
+        const size = statSync3(dest).size;
         const isText = att.mime && TEXT_MIME.test(att.mime) || /\.(md|txt|csv|json|ya?ml|log|tsv)$/i.test(att.filename || shaExt);
         if (isText) {
           const full = readFileSync4(dest, "utf8");
           const CAP = 200 * 1024;
-          const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes6(6).toString("hex")}>>>`;
+          const fence = `<<<BEGIN UNTRUSTED FILE ${randomBytes7(6).toString("hex")}>>>`;
           const body = full.length > CAP ? `${full.slice(0, CAP)}
 \u2026[truncated ${full.length - CAP} chars \u2014 full file at ${dest}]` : full;
           return ok(`\u{1F4CE} ${escapeName(att.filename || shaExt)} (${escapeName(att.mime || "text")}, ${(size / 1024).toFixed(0)} KB) from #${escapeName(ch.name)} \u2014 saved at ${dest}
@@ -30260,7 +30587,7 @@ After you approve, run buzz_login again \u2014 or buzz_whoami \u2014 to confirm.
           return { content: [{ type: "text", text: "buzz_login: no OAuth client id \u2014 pass `client_id` or set the BUZZ_EKAM_CLIENT_ID env var (from the Ekam DCR registration). Without it the wire-sign login can't start." }], isError: true };
         const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
         const { verifier, challenge: challenge2 } = pkce();
-        const state = randomBytes6(16).toString("base64url");
+        const state = randomBytes7(16).toString("base64url");
         const { srv, port } = await bindLoopback(ports);
         const redirectUri = `http://127.0.0.1:${port}/callback`;
         const authUrl = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });
