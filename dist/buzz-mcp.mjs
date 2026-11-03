@@ -21646,7 +21646,46 @@ function wireRefreshClear(id, refused) {
   unlinkQuiet(wireAccessFile(id));
   return true;
 }
-async function withWireLock(id, fn, { timeoutMs = 45e3, staleMs = 6e4, pollMs = 50, now: now2 = Date.now } = {}) {
+function breakStaleLock(lf, staleN, { staleMs = 6e4, breakStaleMs = 5e3, now: now2 = Date.now } = {}) {
+  const bf = `${lf}.break`;
+  const mine = randomBytes3(8).toString("hex");
+  try {
+    const fd = openSync(bf, "wx", 384);
+    try {
+      writeSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), t: now2(), n: mine }));
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (!e || e.code !== "EEXIST") throw e;
+    try {
+      if (now2() - statSync(bf).mtimeMs > breakStaleMs) {
+        const grave = `${bf}.stale-${randomBytes3(6).toString("hex")}`;
+        renameSync(bf, grave);
+        unlinkQuiet(grave);
+      }
+    } catch {
+    }
+    return false;
+  }
+  try {
+    const cur = readJson(lf);
+    let same;
+    if (staleN == null) {
+      try {
+        same = !cur && now2() - statSync(lf).mtimeMs > staleMs;
+      } catch {
+        same = false;
+      }
+    } else same = !!(cur && cur.n === staleN);
+    if (!same) return false;
+    return unlinkQuiet(lf);
+  } finally {
+    const b = readJson(bf);
+    if (b && b.n === mine) unlinkQuiet(bf);
+  }
+}
+async function withWireLock(id, fn, { timeoutMs = 45e3, staleMs = 6e4, breakStaleMs = 5e3, pollMs = 50, now: now2 = Date.now, onAcquire = null } = {}) {
   mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
   const lf = wireLockFile(id);
   const me = { pid: process.pid, host: hostname(), t: now2(), n: randomBytes3(8).toString("hex") };
@@ -21673,14 +21712,13 @@ async function withWireLock(id, fn, { timeoutMs = 45e3, staleMs = 6e4, pollMs = 
       }
     } else stale = now2() - Number(held.t || 0) > staleMs || held.host === hostname() && Number.isInteger(held.pid) && !pidAlive(held.pid);
     if (stale) {
-      const again = readJson(lf);
-      if (again && held && again.n === held.n || !again && !held) {
-        const grave = `${lf}.stale-${randomBytes3(6).toString("hex")}`;
-        try {
-          renameSync(lf, grave);
-          unlinkQuiet(grave);
-        } catch {
-        }
+      if (!breakStaleLock(lf, held ? held.n : null, { staleMs, breakStaleMs, now: now2 })) {
+        await new Promise((r) => setTimeout(r, pollMs + Math.floor(Math.random() * pollMs)));
+      }
+      if (now2() >= deadline) {
+        const err = new Error("wire:sign token refresh: another buzz-mcp process holds the refresh lock (timed out waiting) \u2014 try again shortly");
+        err.transient = true;
+        throw err;
       }
       continue;
     }
@@ -21691,11 +21729,15 @@ async function withWireLock(id, fn, { timeoutMs = 45e3, staleMs = 6e4, pollMs = 
     }
     await new Promise((r) => setTimeout(r, pollMs + Math.floor(Math.random() * pollMs)));
   }
-  try {
-    return await fn();
-  } finally {
+  const owns = () => {
     const cur = readJson(lf);
-    if (cur && cur.n === me.n) unlinkQuiet(lf);
+    return !!(cur && cur.n === me.n);
+  };
+  if (onAcquire) onAcquire({ lockFile: lf, n: me.n });
+  try {
+    return await fn({ owns });
+  } finally {
+    if (owns()) unlinkQuiet(lf);
   }
 }
 function wirePubkeyGet(id) {
@@ -21745,7 +21787,7 @@ function startupKeepAliveDelayMs(rand = Math.random, minMs = STARTUP_KEEPALIVE_M
 }
 function wireInvalidGrantAttempts(env) {
   const n = parseInt(String((env && env.BUZZ_WIRE_INVALID_GRANT_ATTEMPTS) ?? "").trim(), 10);
-  return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
+  return Number.isFinite(n) ? Math.min(WIRE_INVALID_GRANT_ATTEMPTS_MAX, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
 }
 function parseRetryAfter(v, nowMs = Date.now()) {
   const s = String(v ?? "").trim();
@@ -21857,7 +21899,7 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
     if (renewTimer.unref) renewTimer.unref();
   }
   async function lockedAttempt(force, rejected) {
-    return withWireLock(persistId, async () => {
+    return withWireLock(persistId, async ({ owns }) => {
       const d = wireRefreshGet(persistId);
       if (d && d !== refresh) {
         refresh = d;
@@ -21871,6 +21913,8 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
       const st = liveState();
       if (st && nowMs() < st.nextAt) throw cooldownError(st);
       if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
+      const dNow = wireRefreshGet(persistId);
+      if (!owns() || (onDisk ? dNow !== refresh : dNow && dNow !== refresh)) return { lost: true };
       let res, text;
       try {
         res = await fetchFn(`${base}/oauth/token`, {
@@ -21901,14 +21945,15 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
         const label = `HTTP ${res.status}: ${detail}`;
         if (code && TERMINAL_OAUTH_ERRORS.has(code)) {
           const attempt = (st && st.igAttempts || 0) + 1;
-          if (attempt >= maxIgAttempts) {
+          const finalNow = WIRE_FINAL_REFUSAL_RE.test(String(detail || ""));
+          if (finalNow || attempt >= maxIgAttempts) {
             const refused = refresh;
             wireRefreshClear(persistId, refused);
             wireStateClear(persistId);
             wireDeadSet(persistId, { at: new Date(nowMs()).toISOString(), reason: code, seed: envSeed ? tokFp(envSeed) : null });
             onDisk = true;
-            log(`wire: Ekam refused the refresh (${code}) ${attempt}\xD7 \u2014 stored refresh cleared; sign in again (buzz_login / buzz-mcp-login)`);
-            throw markDead(`${label} (after ${attempt} attempt${attempt > 1 ? "s" : ""})`, code);
+            log(`wire: Ekam refused the refresh (${code}${finalNow ? ", final: replay / family revoked" : ""}) ${attempt}\xD7 \u2014 stored refresh cleared; sign in again (buzz_login / buzz-mcp-login)`);
+            throw markDead(`${label} (after ${attempt} attempt${attempt > 1 ? "s" : ""}${finalNow ? "; final" : ""})`, code);
           }
           const retryIn = invalidGrantBackoffMs(attempt, rand);
           wireStateSet(persistId, { rt: tokFp(refresh), failures: (st && st.failures || 0) + 1, igAttempts: attempt, nextAt: nowMs() + retryIn, last: code });
@@ -21948,6 +21993,7 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
     syncFromDisk();
     if (deadErr) throw deadErr;
     if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
+    let lost = 0;
     for (; ; ) {
       const st = liveState();
       if (st && nowMs() < st.nextAt) throw cooldownError(st);
@@ -21955,6 +22001,16 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
       if (r === "ok" || r === "adopted") {
         scheduleRenew();
         return;
+      }
+      if (r && r.lost) {
+        if (++lost > 5) {
+          const e = new Error("wire:sign token refresh: lost the refresh lock to another buzz-mcp process repeatedly \u2014 try again shortly");
+          e.transient = true;
+          throw e;
+        }
+        syncFromDisk();
+        if (deadErr) throw deadErr;
+        continue;
       }
       log(`wire: Ekam refused the refresh (${r.label}); attempt ${r.attempt}/${maxIgAttempts}, retrying in ~${Math.ceil(r.retryIn / 1e3)}s`);
       await sleep(r.retryIn);
@@ -22919,7 +22975,7 @@ async function probeWirePubkey(base, token, fetchFn = fetch) {
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
 }
-var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireStem, wireRefreshFile, wireAccessFile, wireLockFile, wireDeadFile, tokFp, readTrim, readJson, unlinkQuiet, wireAccessGet, wireAccessSet, wireDeadGet, wireDeadSet, pidAlive, wirePubkeyFile, wireNameFile, WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT, TERMINAL_OAUTH_ERRORS, IG_BACKOFF_BASE_MS, TR_BACKOFF_BASE_MS, TR_MIN_REPEAT_MS, TR_BACKOFF_CAP_MS, RETRY_AFTER_CAP_MS, MINT_TIMEOUT_MS, STARTUP_KEEPALIVE_MIN_MS, STARTUP_KEEPALIVE_MAX_MS, wireStartupKeepAliveEnabled, wireStateFile, wireStateGet, wireStateSet, wireStateClear, WIRE_SIGNIN_HINT, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, ZIP_INFLATE_BUDGET, ZIP_MAX_ENTRIES, ZIP_MAX_NESTING, SIG, startsWith, ascii, XML_BAD_BOMS, xmlText, XML_NAMED, localName, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, CONTAINER_MACRO_EXTS, NESTED_ZIP_EXTS, EXEC_MAGICS, HEAD_INPUT_MAX, LBASE, LEXT, DBASE, DEXT, CLORDER, FIXED, MARKUP_TAGS, MARKUP_SCHEMES, HTML_NAMED, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
+var DEFAULT_EKAM_CLIENT_ID, now, ekamBase2, wirePersistId, wireBleedVars, WIRE_REFRESH_DIR, wireStem, wireRefreshFile, wireAccessFile, wireLockFile, wireDeadFile, tokFp, readTrim, readJson, unlinkQuiet, wireAccessGet, wireAccessSet, wireDeadGet, wireDeadSet, pidAlive, wirePubkeyFile, wireNameFile, WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT, WIRE_INVALID_GRANT_ATTEMPTS_MAX, WIRE_FINAL_REFUSAL_RE, TERMINAL_OAUTH_ERRORS, IG_BACKOFF_BASE_MS, TR_BACKOFF_BASE_MS, TR_MIN_REPEAT_MS, TR_BACKOFF_CAP_MS, RETRY_AFTER_CAP_MS, MINT_TIMEOUT_MS, STARTUP_KEEPALIVE_MIN_MS, STARTUP_KEEPALIVE_MAX_MS, wireStartupKeepAliveEnabled, wireStateFile, wireStateGet, wireStateSet, wireStateClear, WIRE_SIGNIN_HINT, WIRE_ALLOWLIST, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN, neverSignError, HEX64, BLOSSOM_AUTH_KIND, BLOSSOM_MAX_TTL, BLOSSOM_CONTENT, MEDIA_MB, MEDIA_CAPS, DOCX, XLSX, PPTX, ODT, ODS, ODP, OCTET_STREAM, ATTACH_ALLOWED_FILE_TYPES, ATTACH_IMAGE_MIMES, ATTACH_VIDEO_MIMES, ATTACH_MAX_NAME_BYTES, TEXT_EXTS, SNIFFED_EXT, MP4_BRANDS, MARKUP_MARKERS, ZIP_MIME, OOXML_MAIN_PARTS, ODF_MIMES, ZIP_DOCUMENT_MIMES, ZIP_PART_MAX, ZIP_INFLATE_BUDGET, ZIP_MAX_ENTRIES, ZIP_MAX_NESTING, SIG, startsWith, ascii, XML_BAD_BOMS, xmlText, XML_NAMED, localName, EXTERNAL_REL_TYPES, CONTAINER_EXEC_EXTS, CONTAINER_MACRO_EXTS, NESTED_ZIP_EXTS, EXEC_MAGICS, HEAD_INPUT_MAX, LBASE, LEXT, DBASE, DEXT, CLORDER, FIXED, MARKUP_TAGS, MARKUP_SCHEMES, HTML_NAMED, INVISIBLE_FILLERS, WINDOWS_RESERVED, avoidReservedName, RELAY_MEDIA_EXTS, echo, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, BUZZ_APP_SIGNIN_CODES, SAFE_CODE;
 var init_signer = __esm({
   async "signer.mjs"() {
     init_pure();
@@ -22996,7 +23052,9 @@ var init_signer = __esm({
     };
     wirePubkeyFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.pub`);
     wireNameFile = (id) => join3(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.name`);
-    WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT = 3;
+    WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT = 1;
+    WIRE_INVALID_GRANT_ATTEMPTS_MAX = 3;
+    WIRE_FINAL_REFUSAL_RE = /replay|family[\s_-]*(?:was\s+|is\s+|has\s+been\s+)?revoked/i;
     TERMINAL_OAUTH_ERRORS = /* @__PURE__ */ new Set(["invalid_grant", "invalid_client", "unauthorized_client"]);
     IG_BACKOFF_BASE_MS = 2e3;
     TR_BACKOFF_BASE_MS = 2e3;

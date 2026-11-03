@@ -13,6 +13,23 @@ import { createHash } from "node:crypto";
 
 const SELF = fileURLToPath(import.meta.url);
 
+// ── child mode: a process contending for the lock on a STALE lock file (case 8 stress) ──────────
+if (process.argv[2] === "--lockchild") {
+  const { withWireLock } = await import("./signer.mjs");
+  const { appendFileSync } = await import("node:fs");
+  const at = Number(process.env.T_AT || 0);
+  if (at > Date.now()) await new Promise((r) => setTimeout(r, at - Date.now()));
+  try {
+    await withWireLock(process.env.T_ID, async ({ owns }) => {
+      appendFileSync(process.env.T_LOG, `E ${process.pid}\n`);
+      await new Promise((r) => setTimeout(r, 120));
+      appendFileSync(process.env.T_LOG, `X ${process.pid} ${owns() ? 1 : 0}\n`);
+    }, { timeoutMs: 20_000, pollMs: 5 });
+    process.stdout.write("ok");
+  } catch (e) { process.stdout.write("err " + e.message); }
+  process.exit(0);
+}
+
 // ── child mode: one "shim process" asking for a token ──────────────────────────────────────────
 if (process.argv[2] === "--child") {
   const { makeWireTokenProvider } = await import("./signer.mjs");
@@ -36,7 +53,7 @@ const HOME = mkdtempSync(join(tmpdir(), "buzz-refresh-test-"));
 process.env.HOME = HOME; process.env.USERPROFILE = HOME;
 const S = await import("./signer.mjs");
 const { makeWireTokenProvider, wireRefreshSet, wireRefreshGet, wireDeadGet, withWireLock, WIRE_REFRESH_DIR,
-  WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT, wireInvalidGrantAttempts, transientBackoffMs, invalidGrantBackoffMs, parseRetryAfter } = S;
+  WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT, WIRE_INVALID_GRANT_ATTEMPTS_MAX, WIRE_FINAL_REFUSAL_RE, breakStaleLock, wireInvalidGrantAttempts, transientBackoffMs, invalidGrantBackoffMs, parseRetryAfter } = S;
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) { passed++; console.log("  ✅ " + m); } else { failed++; console.log("  ❌ " + m); } };
@@ -86,17 +103,43 @@ console.log("\ncase 1: two shim processes, same wire id, refresh at the same mom
   srv.close();
 }
 
-// ── 2. invalid_grant: bounded retries (default 3 total), then clear + tombstone + sign-in prompt ─
-console.log("\ncase 2: invalid_grant → 3 attempts total with ~2s/~8s backoff, then clear + sign in again");
+// ── 2. invalid_grant: bounded retries (v0.2.37: default 1, cap 3), then clear + tombstone + sign-in prompt ─
+console.log("\ncase 2: invalid_grant → default 1 attempt (no retry); opt-in up to 3 with ~2s/~8s backoff; then clear + sign in again");
 {
-  ok(WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT === 3 && wireInvalidGrantAttempts({}) === 3, "default attempt count is 3");
-  ok(wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "5" }) === 5 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "0" }) === 1 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "99" }) === 10 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "x" }) === 3, "BUZZ_WIRE_INVALID_GRANT_ATTEMPTS override, clamped to 1..10");
+  ok(WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT === 1 && wireInvalidGrantAttempts({}) === 1 && WIRE_INVALID_GRANT_ATTEMPTS_MAX === 3, "default attempt count is 1, cap 3 (buzz_security Decision 1)");
+  ok(wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "2" }) === 2 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }) === 3 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "5" }) === 3 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "0" }) === 1 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "99" }) === 3 && wireInvalidGrantAttempts({ BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "x" }) === 1, "BUZZ_WIRE_INVALID_GRANT_ATTEMPTS override, clamped to 1..3; junk → default 1");
+  {
+    const clock = fakeClock(); const sleeps = []; let calls = 0;
+    wireRefreshSet("ig1", "rt-dead");
+    const p = makeWireTokenProvider(ENV("ig1"), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async (ms) => { sleeps.push(ms); clock.add(ms); } });
+    let err = null; try { await p.get(); } catch (e) { err = e; }
+    ok(calls === 1 && sleeps.length === 0 && err && err.code === "WIRE_SIGNIN_REQUIRED" && !existsSync(f("ig1", ".tok")) && wireDeadGet("ig1"), `default (env unset) → exactly 1 /oauth/token call, no backoff, then sign-in + tombstone (got ${calls}/${sleeps.length})`);
+    for (let i = 0; i < 3; i++) { try { await p.get(true); } catch {} }
+    ok(calls === 1, "further get() calls → still 1 call total");
+  }
+  // replay / family revoked in error_description → final at once, even with attempts=3
+  ok(WIRE_FINAL_REFUSAL_RE.test("refresh_token_replay") && WIRE_FINAL_REFUSAL_RE.test("Replay detected") && WIRE_FINAL_REFUSAL_RE.test("token family revoked") && WIRE_FINAL_REFUSAL_RE.test("family_revoked") && !WIRE_FINAL_REFUSAL_RE.test("refresh token is invalid") && !WIRE_FINAL_REFUSAL_RE.test("refresh token expired"), "final-refusal matcher: replay / family revoked yes; plain invalid / expired no");
+  for (const desc of ["refresh_token_replay", "replay detected", "token family revoked", "family_revoked"]) {
+    const clock = fakeClock(); const sleeps = []; let calls = 0; const id = "igf-" + desc.replace(/\W/g, "");
+    wireRefreshSet(id, "rt-dead");
+    const p = makeWireTokenProvider(ENV(id, { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async () => { calls++; return json(400, { error: "invalid_grant", error_description: desc }); }, { ...quiet, now: clock, sleep: async (ms) => { sleeps.push(ms); clock.add(ms); } });
+    let err = null; try { await p.get(); } catch (e) { err = e; }
+    ok(calls === 1 && sleeps.length === 0 && err && err.code === "WIRE_SIGNIN_REQUIRED" && /final/.test(err.message) && !existsSync(f(id, ".tok")) && wireDeadGet(id), `attempts=3 but error_description "${desc}" → final after 1 call, no retry, tombstone (got ${calls})`);
+  }
+  {
+    // a replay refusal on a LATER attempt also stops at once (attempt 2 of 3 → no attempt 3)
+    const clock = fakeClock(); let calls = 0;
+    wireRefreshSet("igf2", "rt-dead");
+    const p = makeWireTokenProvider(ENV("igf2", { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async () => { calls++; return calls === 1 ? IG() : json(400, { error: "invalid_grant", error_description: "refresh_token_replay" }); }, { ...quiet, now: clock, sleep: async (ms) => clock.add(ms) });
+    let err = null; try { await p.get(); } catch (e) { err = e; }
+    ok(calls === 2 && err && err.code === "WIRE_SIGNIN_REQUIRED", `plain invalid_grant then replay → stops at attempt 2 of 3 (got ${calls})`);
+  }
   const clock = fakeClock(); const sleeps = []; let calls = 0;
   const sleep = async (ms) => { sleeps.push(ms); clock.add(ms); };
   wireRefreshSet("ig3", "rt-dead");
-  const p = makeWireTokenProvider(ENV("ig3", { BUZZ_WIRE_REFRESH: "env-seed" }), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep });
+  const p = makeWireTokenProvider(ENV("ig3", { BUZZ_WIRE_REFRESH: "env-seed", BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep });
   let err = null; try { await p.get(); } catch (e) { err = e; }
-  ok(calls === 3, `exactly 3 /oauth/token calls (got ${calls})`);
+  ok(calls === 3, `BUZZ_WIRE_INVALID_GRANT_ATTEMPTS=3 (the cap) → exactly 3 /oauth/token calls (got ${calls})`);
   ok(sleeps.length === 2 && sleeps[0] >= 1500 && sleeps[0] <= 2500 && sleeps[1] >= 6000 && sleeps[1] <= 10000, `backoff between attempts ≈2s then ≈8s with jitter (got ${sleeps.map((s) => Math.round(s / 100) / 10 + "s").join(", ")})`);
   ok(err && err.code === "WIRE_SIGNIN_REQUIRED" && LOGIN_REMEDY.test(err.message) && /buzz_login/.test(err.message) && /buzz-mcp-login/.test(err.message), "surfaces a sign-in-again error naming buzz_login / buzz-mcp-login");
   ok(!existsSync(f("ig3", ".tok")) && !existsSync(f("ig3", ".acc")) && !existsSync(f("ig3", ".state")), "stored refresh (+ access, + backoff state) cleared");
@@ -114,13 +157,13 @@ console.log("\ncase 2: invalid_grant → 3 attempts total with ~2s/~8s backoff, 
   p3.stopKeepAlive();
   ok(!existsSync(f("ig3", ".dead")) && wireRefreshGet("ig3") === "rt-fresh", "successful mint after re-login removes the tombstone");
 }
-for (const [n, want] of [["1", 1], ["5", 5]]) {
+for (const [n, want] of [["1", 1], ["2", 2], ["5", 3]]) {
   const clock = fakeClock(); const sleeps = []; let calls = 0;
   wireRefreshSet("ign" + n, "rt-dead");
   const p = makeWireTokenProvider(ENV("ign" + n, { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: n }), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async (ms) => { sleeps.push(ms); clock.add(ms); } });
   let err = null; try { await p.get(); } catch (e) { err = e; }
   ok(calls === want && sleeps.length === want - 1 && err && err.code === "WIRE_SIGNIN_REQUIRED" && !existsSync(f("ign" + n, ".tok")), `BUZZ_WIRE_INVALID_GRANT_ATTEMPTS=${n} → ${want} call(s), ${want - 1} backoff(s), then sign-in (got ${calls}/${sleeps.length})`);
-  if (want === 5) ok(sleeps[2] >= 24000 && sleeps[2] <= 40000, `third backoff ≈32s (got ${Math.round(sleeps[2] / 1000)}s)`);
+  if (n === "5") ok(sleeps.length === 2, `BUZZ_WIRE_INVALID_GRANT_ATTEMPTS=5 is capped at 3 (no ≈32s third backoff; got ${sleeps.length} backoffs)`);
 }
 
 // ── 3. another process rotates during the retry window → adopt and stop ─────────────────────────
@@ -134,7 +177,7 @@ console.log("\ncase 3: a sibling rotates the token while we wait to retry → us
     wireRefreshSet("rot", "rt-new");
     writeFileSync(f("rot", ".acc"), JSON.stringify({ access_token: "acc-sibling", exp: clock() + 600_000, rt: fp("rt-new") }), { mode: 0o600 });
   };
-  const p = makeWireTokenProvider(ENV("rot"), async (_u, init) => { calls++; const rt = JSON.parse(init.body).refresh_token; return rt === "rt-old" ? IG() : json(200, { access_token: "acc-from-new", refresh_token: "rt-newer", expires_in: 900 }); }, { ...quiet, now: clock, sleep });
+  const p = makeWireTokenProvider(ENV("rot", { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async (_u, init) => { calls++; const rt = JSON.parse(init.body).refresh_token; return rt === "rt-old" ? IG() : json(200, { access_token: "acc-from-new", refresh_token: "rt-newer", expires_in: 900 }); }, { ...quiet, now: clock, sleep });
   const a = await p.get();
   ok(a === "acc-sibling" && calls === 1, `sibling's rotation + access token adopted after the first refusal — no second call (access=${a}, calls=${calls})`);
   ok(!existsSync(f("rot", ".dead")) && !p.needsSignIn(), "no tombstone, still signed in");
@@ -145,7 +188,7 @@ console.log("\ncase 3: a sibling rotates the token while we wait to retry → us
   // 3b: sibling wrote only the new refresh → the retry presents the NEW refresh (never rt-old twice)
   const clock = fakeClock(); const sent = [];
   wireRefreshSet("rot2", "rt-old");
-  const p = makeWireTokenProvider(ENV("rot2"), async (_u, init) => { const rt = JSON.parse(init.body).refresh_token; sent.push(rt); return rt === "rt-old" ? IG() : json(200, { access_token: "acc-2", refresh_token: "rt-3", expires_in: 900 }); },
+  const p = makeWireTokenProvider(ENV("rot2", { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async (_u, init) => { const rt = JSON.parse(init.body).refresh_token; sent.push(rt); return rt === "rt-old" ? IG() : json(200, { access_token: "acc-2", refresh_token: "rt-3", expires_in: 900 }); },
     { ...quiet, now: clock, sleep: async (ms) => { clock.add(ms); wireRefreshSet("rot2", "rt-sibling"); } });
   const a = await p.get();
   ok(a === "acc-2" && sent.join(",") === "rt-old,rt-sibling", `retry re-read the file under the lock and used the sibling's refresh (sent ${sent.join(",")})`);
@@ -158,10 +201,10 @@ console.log("\ncase 4: process dies between invalid_grant attempts → restart h
 {
   let calls = 0; const clock = fakeClock();
   wireRefreshSet("cool", "rt-x");
-  const p1 = makeWireTokenProvider(ENV("cool"), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async () => { throw new Error("process killed"); } });
+  const p1 = makeWireTokenProvider(ENV("cool", { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async () => { throw new Error("process killed"); } });
   try { await p1.get(); } catch {}
   ok(calls === 1 && existsSync(f("cool", ".state")) && existsSync(f("cool", ".tok")), "after attempt 1: state persisted, refresh NOT cleared yet");
-  const p2 = makeWireTokenProvider(ENV("cool"), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async (ms) => clock.add(ms) });
+  const p2 = makeWireTokenProvider(ENV("cool", { BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "3" }), async () => { calls++; return IG(); }, { ...quiet, now: clock, sleep: async (ms) => clock.add(ms) });
   let e = null; try { await p2.get(); } catch (x) { e = x; }
   ok(calls === 1 && e && e.code === "WIRE_REFRESH_BACKOFF" && /attempt 1\/3/.test(e.message), "restarted process inside the window → zero calls, says attempt 1/3 + when it will retry");
   clock.add(3_000);
@@ -397,6 +440,83 @@ const waitFor = async (cond, ms = 3000) => { const t0 = Date.now(); while (!cond
   const s3 = await S.resolveSigner({ env: { ...wenv, BUZZ_WIRE_ID: "sk5-static", BUZZ_EKAM_HUMAN_TOKEN: "st" }, fetch: fetchFn, wireTokenOpts: { log: () => {}, startupKeepAlive: { delayMs: 10 } } });
   ok(!s3.keepAlivePending().startup, "static token via resolveSigner → no startup timer");
   s3.wipe();
+}
+
+// ── 8. v0.2.37 (buzz_security must-fix 1): stale-lock break is serialized + ownership re-check before the POST ──
+console.log("\ncase 8: stale-lock break race (.break serialization, nonce re-check, pre-POST ownership)");
+{
+  const { hostname } = await import("node:os");
+  const lf = f("br", ".lock");
+  // (a) the race itself: we saw stale nonce X, but another breaker already broke it and took a NEW lock Y
+  writeFileSync(lf, JSON.stringify({ pid: process.pid, host: hostname(), t: Date.now(), n: "Y-new-holder" }), { mode: 0o600 });
+  ok(breakStaleLock(lf, "X-stale") === false && JSON.parse(readFileSync(lf, "utf8")).n === "Y-new-holder", "breaker with a stale snapshot (n=X) does NOT remove the new holder's lock (n=Y)");
+  ok(!existsSync(lf + ".break"), ".break released after a no-op break");
+  // (b) nonce still matches → broken, .break released
+  writeFileSync(lf, JSON.stringify({ pid: 1, host: "h", t: 0, n: "X-stale" }), { mode: 0o600 });
+  ok(breakStaleLock(lf, "X-stale") === true && !existsSync(lf) && !existsSync(lf + ".break"), "nonce still the stale one → lock removed, .break released");
+  // (c) another breaker holds a FRESH .break → we do not break at all
+  writeFileSync(lf, JSON.stringify({ pid: 1, host: "h", t: 0, n: "X-stale" }), { mode: 0o600 });
+  writeFileSync(lf + ".break", JSON.stringify({ pid: 1, host: "h", t: Date.now(), n: "other-breaker" }), { mode: 0o600 });
+  ok(breakStaleLock(lf, "X-stale") === false && existsSync(lf) && JSON.parse(readFileSync(lf + ".break", "utf8")).n === "other-breaker", "a live .break (another breaker mid-break) → no break, its .break untouched");
+  // (d) a crashed breaker's .break is cleared once older than breakStaleMs; the next try breaks the lock
+  ok(breakStaleLock(lf, "X-stale", { breakStaleMs: 5_000, now: () => Date.now() + 10_000 }) === false && !existsSync(lf + ".break") && existsSync(lf), ".break older than breakStaleMs is cleared (that call still does not break)");
+  ok(breakStaleLock(lf, "X-stale") === true && !existsSync(lf), "…and the next call breaks the stale lock");
+  // (e) unreadable lock: broken only if still unreadable AND old by mtime
+  writeFileSync(lf, "", { mode: 0o600 });
+  ok(breakStaleLock(lf, null) === false && existsSync(lf), "fresh empty lock (holder mid-write) is not broken");
+  ok(breakStaleLock(lf, null, { now: () => Date.now() + 120_000 }) === true && !existsSync(lf), "empty lock older than staleMs is broken");
+  // (f) withWireLock: owns() reflects a stolen lock; release never removes someone else's lock
+  const r = await withWireLock("br", async ({ owns }) => {
+    const before = owns();
+    writeFileSync(lf, JSON.stringify({ pid: process.pid, host: hostname(), t: Date.now(), n: "thief" }), { mode: 0o600 });
+    return [before, owns()];
+  }, { timeoutMs: 2000 });
+  ok(r[0] === true && r[1] === false && JSON.parse(readFileSync(lf, "utf8")).n === "thief", "owns() true while held, false once another holder's lock replaced ours; our release leaves theirs alone");
+  unlinkSync(lf);
+}
+{
+  // (g) provider: a racing breaker replaces our lock right after we acquire → NO POST that round; we re-acquire, then POST once
+  const { hostname } = await import("node:os");
+  const dead = spawn(process.execPath, ["-e", "0"]); const deadPid = dead.pid; await new Promise((r) => dead.on("close", r));
+  wireRefreshSet("own", "rt-o");
+  let calls = 0, hits = 0;
+  const onAcquire = ({ lockFile }) => { if (hits++ === 0) writeFileSync(lockFile, JSON.stringify({ pid: deadPid, host: hostname(), t: Date.now(), n: "racer" }), { mode: 0o600 }); };
+  const p = makeWireTokenProvider(ENV("own"), async (_u, init) => { calls++; return json(200, { access_token: "acc-o", refresh_token: "rt-o2", expires_in: 900 }); }, { ...quiet, lock: { timeoutMs: 3000, onAcquire } });
+  const a = await p.get();
+  ok(a === "acc-o" && calls === 1 && hits === 2, `lost lock before the POST → zero POSTs that round, one POST after re-acquiring (calls=${calls}, acquisitions=${hits})`);
+  ok(!existsSync(f("own", ".lock")) && wireRefreshGet("own") === "rt-o2", "lock released, rotation persisted");
+  p.stopKeepAlive();
+}
+{
+  // (h) provider: .tok changes right after we acquire (sibling rotated) → the old refresh is never sent
+  wireRefreshSet("own2", "rt-old");
+  const sent = []; let hits = 0;
+  const onAcquire = () => { if (hits++ === 0) wireRefreshSet("own2", "rt-sib"); };
+  const p = makeWireTokenProvider(ENV("own2"), async (_u, init) => { sent.push(JSON.parse(init.body).refresh_token); return json(200, { access_token: "acc-s", refresh_token: "rt-s2", expires_in: 900 }); }, { ...quiet, lock: { timeoutMs: 3000, onAcquire } });
+  // force the provider to hold rt-old in memory first
+  ok(p.hasRefresh(), "provider loaded rt-old");
+  const a = await p.get();
+  ok(a === "acc-s" && sent.join(",") === "rt-sib", `.tok rotated before the POST → sent only the sibling's refresh (sent ${sent.join(",")})`);
+  p.stopKeepAlive();
+}
+{
+  // (i) stress: 6 processes race to break the SAME stale lock (dead pid) at the same instant → critical sections never overlap
+  const { hostname } = await import("node:os");
+  const dead = spawn(process.execPath, ["-e", "0"]); const deadPid = dead.pid; await new Promise((r) => dead.on("close", r));
+  writeFileSync(f("stress", ".lock"), JSON.stringify({ pid: deadPid, host: hostname(), t: Date.now(), n: "stale" }), { mode: 0o600 });
+  const logf = join(HOME, "stress.log"); writeFileSync(logf, "");
+  const at = Date.now() + 800;
+  const run = () => new Promise((resolve) => {
+    const c = spawn(process.execPath, [SELF, "--lockchild"], { env: { ...process.env, HOME, T_ID: "stress", T_LOG: logf, T_AT: String(at) }, stdio: ["ignore", "pipe", "inherit"] });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.on("close", () => resolve(out));
+  });
+  const outs = await Promise.all(Array.from({ length: 6 }, run));
+  const lines = readFileSync(logf, "utf8").trim().split("\n");
+  let overlap = false, depth = 0, lost = false;
+  for (const l of lines) { const [k, , o] = l.split(" "); if (k === "E") { depth++; if (depth > 1) overlap = true; } else { depth--; if (o !== "1") lost = true; } }
+  ok(outs.every((o) => o === "ok") && lines.length === 12, `all 6 processes got the lock once (${outs.filter((o) => o === "ok").length}/6, ${lines.length} log lines)`);
+  ok(!overlap && !lost, "no two holders at once; every holder still owned its lock at the end of its critical section");
+  ok(!existsSync(f("stress", ".lock")) && !existsSync(f("stress", ".lock.break")) && !readdirSync(WIRE_REFRESH_DIR).some((n) => /^stress.*stale/.test(n)), "no leftover lock, .break or grave files");
 }
 
 console.log(`\n${failed ? "FAIL" : "ALL PASS"}: ${passed} passed, ${failed} failed`);
