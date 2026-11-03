@@ -16,6 +16,7 @@
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import * as nip19 from "nostr-tools/nip19";
 import { resolveKey } from "./loadkey_v2.mjs";
+import { shimUserAgent } from "./clientversion.mjs";
 import { getConversationKey as nip44ConvKey, encrypt as nip44Encrypt, decrypt as nip44Decrypt } from "./nip44.mjs";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -342,7 +343,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
       let res, text;
       try {
         res = await fetchFn(`${base}/oauth/token`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
           body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, refresh_token: refresh }),
           signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(MINT_TIMEOUT_MS) : undefined,
         });
@@ -1335,10 +1336,10 @@ export function kindNotAllowedMessage(kind, body) {
 //             400 kind_not_allowed, 503 escrow/Vault unavailable — {error,error_description}.
 //             (v0.2.32-pre) 400 kind_not_allowed → kindNotAllowedMessage(): refused kind + Ekam's allowed set.
 // Guarded to fail LOUD on any mismatch, so a wrong/unsigned event never passes silently.
-export async function wireSign(base, token, template, fetchFn = fetch) {
+export async function wireSign(base, token, template, fetchFn = fetch, { hosted = false } = {}) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "User-Agent": shimUserAgent({ hosted }) },
     // {event:{...}} envelope; kind/tags/content ONLY — server stamps created_at and
     // fills pubkey/id/sig from the escrowed wire key.
     body: JSON.stringify({ event: { kind: template.kind, tags: template.tags || [], content: template.content ?? "" } }),
@@ -1528,10 +1529,10 @@ export function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = 
       let ev;
       // 403 (bare / "forbidden") or a not-provisioned code → the one friendly message; anything else unchanged.
       const mapped = (e) => (e && isBuzzAppSigninError({ status: e.status, error: e.ekamError === "forbidden" ? null : e.ekamError }) ? buzzAppSigninError(e) : hostedWireError(e, template.kind));
-      try { ev = await wireSign(base, await getToken(false), template, fetchFn); }
+      try { ev = await wireSign(base, await getToken(false), template, fetchFn, { hosted: true }); }
       catch (e) {
         if (e.status !== 401) throw mapped(e);
-        try { ev = await wireSign(base, await getToken(true), template, fetchFn); } // one forced re-exchange
+        try { ev = await wireSign(base, await getToken(true), template, fetchFn, { hosted: true }); } // one forced re-exchange
         catch (e2) { throw mapped(e2); }
       }
       if (String(ev.pubkey).toLowerCase() !== pk)
@@ -1545,7 +1546,7 @@ export function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = 
 // for a non-routable URL and read the pubkey off the signed event (same probe as wirelogin.mjs).
 // The event is never sent anywhere.
 export async function probeWirePubkey(base, token, fetchFn = fetch) {
-  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn);
+  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn, { hosted: true });
   const pk = normalizePubkey(ev.pubkey);
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;

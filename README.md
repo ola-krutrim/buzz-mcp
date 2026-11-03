@@ -604,6 +604,12 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   the stdio shim refreshes once after a jittered 3–60s delay, through the same lock and single-flight,
   then the normal ~75% renew takes over. No token means nothing happens; failures fall back to on-demand.
   Off in hosted mode. Opt out with `BUZZ_WIRE_STARTUP_KEEPALIVE=0`.
+- **Ekam calls send the shim version in `User-Agent`** (previously node's bare default): refresh/mint,
+  login code exchange, wire-sign, wire-key and directory calls send
+  `buzz-mcp/<version> (node/<node version>; <platform>)`; the hosted server's metadata, JWKS,
+  introspection and token-exchange calls send `buzz-mcp/<version> hosted (...)`. No user, host, client
+  or token identifiers. The version comes from `SHIM_VERSION` in `clientversion.mjs`, now the single
+  source that `buzz-mcp.mjs` re-exports. Relay calls are unchanged (they already send `x-buzz-client`).
 
 ### v0.2.36
 - Version bump to 0.2.36. The changes below are already on `main` (#27, #22, #28); this release tags them.

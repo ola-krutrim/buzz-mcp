@@ -19,6 +19,8 @@
 import { createHash, createPublicKey, verify as cryptoVerify, createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync, existsSync, chmodSync, unlinkSync } from "node:fs";
 import { isBuzzAppSigninError, buzzAppSigninError } from "./signer.mjs";
+import { shimUserAgent } from "./clientversion.mjs";
+const HOSTED_UA = () => shimUserAgent({ hosted: true });
 
 export const DEFAULT_RESOURCE = "https://mcp.buzz.ola.in";
 export const DEFAULT_ISSUER = "https://ekam.olakrutrim.com";
@@ -117,7 +119,7 @@ export function createAsMetadata(cfg, { fetch: fetchFn = fetch, now = Date.now }
     if (inflight) return inflight;
     inflight = (async () => {
       try {
-        const j = await readJson(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json" } }), "authorization-server metadata");
+        const j = await readJson(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json", "User-Agent": HOSTED_UA() } }), "authorization-server metadata");
         if (j.issuer && trimSlash(j.issuer) !== cfg.issuer) throw new Error(`authorization-server metadata issuer mismatch (${j.issuer} ≠ ${cfg.issuer})`);
         cached = j; at = now(); return j;
       } finally { inflight = null; }
@@ -186,7 +188,7 @@ export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.n
     if (!force && jwks && now() - jwksAt < cfg.metadataTtlS * 1000) return jwks;
     const uri = await jwksUri();
     if (!uri) throw new AuthError(401, "invalid_token", "no JWKS available to verify the token");
-    const j = await readJson(await fetchFn(uri, { headers: { Accept: "application/json" } }), "JWKS");
+    const j = await readJson(await fetchFn(uri, { headers: { Accept: "application/json", "User-Agent": HOSTED_UA() } }), "JWKS");
     jwks = Array.isArray(j.keys) ? j.keys : []; jwksAt = now();
     return jwks;
   }
@@ -215,7 +217,7 @@ export function createTokenValidator(cfg, { fetch: fetchFn = fetch, now = Date.n
     if (hit) return hit;
     const ep = cfg.introspectionEndpoint || (await meta()).introspection_endpoint;
     if (!ep) throw new AuthError(401, "invalid_token", "no introspection endpoint configured");
-    const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
+    const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json", "User-Agent": HOSTED_UA() };
     const form = new URLSearchParams({ token, token_type_hint: "access_token" });
     if (cfg.clientSecret) headers.Authorization = "Basic " + Buffer.from(`${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.clientSecret)}`).toString("base64");
     else form.set("client_id", cfg.clientId);
@@ -297,7 +299,7 @@ export function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now = Date.n
       resource: cfg.exchangeResource,
       client_id: cfg.clientId,
     };
-    const headers = { Accept: "application/json" };
+    const headers = { Accept: "application/json", "User-Agent": HOSTED_UA() };
     if (cfg.clientSecret) headers.Authorization = "Basic " + Buffer.from(`${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.clientSecret)}`).toString("base64");
     let body;
     if (cfg.exchangeFormat === "form") { headers["Content-Type"] = "application/x-www-form-urlencoded"; body = new URLSearchParams(params).toString(); }

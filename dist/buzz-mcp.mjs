@@ -20615,6 +20615,74 @@ ${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
   }
 });
 
+// clientversion.mjs
+function shimUserAgent({ hosted = false } = {}) {
+  const node2 = typeof process !== "undefined" && process.versions && process.versions.node || "unknown";
+  const plat = typeof process !== "undefined" && process.platform || "unknown";
+  return `buzz-mcp/${SHIM_VERSION}${hosted ? " hosted" : ""} (node/${node2}; ${plat})`;
+}
+function parse3(v) {
+  if (typeof v !== "string") return null;
+  const core = v.trim().replace(/^v/, "").split(/[-+]/, 1)[0];
+  if (!/^\d+(\.\d+)*$/.test(core)) return null;
+  return core.split(".").map((n) => parseInt(n, 10));
+}
+function cmpVersions(a, b) {
+  const pa = parse3(a), pb = parse3(b);
+  if (!pa || !pb) return null;
+  const n = Math.max(pa.length, pb.length);
+  for (let i2 = 0; i2 < n; i2++) {
+    const x = pa[i2] || 0, y = pb[i2] || 0;
+    if (x < y) return -1;
+    if (x > y) return 1;
+  }
+  return 0;
+}
+function pickAdvertised(nip11) {
+  if (!nip11 || typeof nip11 !== "object") return {};
+  const ns = nip11.ola_buzz && typeof nip11.ola_buzz === "object" ? nip11.ola_buzz : {};
+  const latest = nip11.shim_latest ?? ns.shim_latest;
+  const min = nip11.shim_min ?? ns.shim_min;
+  return {
+    latest: typeof latest === "string" ? latest : void 0,
+    min: typeof min === "string" ? min : void 0
+  };
+}
+function clientVersionStatus(running, advertised) {
+  const { latest, min } = advertised || {};
+  if (min) {
+    const c = cmpVersions(running, min);
+    if (c !== null && c < 0) {
+      return {
+        level: "below-min",
+        running,
+        latest,
+        min,
+        message: `[buzz-mcp] \u26A0 this shim is v${running}, but the relay requires at least v${min}. Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli). Older clients may be refused.`
+      };
+    }
+  }
+  if (latest) {
+    const c = cmpVersions(running, latest);
+    if (c !== null && c < 0) {
+      return {
+        level: "update",
+        running,
+        latest,
+        min,
+        message: `[buzz-mcp] \u2139 a newer shim is available: v${latest} (you're on v${running}). Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli).`
+      };
+    }
+  }
+  return { level: "ok", running, latest, min, message: null };
+}
+var SHIM_VERSION;
+var init_clientversion = __esm({
+  "clientversion.mjs"() {
+    SHIM_VERSION = "0.2.36";
+  }
+});
+
 // node_modules/@noble/ciphers/utils.js
 function isBytes3(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
@@ -21807,7 +21875,7 @@ function makeWireTokenProvider(env, fetchFn, opts = {}) {
       try {
         res = await fetchFn(`${base}/oauth/token`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
           body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, refresh_token: refresh }),
           signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(MINT_TIMEOUT_MS) : void 0
         });
@@ -22666,10 +22734,10 @@ function kindNotAllowedMessage(kind, body) {
   const what = allowed ? `it currently allows {${allowed.join(", ")}}` : `it didn't say which kinds it allows${desc ? ` (Ekam said: "${echo(desc)}")` : ""}`;
   return `Ekam (your signing service) doesn't sign kind ${kind} yet; ${what}. Ask the Ekam owner to add it, or use an agent's own key. (wire-sign HTTP 400 kind_not_allowed)`;
 }
-async function wireSign(base, token, template, fetchFn = fetch) {
+async function wireSign(base, token, template, fetchFn = fetch, { hosted = false } = {}) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "User-Agent": shimUserAgent({ hosted }) },
     // {event:{...}} envelope; kind/tags/content ONLY — server stamps created_at and
     // fills pubkey/id/sig from the escrowed wire key.
     body: JSON.stringify({ event: { kind: template.kind, tags: template.tags || [], content: template.content ?? "" } })
@@ -22830,11 +22898,11 @@ function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = fetch }
       let ev;
       const mapped = (e) => e && isBuzzAppSigninError({ status: e.status, error: e.ekamError === "forbidden" ? null : e.ekamError }) ? buzzAppSigninError(e) : hostedWireError(e, template.kind);
       try {
-        ev = await wireSign(base, await getToken(false), template, fetchFn);
+        ev = await wireSign(base, await getToken(false), template, fetchFn, { hosted: true });
       } catch (e) {
         if (e.status !== 401) throw mapped(e);
         try {
-          ev = await wireSign(base, await getToken(true), template, fetchFn);
+          ev = await wireSign(base, await getToken(true), template, fetchFn, { hosted: true });
         } catch (e2) {
           throw mapped(e2);
         }
@@ -22846,7 +22914,7 @@ function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = fetch }
   };
 }
 async function probeWirePubkey(base, token, fetchFn = fetch) {
-  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn);
+  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn, { hosted: true });
   const pk = normalizePubkey(ev.pubkey);
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;
@@ -22857,6 +22925,7 @@ var init_signer = __esm({
     init_pure();
     init_nip19();
     await init_loadkey_v2();
+    init_clientversion();
     init_nip44();
     init_hmac();
     init_sha2();
@@ -26143,7 +26212,7 @@ function createAsMetadata(cfg, { fetch: fetchFn = fetch, now: now2 = Date.now } 
     if (inflight) return inflight;
     inflight = (async () => {
       try {
-        const j = await readJson2(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json" } }), "authorization-server metadata");
+        const j = await readJson2(await fetchFn(`${cfg.issuer}/.well-known/oauth-authorization-server`, { headers: { Accept: "application/json", "User-Agent": HOSTED_UA() } }), "authorization-server metadata");
         if (j.issuer && trimSlash(j.issuer) !== cfg.issuer) throw new Error(`authorization-server metadata issuer mismatch (${j.issuer} \u2260 ${cfg.issuer})`);
         cached2 = j;
         at = now2();
@@ -26210,7 +26279,7 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     if (!force && jwks && now2() - jwksAt < cfg.metadataTtlS * 1e3) return jwks;
     const uri = await jwksUri();
     if (!uri) throw new AuthError(401, "invalid_token", "no JWKS available to verify the token");
-    const j = await readJson2(await fetchFn(uri, { headers: { Accept: "application/json" } }), "JWKS");
+    const j = await readJson2(await fetchFn(uri, { headers: { Accept: "application/json", "User-Agent": HOSTED_UA() } }), "JWKS");
     jwks = Array.isArray(j.keys) ? j.keys : [];
     jwksAt = now2();
     return jwks;
@@ -26254,7 +26323,7 @@ function createTokenValidator(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     if (hit) return hit;
     const ep = cfg.introspectionEndpoint || (await meta2()).introspection_endpoint;
     if (!ep) throw new AuthError(401, "invalid_token", "no introspection endpoint configured");
-    const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
+    const headers = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json", "User-Agent": HOSTED_UA() };
     const form = new URLSearchParams({ token, token_type_hint: "access_token" });
     if (cfg.clientSecret) headers.Authorization = "Basic " + Buffer.from(`${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.clientSecret)}`).toString("base64");
     else form.set("client_id", cfg.clientId);
@@ -26350,7 +26419,7 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
       resource: cfg.exchangeResource,
       client_id: cfg.clientId
     };
-    const headers = { Accept: "application/json" };
+    const headers = { Accept: "application/json", "User-Agent": HOSTED_UA() };
     if (cfg.clientSecret) headers.Authorization = "Basic " + Buffer.from(`${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.clientSecret)}`).toString("base64");
     let body;
     if (cfg.exchangeFormat === "form") {
@@ -26410,10 +26479,12 @@ function createTokenExchanger(cfg, { fetch: fetchFn = fetch, now: now2 = Date.no
     size: () => cache.size
   };
 }
-var DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, SIGNIN_CLIENT_ID, EXCHANGE_CLIENT_ID, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, defaultTmpName, hashSub;
+var HOSTED_UA, DEFAULT_RESOURCE, DEFAULT_ISSUER, CLIENT_ID_PLACEHOLDER, SIGNIN_CLIENT_ID, EXCHANGE_CLIENT_ID, TOKEN_EXCHANGE_GRANT, ACCESS_TOKEN_TYPE, ALLOWED_ALGS, trimSlash, list, int2, AuthError, resourceMetadataUrl, b64urlJson, looksJwt, audList, scopeList, STORE_AAD, defaultTmpName, hashSub;
 var init_hosted_auth = __esm({
   async "hosted-auth.mjs"() {
     await init_signer();
+    init_clientversion();
+    HOSTED_UA = () => shimUserAgent({ hosted: true });
     DEFAULT_RESOURCE = "https://mcp.buzz.ola.in";
     DEFAULT_ISSUER = "https://ekam.olakrutrim.com";
     CLIENT_ID_PLACEHOLDER = "REPLACE_WITH_EKAM_CLIENT_ID";
@@ -27015,65 +27086,7 @@ init_types();
 init_nip19();
 await init_signer();
 await init_loadkey_v2();
-
-// clientversion.mjs
-function parse3(v) {
-  if (typeof v !== "string") return null;
-  const core = v.trim().replace(/^v/, "").split(/[-+]/, 1)[0];
-  if (!/^\d+(\.\d+)*$/.test(core)) return null;
-  return core.split(".").map((n) => parseInt(n, 10));
-}
-function cmpVersions(a, b) {
-  const pa = parse3(a), pb = parse3(b);
-  if (!pa || !pb) return null;
-  const n = Math.max(pa.length, pb.length);
-  for (let i2 = 0; i2 < n; i2++) {
-    const x = pa[i2] || 0, y = pb[i2] || 0;
-    if (x < y) return -1;
-    if (x > y) return 1;
-  }
-  return 0;
-}
-function pickAdvertised(nip11) {
-  if (!nip11 || typeof nip11 !== "object") return {};
-  const ns = nip11.ola_buzz && typeof nip11.ola_buzz === "object" ? nip11.ola_buzz : {};
-  const latest = nip11.shim_latest ?? ns.shim_latest;
-  const min = nip11.shim_min ?? ns.shim_min;
-  return {
-    latest: typeof latest === "string" ? latest : void 0,
-    min: typeof min === "string" ? min : void 0
-  };
-}
-function clientVersionStatus(running, advertised) {
-  const { latest, min } = advertised || {};
-  if (min) {
-    const c = cmpVersions(running, min);
-    if (c !== null && c < 0) {
-      return {
-        level: "below-min",
-        running,
-        latest,
-        min,
-        message: `[buzz-mcp] \u26A0 this shim is v${running}, but the relay requires at least v${min}. Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli). Older clients may be refused.`
-      };
-    }
-  }
-  if (latest) {
-    const c = cmpVersions(running, latest);
-    if (c !== null && c < 0) {
-      return {
-        level: "update",
-        running,
-        latest,
-        min,
-        message: `[buzz-mcp] \u2139 a newer shim is available: v${latest} (you're on v${running}). Update: npx -y github:ola-krutrim/buzz-mcp (or re-run the install-cli).`
-      };
-    }
-  }
-  return { level: "ok", running, latest, min, message: null };
-}
-
-// buzz-mcp.mjs
+init_clientversion();
 init_names();
 init_pure();
 init_safety();
@@ -27878,6 +27891,7 @@ function checkDiffContent(diff) {
 
 // wirelogin.mjs
 init_safety();
+init_clientversion();
 await init_signer();
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -27906,7 +27920,7 @@ function authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, stat
 async function exchangeAuthCode(base, { code, verifier, clientId, redirectUri }, fetchFn = fetch) {
   const res = await fetchFn(`${base}/oauth/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
     body: JSON.stringify({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri })
   });
   const text = await res.text();
@@ -28003,7 +28017,7 @@ ${url}
         console.error(`[wire-login] (pubkey auto-capture skipped: ${e.message} \u2014 set BUZZ_USER_PUBKEY if needed)`);
       }
       try {
-        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}`, "User-Agent": shimUserAgent() } });
         if (wk.ok) {
           const kj = await wk.json().catch(() => null);
           if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name));
@@ -28051,7 +28065,7 @@ import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import { homedir as homedir4, hostname as hostname2, tmpdir as tmpdir2 } from "node:os";
 import { join as join5, basename as basename2, extname } from "node:path";
 import { execSync, spawn as spawn2 } from "node:child_process";
-var SHIM_VERSION_EXPORT = "0.2.36";
+var SHIM_VERSION_EXPORT = SHIM_VERSION;
 var ERROR_TEXT_CAP = 1500;
 async function createBuzzServer(opts = {}) {
   const ENV = opts.env ?? process.env;
@@ -28181,7 +28195,7 @@ async function createBuzzServer(opts = {}) {
     );
     return "Nostr " + Buffer.from(JSON.stringify(ev)).toString("base64");
   }
-  const SHIM_VERSION = SHIM_VERSION_EXPORT;
+  const SHIM_VERSION2 = SHIM_VERSION_EXPORT;
   function retryClass(e) {
     const c = (e && (e.cause?.code || e.code || e.name) || "").toString().toLowerCase();
     if (c.includes("reset") || c.includes("econnreset")) return "socket_reset";
@@ -28377,7 +28391,7 @@ async function createBuzzServer(opts = {}) {
       // NIP-OA owner delegation: the relay reads membership from the `x-auth-tag` header (bridge.rs).
       ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
       // Platform attribution — telemetry only (relay stamps a bounded `client` label, never gates auth).
-      "x-buzz-client": `agent/${SHIM_VERSION}`,
+      "x-buzz-client": `agent/${SHIM_VERSION2}`,
       // #243: on a retry ONLY, mark it so the relay counts retry RATE (dedicated counter, telemetry only).
       ...isRetry ? { "x-buzz-retry": `1; retry_class=${rClass}` } : {}
     });
@@ -28666,19 +28680,19 @@ async function createBuzzServer(opts = {}) {
       model: AGENT_MODEL,
       harness: AGENT_HARNESS,
       interface: AGENT_INTERFACE,
-      client_version: SHIM_VERSION
+      client_version: SHIM_VERSION2
       // (C, v0.2.30) which shim build published this profile
     }, patch);
     const created_at = Math.max(Math.floor(Date.now() / 1e3), ((existing && existing.created_at) | 0) + 1);
     const res = await signer.sign({ kind: 0, created_at, tags: AUTH_TAG ? [AUTH_TAG] : [], content: JSON.stringify(profile) }).then((ev) => bridge("/events", ev));
     try {
-      const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed", client_version: SHIM_VERSION };
+      const card = { name, model: AGENT_MODEL, harness: AGENT_HARNESS, interface: AGENT_INTERFACE, host, identity: "Ekam-governed", client_version: SHIM_VERSION2 };
       const cardTags = [
         ["model", AGENT_MODEL],
         ["harness", AGENT_HARNESS],
         ["interface", AGENT_INTERFACE],
         ["L", "agent-card"],
-        ["client", "buzz-mcp", SHIM_VERSION]
+        ["client", "buzz-mcp", SHIM_VERSION2]
       ];
       if (PICKER_OWNER_TAG) cardTags.push(PICKER_OWNER_TAG);
       const cardEv = await signer.sign({ kind: KIND_AGENT_PROFILE, tags: cardTags, content: JSON.stringify(card) });
@@ -28870,7 +28884,7 @@ async function createBuzzServer(opts = {}) {
     if (signer.mode !== "wire" || typeof signer.ekamToken !== "function")
       throw new Error(`email addressing needs wire mode ("post as me") \u2014 pass an npub, hex pubkey, or exact display name instead`);
     const base = (signer.ekamBase ? signer.ekamBase() : ENV.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
-    const res = await fetch(`${base}/v1/directory/resolve?email=${encodeURIComponent(email2)}`, { headers: { Authorization: `Bearer ${await signer.ekamToken()}` } });
+    const res = await fetch(`${base}/v1/directory/resolve?email=${encodeURIComponent(email2)}`, { headers: { Authorization: `Bearer ${await signer.ekamToken()}`, "User-Agent": shimUserAgent({ hosted: !!signer.hosted }) } });
     const text = await res.text();
     if (res.ok) {
       let j;
@@ -29647,7 +29661,7 @@ Detail: buzz_workflows { channel, workflow }. Run one you own: buzz_workflow_run
     }
     return null;
   }
-  const server = new Server(HOSTED ? { name: "Ola Buzz", title: "Ola Buzz", version: SHIM_VERSION } : { name: "buzz", version: SHIM_VERSION }, { capabilities: { tools: {} } });
+  const server = new Server(HOSTED ? { name: "Ola Buzz", title: "Ola Buzz", version: SHIM_VERSION2 } : { name: "buzz", version: SHIM_VERSION2 }, { capabilities: { tools: {} } });
   const TO_SCHEMA = { type: ["string", "array"], items: { type: "string" }, maxItems: 8, description: "one person (npub / hex / email / exact display-name) or an array of up to 8 for a group DM" };
   const CONFIRM_PROP = { type: "boolean", description: "set true to confirm a destructive action (asked once per session per kind in wire / post-as-me mode)" };
   const CH = { type: "string", description: "channel name or id" };
@@ -29805,7 +29819,7 @@ Detail: buzz_workflows { channel, workflow }. Run one you own: buzz_workflow_run
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   let RELAY_INFO = null, RELAY_INFO_AT = 0;
   const RELAY_INFO_TTL = 3e4;
-  let CLIENT_VERSION = { level: "ok", running: SHIM_VERSION, latest: void 0, min: void 0, message: null };
+  let CLIENT_VERSION = { level: "ok", running: SHIM_VERSION2, latest: void 0, min: void 0, message: null };
   let VERSION_NUDGED = false;
   async function relayInfo() {
     if (RELAY_INFO && Date.now() - RELAY_INFO_AT < RELAY_INFO_TTL) return RELAY_INFO;
@@ -29814,7 +29828,7 @@ Detail: buzz_workflows { channel, workflow }. Run one you own: buzz_workflow_run
       const j = await r.json();
       RELAY_INFO = { name: j.name || "?", software: j.software || "?", version: j.version || "?", sha: j.software_sha || null, self: typeof j.self === "string" ? j.self : null };
       try {
-        CLIENT_VERSION = clientVersionStatus(SHIM_VERSION, pickAdvertised(j));
+        CLIENT_VERSION = clientVersionStatus(SHIM_VERSION2, pickAdvertised(j));
         if (CLIENT_VERSION.message && !VERSION_NUDGED) {
           VERSION_NUDGED = true;
           process.stderr.write(CLIENT_VERSION.message + "\n");
@@ -29874,7 +29888,7 @@ ${txt}` }] };
         const info = await relayInfo();
         const relayLine = info.error ? `\u26A0 UNREACHABLE: ${info.error}` : `${info.name} \xB7 v${info.version}${info.sha ? ` \xB7 deploy ${info.sha.slice(0, 12)}` : ""}`;
         return ok(`Ola Buzz \u2014 posting as you (${escapeName(MY_NAME)})
-  shim: @ola/buzz-mcp v${SHIM_VERSION} (hosted)
+  shim: @ola/buzz-mcp v${SHIM_VERSION2} (hosted)
   npub: ${npubEncode(PK)}
   pubkey: ${PK}
   identity: ${keyProvenance()}
@@ -29888,7 +29902,7 @@ ${txt}` }] };
         const skewNote = CLIENT_VERSION.message ? CLIENT_VERSION.level === "below-min" ? ` \u2014 \u26A0 below the relay's minimum v${CLIENT_VERSION.min}, update soon` : ` \u2014 \u2139 update available: v${CLIENT_VERSION.latest}` : "";
         return ok(`Buzz CLI identity:
   name: ${MY_NAME}
-  shim: @ola/buzz-mcp v${SHIM_VERSION}${skewNote}
+  shim: @ola/buzz-mcp v${SHIM_VERSION2}${skewNote}
   model: ${AGENT_MODEL}
   harness: ${AGENT_HARNESS}
   interface: ${AGENT_INTERFACE}
@@ -30639,7 +30653,7 @@ After you approve, run buzz_login again \u2014 or buzz_whoami \u2014 to confirm.
             } catch {
             }
             try {
-              const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+              const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}`, "User-Agent": shimUserAgent() } });
               if (wk.ok) {
                 const kj = await wk.json().catch(() => null);
                 if (kj && kj.name) wireNameSet(persistId, String(kj.name));
@@ -30718,7 +30732,7 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
               "Content-Type": "application/json",
               "Authorization": authz,
               ...AUTH_TAG ? { "x-auth-tag": JSON.stringify(AUTH_TAG) } : {},
-              "x-buzz-client": `agent/${SHIM_VERSION}`
+              "x-buzz-client": `agent/${SHIM_VERSION2}`
             }, "[]");
             const ptext = await probe.text();
             if (probe.status === 401 || probe.status === 403 || /nip-?98|unauthor|sign-?in|invalid.?token|revoked|expired/i.test(ptext)) {
@@ -30787,10 +30801,10 @@ The link is valid for about ${Math.round(ttlMs / 6e4)} min \u2014 after you appr
         let cv = CLIENT_VERSION;
         try {
           const r = await rawGet(`${RELAY}/`, { Accept: "application/nostr+json" }, timeoutMs);
-          if (r.ok) cv = clientVersionStatus(SHIM_VERSION, pickAdvertised(JSON.parse(r.text)));
+          if (r.ok) cv = clientVersionStatus(SHIM_VERSION2, pickAdvertised(JSON.parse(r.text)));
         } catch {
         }
-        const shimLine = cv.level === "below-min" ? `@ola/buzz-mcp v${SHIM_VERSION} \u2014 \u26A0 BELOW the relay's minimum v${cv.min}${cv.latest ? `; latest v${cv.latest}` : ""}, update soon` : cv.level === "update" ? `@ola/buzz-mcp v${SHIM_VERSION} \u2014 \u2139 update available (relay advertises v${cv.latest})` : cv.latest ? `@ola/buzz-mcp v${SHIM_VERSION} (up to date; relay advertises v${cv.latest})` : `@ola/buzz-mcp v${SHIM_VERSION} (relay advertises no shim version \u2014 skew-check inert)`;
+        const shimLine = cv.level === "below-min" ? `@ola/buzz-mcp v${SHIM_VERSION2} \u2014 \u26A0 BELOW the relay's minimum v${cv.min}${cv.latest ? `; latest v${cv.latest}` : ""}, update soon` : cv.level === "update" ? `@ola/buzz-mcp v${SHIM_VERSION2} \u2014 \u2139 update available (relay advertises v${cv.latest})` : cv.latest ? `@ola/buzz-mcp v${SHIM_VERSION2} (up to date; relay advertises v${cv.latest})` : `@ola/buzz-mcp v${SHIM_VERSION2} (relay advertises no shim version \u2014 skew-check inert)`;
         return ok([
           "buzz_doctor \u2014 connector-side diagnosis (NOT the authoritative relay health signal)",
           `  shim: ${shimLine}`,
@@ -30968,7 +30982,7 @@ ${UNTRUSTED_NOTE}
     get name() {
       return MY_NAME;
     },
-    version: SHIM_VERSION,
+    version: SHIM_VERSION2,
     hosted: HOSTED,
     close: async () => {
       try {
