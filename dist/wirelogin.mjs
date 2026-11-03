@@ -3,7 +3,7 @@
 // wirelogin.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+import { createHash as createHash2, randomBytes as randomBytes3 } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -2361,7 +2361,7 @@ async function resolveKey(opts = {}) {
   return sk;
 }
 if (process.argv.includes("--test")) {
-  const { rmSync, statSync } = await import("node:fs");
+  const { rmSync, statSync: statSync2 } = await import("node:fs");
   let pass = 0, fail = 0;
   const ok = (c, m) => c ? (pass++, console.log("  \u2705 " + m)) : (fail++, console.log("  \u274C " + m));
   console.log("resolve \u2014 pin caches + keystore recovery (the churn fix):");
@@ -2370,7 +2370,7 @@ if (process.argv.includes("--test")) {
   ok(skToHex(a) === pin, "named + pin \u2192 uses pin (and caches to keystore)");
   const b = await resolveKey({ env: { BUZZ_NAME: "smoke_governed" }, sessionId: "x" });
   ok(skToHex(b) === pin, "named, pin lost \u2192 RECOVERED from keystore (no random)");
-  const mode = statSync(identityFile("smoke_governed")).mode & 511;
+  const mode = statSync2(identityFile("smoke_governed")).mode & 511;
   ok(mode === 384, `keystore file is 0600 \u2014 no Keychain argv leak (SEC-1)`);
   try {
     rmSync(identityFile("smoke_governed"));
@@ -2442,21 +2442,56 @@ var te = new TextEncoder();
 var td = new TextDecoder("utf-8", { fatal: true });
 
 // signer.mjs
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2, chmodSync as chmodSync2, openSync, writeSync, closeSync, fsyncSync, renameSync, unlinkSync, statSync } from "node:fs";
+import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+import { homedir as homedir2, hostname } from "node:os";
 import { join as join4 } from "node:path";
 var DEFAULT_EKAM_CLIENT_ID = "clt_37501bdddf3c4e43a0ff";
 var ekamBase2 = (env) => (env.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com").replace(/\/+$/, "");
 var wirePersistId = (env) => (env.BUZZ_WIRE_ID || "wire").trim() || "wire";
 var wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter((k) => (env[k] || "").trim());
 var WIRE_REFRESH_DIR = join4(homedir2(), ".config", "buzz-cli", "wire-refresh");
-var wireRefreshFile = (id) => join4(WIRE_REFRESH_DIR, `${(id || "default").replace(/[^\w.-]/g, "_").slice(0, 80)}.tok`);
+var wireStem = (id) => join4(WIRE_REFRESH_DIR, (id || "default").replace(/[^\w.-]/g, "_").slice(0, 80));
+var wireRefreshFile = (id) => `${wireStem(id)}.tok`;
+var wireDeadFile = (id) => `${wireStem(id)}.dead`;
+var unlinkQuiet = (f) => {
+  try {
+    unlinkSync(f);
+    return true;
+  } catch {
+    return false;
+  }
+};
+function atomicWrite0600(f, data) {
+  mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
+  const tmp = `${f}.tmp-${process.pid}-${randomBytes2(6).toString("hex")}`;
+  let fd;
+  try {
+    fd = openSync(tmp, "wx", 384);
+    writeSync(fd, data);
+    try {
+      fsyncSync(fd);
+    } catch {
+    }
+    closeSync(fd);
+    fd = void 0;
+    chmodSync2(tmp, 384);
+    renameSync(tmp, f);
+  } catch (e) {
+    if (fd !== void 0) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+    unlinkQuiet(tmp);
+    throw e;
+  }
+}
 function wireRefreshSet(id, tok) {
   try {
-    mkdirSync2(WIRE_REFRESH_DIR, { recursive: true, mode: 448 });
-    const f = wireRefreshFile(id);
-    writeFileSync2(f, tok, { mode: 384 });
-    chmodSync2(f, 384);
+    atomicWrite0600(wireRefreshFile(id), String(tok));
+    unlinkQuiet(wireDeadFile(id));
     return true;
   } catch {
     return false;
@@ -2488,6 +2523,8 @@ function wireNameSet(id, name) {
     return false;
   }
 }
+var TR_BACKOFF_CAP_MS = 5 * 6e4;
+var RETRY_AFTER_CAP_MS = 60 * 6e4;
 var MEDIA_MB = 1024 * 1024;
 var MEDIA_CAPS = { image: 50 * MEDIA_MB, gif: 10 * MEDIA_MB, video: 500 * MEDIA_MB, file: 100 * MEDIA_MB };
 var DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -2625,8 +2662,8 @@ async function wireSign(base, token, template, fetchFn = fetch) {
 // wirelogin.mjs
 var b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 function pkce() {
-  const verifier = b64url(randomBytes2(32));
-  const challenge2 = b64url(createHash("sha256").update(verifier).digest());
+  const verifier = b64url(randomBytes3(32));
+  const challenge2 = b64url(createHash2("sha256").update(verifier).digest());
   return { verifier, challenge: challenge2 };
 }
 function authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource }) {
@@ -2704,7 +2741,7 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
   }
   const ports = (env.BUZZ_WIRE_LOGIN_PORTS || "8765,8766,8770").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
   const { verifier, challenge: challenge2 } = pkce();
-  const state = b64url(randomBytes2(16));
+  const state = b64url(randomBytes3(16));
   const { srv, port } = await bindLoopback(ports);
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   const url = authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, state, resource: base });

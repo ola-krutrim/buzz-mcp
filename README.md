@@ -123,6 +123,19 @@ each message (kind 9). **Kill-switch:** revoke the token family or suspend the h
 Ekam and the shim can neither mint nor sign — immediately. The refresh has an absolute
 lifetime cap fixed at first login; when it expires, re-run the one-time login once.
 
+**Many sessions, one login.** Every MCP session runs its own shim process, and they all share
+`wire-refresh/<id>.tok`. The refresh is single-use, so minting is serialized: one mint at a time per
+process, and across processes an exclusive `<id>.lock` (stale after 60s or a dead pid). Under the
+lock the shim re-reads `.tok` and adopts a token another process already rotated (and that process's
+short-lived access token, `<id>.acc`, 0600) instead of replaying the spent one. Writes are atomic
+(0600 temp file, then rename). If Ekam refuses the refresh (`invalid_grant`), the shim retries a
+bounded number of times (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`, default 3, max 10; ~2s / ~8s / ~32s
+apart), re-reading `.tok` before each try; after that it clears the stored refresh, leaves an
+`<id>.dead` marker so no session (or restart) retries it, and asks you to sign in again
+(`buzz_login` / `buzz-mcp-login`). Network / 5xx / 429 errors back off exponentially with jitter
+(at least 30s after repeated failures, honouring `Retry-After`, capped at 5 min); the window is kept
+in `<id>.state`, so a restarted shim does not start the cycle over.
+
 Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005,
 9007, 9002, 9021, 40003, 9022}` — messages, NIP-98 auth, DM open / add-member, NIP-25 reactions
 (kind 7), Blossom media auth (kind 24242, for attachment upload/download), NIP-29 moderation
@@ -567,6 +580,18 @@ source; the bundle is derived. Both bundles carry a `#!/usr/bin/env node` sheban
 in the published `files[]` — the end-user install stays no-npm and runs only the bundle.)
 
 ## Changelog
+
+### Unreleased (refresh-singleflight, after v0.2.36)
+- **Wire mode: rotating-refresh races fixed.** Cross-process `O_EXCL` lock + in-process single-flight
+  around the Ekam refresh, re-read and adopt under the lock, atomic 0600 writes. Previously each MCP
+  session's shim read the refresh once at startup, so a second session replayed a spent token
+  (`invalid_grant`, Ekam family revocation for `refresh_token_replay`) and kept POSTing it on every
+  signed request.
+- `invalid_grant` / `invalid_client`: bounded retries (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`, default 3),
+  then the stored refresh is cleared and the error asks you to sign in (`code: WIRE_SIGNIN_REQUIRED`).
+  Transient errors back off (`code: WIRE_REFRESH_BACKOFF`) with a persistent window.
+- Tests: new `refresh.test.mjs` (mocked token endpoint, real child processes). `bridge.test.mjs` no
+  longer sends a refresh to prod Ekam during `npm test`.
 
 ### v0.2.36
 - Version bump to 0.2.36. The changes below are already on `main` (#27, #22, #28); this release tags them.

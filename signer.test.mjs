@@ -87,9 +87,12 @@ const { rmSync, readFileSync: rf, mkdirSync: mkd, writeFileSync: wf } = await im
 const { join: pjoin } = await import("node:path");
 const { homedir: hd } = await import("node:os");
 const wireTok = (id) => pjoin(hd(), ".config/buzz-cli/wire-refresh", id + ".tok");
+// refresh-singleflight: a wire id also has .acc (shared access token), .state (persistent backoff), .dead (sign-in
+// tombstone) and .lock sidecars — clean them all so reruns start from a blank slate.
+const wireClean = (id) => { for (const x of [".tok", ".acc", ".state", ".dead", ".lock"]) { try { rmSync(pjoin(hd(), ".config/buzz-cli/wire-refresh", id + x)); } catch {} } };
 
 console.log("wire mode — autonomous refresh-rotation (Phase-2 seam):");
-try { rmSync(wireTok("wiretest")); } catch {}
+wireClean("wiretest");
 let oauthCalls = 0, lastGrant = null;
 const refreshMock = async (url, init) => {
   if (url.endsWith("/oauth/token")) {
@@ -109,10 +112,10 @@ ok(oauthCalls === 1 && lastGrant.grant_type === "refresh_token" && lastGrant.cli
 ok(rf(wireTok("wiretest"), "utf8").trim() === "rot-1", "rotated refresh persisted 0600 (single-use rotation)");
 await rSigner.sign({ kind: 9, tags: [], content: "again" });
 ok(oauthCalls === 1, "valid access token reused within TTL — no needless re-mint");
-try { rmSync(wireTok("wiretest")); } catch {}
+wireClean("wiretest");
 
 console.log("wire mode — 401 mid-life → forced re-mint + retry:");
-try { rmSync(wireTok("wt2")); } catch {}
+wireClean("wt2");
 let ws = 0, oauth2 = 0;
 const expireMock = async (url, init) => {
   if (url.endsWith("/oauth/token")) { oauth2++; return { ok: true, status: 200, text: async () => JSON.stringify({ access_token: GOOD_TOKEN, refresh_token: "rot-x", expires_in: 900 }) }; }
@@ -124,18 +127,18 @@ await eSigner.sign({ kind: 9, tags: [], content: "first ok" });
 const before = oauth2;
 const eev = await eSigner.sign({ kind: 9, tags: [], content: "second hits 401" });
 ok(verifyEvent(eev) && oauth2 === before + 1 && ws === 3, "wire-sign 401 → one forced re-mint + retry → succeeds");
-try { rmSync(wireTok("wt2")); } catch {}
+wireClean("wt2");
 
 console.log("wire mode — mint failure surfaces (refresh spent/revoked = kill-switch):");
-try { rmSync(wireTok("wt3")); } catch {}
+wireClean("wt3");
 const deadMock = async (url) => { if (url.endsWith("/oauth/token")) return { ok: false, status: 400, text: async () => '{"error":"invalid_grant","error_description":"refresh spent"}' }; return { ok: false, status: 404, text: async () => "x" }; };
-const dSigner = await resolveSigner({ env: { BUZZ_WIRE_SIGN: "1", BUZZ_USER_PUBKEY: USER_PK, BUZZ_EKAM_BASE: "https://ekam.test", BUZZ_WIRE_REFRESH: "dead", BUZZ_EKAM_CLIENT_ID: "c", BUZZ_WIRE_ID: "wt3" }, fetch: deadMock });
+const dSigner = await resolveSigner({ env: { BUZZ_WIRE_SIGN: "1", BUZZ_USER_PUBKEY: USER_PK, BUZZ_EKAM_BASE: "https://ekam.test", BUZZ_WIRE_REFRESH: "dead", BUZZ_EKAM_CLIENT_ID: "c", BUZZ_WIRE_ID: "wt3", BUZZ_WIRE_INVALID_GRANT_ATTEMPTS: "1" }, fetch: deadMock });
 try { await dSigner.sign({ kind: 9, tags: [], content: "x" }); ok(false, "spent refresh should throw"); }
-catch (e) { ok(/token mint -> HTTP 400/.test(e.message) && /refresh spent/.test(e.message), "spent/revoked refresh → mint failure surfaced (kill-switch; re-run one-time login)"); }
-try { rmSync(wireTok("wt3")); } catch {}
+catch (e) { ok(/token mint -> HTTP 400/.test(e.message) && /refresh spent/.test(e.message) && /buzz_login/.test(e.message) && e.code === "WIRE_SIGNIN_REQUIRED", "spent/revoked refresh → mint failure surfaced with a sign-in-again prompt (kill-switch; no loop)"); }
+wireClean("wt3");
 
 console.log("wire mode — refresh precedence: persisted rotated token beats env seed (replay-safe):");
-try { rmSync(wireTok("wt4")); } catch {}
+wireClean("wt4");
 mkd(pjoin(hd(), ".config/buzz-cli/wire-refresh"), { recursive: true });
 wf(wireTok("wt4"), "persisted-rot", { mode: 0o600 });
 let seenRefresh = null;
@@ -143,7 +146,7 @@ const precMock = async (url, init) => { if (url.endsWith("/oauth/token")) { seen
 const pSigner = await resolveSigner({ env: { BUZZ_WIRE_SIGN: "1", BUZZ_USER_PUBKEY: USER_PK, BUZZ_EKAM_BASE: "https://ekam.test", BUZZ_WIRE_REFRESH: "env-seed-spent", BUZZ_EKAM_CLIENT_ID: "c", BUZZ_WIRE_ID: "wt4" }, fetch: precMock });
 await pSigner.sign({ kind: 9, tags: [], content: "x" });
 ok(seenRefresh === "persisted-rot", "persisted rotated refresh used over env seed (replay-safe)");
-try { rmSync(wireTok("wt4")); } catch {}
+wireClean("wt4");
 
 console.log("wire mode — pubkey auto-captured at login is used (no BUZZ_USER_PUBKEY needed):");
 const pubFile = pjoin(hd(), ".config/buzz-cli/wire-refresh", "pubcap.pub");
@@ -379,7 +382,7 @@ console.log("wire token provider (v0.2.8) — single-flight mint + rotate-persis
   const forced = await p.get(true);
   ok(mints === 2 && sentRefresh[1] === "rot-1", "force renew mints once more, sending the ROTATED (persisted) refresh, not the spent original");
   p.stopKeepAlive();
-  try { nfs.rmSync(tokFile, { force: true }); } catch { /* throwaway */ }
+  for (const x of [".tok", ".acc", ".state", ".dead", ".lock"]) { try { nfs.rmSync(tokFile.replace(/\.tok$/, x), { force: true }); } catch { /* throwaway */ } }
 }
 
 // wire display-name capture (ekam #335: /v1/me/wire-key `name`) — round-trip, trim, fallbacks.
