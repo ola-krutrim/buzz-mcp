@@ -136,6 +136,14 @@ apart), re-reading `.tok` before each try; after that it clears the stored refre
 (at least 30s after repeated failures, honouring `Retry-After`, capped at 5 min); the window is kept
 in `<id>.state`, so a restarted shim does not start the cycle over.
 
+**Keep-alive from startup.** Ekam expires a refresh that sits unused for 7 days (sliding idle). So a
+stdio shim with a stored `.tok` does one refresh shortly after it starts (a jittered 3s–60s, on an
+unref'd timer), and then renews at ~75% of the access token's life. Before, this only began after the
+first tool call. The startup refresh uses the same lock / single-flight / adopt path, so N sessions
+starting together still mint once. With no stored login it does nothing (it never opens a sign-in),
+and a failure is logged to stderr and left to the next call. Hosted (`--http`) mode does not use it.
+Opt out with `BUZZ_WIRE_STARTUP_KEEPALIVE=0`.
+
 Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005,
 9007, 9002, 9021, 40003, 9022}` — messages, NIP-98 auth, DM open / add-member, NIP-25 reactions
 (kind 7), Blossom media auth (kind 24242, for attachment upload/download), NIP-29 moderation
@@ -592,6 +600,10 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
   Transient errors back off (`code: WIRE_REFRESH_BACKOFF`) with a persistent window.
 - Tests: new `refresh.test.mjs` (mocked token endpoint, real child processes). `bridge.test.mjs` no
   longer sends a refresh to prod Ekam during `npm test`.
+- **Wire keep-alive starts at process start** (Ekam 7-day sliding refresh idle). With a stored `.tok`,
+  the stdio shim refreshes once after a jittered 3–60s delay, through the same lock and single-flight,
+  then the normal ~75% renew takes over. No token means nothing happens; failures fall back to on-demand.
+  Off in hosted mode. Opt out with `BUZZ_WIRE_STARTUP_KEEPALIVE=0`.
 
 ### v0.2.36
 - Version bump to 0.2.36. The changes below are already on `main` (#27, #22, #28); this release tags them.

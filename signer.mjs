@@ -199,6 +199,17 @@ const TR_MIN_REPEAT_MS = 30_000;        // never faster than this after ≥2 con
 const TR_BACKOFF_CAP_MS = 5 * 60_000;   // cap for computed backoff (and for non-retryable 4xx)
 const RETRY_AFTER_CAP_MS = 60 * 60_000; // never honour a Retry-After beyond an hour
 const MINT_TIMEOUT_MS = 20_000;         // < lock staleMs (60s), so a live holder never looks stale
+// startup-keepalive (after refresh-singleflight): Ekam keeps a 7-day SLIDING refresh idle limit, so a running
+// stdio shim keeps the refresh family alive from process start, not only after its first tool call. The first
+// keep-alive fires after a jittered delay in [MIN, MAX] (so N shims launched together don't stampede; the
+// lock + single-flight still make it one mint), unref'd so it never holds the process open.
+export const STARTUP_KEEPALIVE_MIN_MS = 3_000;
+export const STARTUP_KEEPALIVE_MAX_MS = 60_000;
+export function startupKeepAliveDelayMs(rand = Math.random, minMs = STARTUP_KEEPALIVE_MIN_MS, maxMs = STARTUP_KEEPALIVE_MAX_MS) {
+  return Math.floor(minMs + Math.max(0, maxMs - minMs) * rand());
+}
+// BUZZ_WIRE_STARTUP_KEEPALIVE=0|false|no|off opts out (back to "first refresh on the first tool call").
+export const wireStartupKeepAliveEnabled = (env) => !/^(0|false|no|off)$/i.test(String((env && env.BUZZ_WIRE_STARTUP_KEEPALIVE) ?? "").trim());
 export function wireInvalidGrantAttempts(env) {
   const n = parseInt(String((env && env.BUZZ_WIRE_INVALID_GRANT_ATTEMPTS) ?? "").trim(), 10);
   return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
@@ -257,7 +268,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
   let accessExp = access ? Infinity : 0; // static token: valid until a 401 says otherwise
   let deadErr = (!refresh && dead0 && !staticTok) ? signInError(`refresh refused earlier (${dead0.reason || "invalid_grant"})`) : null;
   // a sibling process may already hold a fresh access token for this refresh → adopt, no mint at startup
-  if (!staticTok && refresh) adoptDiskAccess(false);
+  const adopted0 = !!(!staticTok && refresh && adoptDiskAccess(false));
 
   function adoptDiskAccess(force, rejected) {
     const acc = wireAccessGet(persistId);
@@ -279,7 +290,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
   function markDead(detail, reason) {
     deadErr = signInError(detail);
     refresh = null; access = staticTok; accessExp = staticTok ? Infinity : 0;
-    if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    clearTimers();
     return deadErr;
   }
   function cooldownError(st) {
@@ -294,9 +305,13 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
 
   // Single-flight + proactive keep-alive (v0.2.8). `inflightMint` dedupes in-process; the lock below
   // dedupes across processes. `renewTimer` refreshes at ~75% of the access token's life (unref'd).
-  let inflightMint = null, renewTimer = null;
-  function scheduleRenew() {
+  let inflightMint = null, renewTimer = null, startupTimer = null;
+  function clearTimers() {
     if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
+  }
+  function scheduleRenew() {
+    clearTimers(); // a real renew supersedes the pending startup keep-alive
     if (!refresh || !isFinite(accessExp)) return; // need a refresh + a real expires_in to time a renew
     const delay = Math.max(30_000, Math.floor((accessExp - nowMs()) * 0.75)); // ~75% of remaining life
     renewTimer = setTimeout(() => { getToken(true).catch((e) => log(`wire keep-alive renew failed (will retry on next call): ${e.message}`)); }, delay);
@@ -401,6 +416,27 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
     }
   }
 
+  // startup-keepalive: opt-in per provider (resolveSigner turns it on for the stdio wire signer only;
+  // hosted --http mode never builds this provider). Only with a STORED refresh (<id>.tok present, no
+  // tombstone, no static token) — never an env-only seed, never an interactive login. If a sibling's
+  // access token was adopted above, just time a normal renew off it (no mint now). Otherwise, after a
+  // jittered delay, ask for a token the normal way (getToken(false) → single-flight → cross-process
+  // lock → re-read/adopt under the lock), so N shims starting together cause ONE /oauth/token call.
+  // Failures are logged and fall back to on-demand, like the existing keep-alive.
+  const sk = opts.startupKeepAlive;
+  if (sk && !staticTok && refresh && onDisk && !deadErr) {
+    if (adopted0 && isFinite(accessExp)) scheduleRenew();
+    else {
+      const delay = typeof sk === "object" && Number.isFinite(sk.delayMs) ? sk.delayMs
+        : startupKeepAliveDelayMs(rand, sk.minMs ?? STARTUP_KEEPALIVE_MIN_MS, sk.maxMs ?? STARTUP_KEEPALIVE_MAX_MS);
+      startupTimer = setTimeout(() => {
+        startupTimer = null;
+        getToken(false).catch((e) => log(`wire startup keep-alive failed (will retry on next call): ${e.message}`));
+      }, delay);
+      if (startupTimer.unref) startupTimer.unref();
+    }
+  }
+
   async function getToken(force) {
     if (!force && access && nowMs() < accessExp) return access;
     if (refresh || deadErr) {
@@ -420,7 +456,8 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
     // but every sign fails fast with the sign-in prompt and Ekam is never called.
     needsSignIn: () => !!deadErr,
     get: getToken,
-    stopKeepAlive() { if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; } }, // for clean shutdown/tests
+    stopKeepAlive() { clearTimers(); }, // renew + startup keep-alive timers; for clean shutdown/tests
+    keepAlivePending: () => ({ startup: !!startupTimer, renew: !!renewTimer }), // introspection for tests
   };
 }
 
@@ -1359,14 +1396,18 @@ export async function resolveSigner(opts = {}) {
     const pubkey = normalizePubkey(env.BUZZ_USER_PUBKEY) || wirePubkeyGet(wirePersistId(env));
     if (!pubkey)
       throw new Error("buzz-mcp: wire mode has no user identity yet — run the one-time login (it captures your pubkey), or set BUZZ_USER_PUBKEY.");
-    const tokens = makeWireTokenProvider(env, fetchFn);
+    // stdio wire signer: keep the refresh family alive from process start (Ekam 7-day sliding idle limit).
+    // BUZZ_WIRE_STARTUP_KEEPALIVE=0 turns it off; opts.wireTokenOpts is a test seam (timing/log only).
+    const wto = opts.wireTokenOpts || {};
+    const tokens = makeWireTokenProvider(env, fetchFn, { ...wto, startupKeepAlive: wireStartupKeepAliveEnabled(env) ? (wto.startupKeepAlive ?? true) : false });
     if (!tokens.hasRefresh() && !tokens.hasStatic() && !tokens.needsSignIn())
       throw new Error("buzz-mcp: wire mode needs BUZZ_WIRE_REFRESH (+BUZZ_EKAM_CLIENT_ID) from the one-time wire:sign login, or a static BUZZ_EKAM_HUMAN_TOKEN — refusing to start.");
     return {
       mode: "wire",
       pubkey,
       canSign: (kind) => WIRE_ALLOWLIST.has(kind) && !NEVER_SIGN.has(kind),
-      wipe() { /* wire mode holds no key */ },
+      wipe() { tokens.stopKeepAlive(); /* wire mode holds no key; stop the keep-alive timers on shutdown */ },
+      keepAlivePending: () => tokens.keepAlivePending(), // introspection for tests
       // v0.2.33: no encrypt-to-self in wire mode — the user's key is escrowed at Ekam and Ekam offers
       // no NIP-44 endpoint, so NIP-44 features (read state, private saved items) are agent-mode only.
       selfCipher: null,

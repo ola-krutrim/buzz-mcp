@@ -20,6 +20,13 @@ if (process.argv[2] === "--child") {
   const p = makeWireTokenProvider(env, fetch, { log: () => {} });
   const at = Number(process.env.T_AT || 0); // start barrier so both children race for real
   if (at > Date.now()) await new Promise((r) => setTimeout(r, at - Date.now()));
+  if (process.env.T_STARTUP) { // startup-keepalive child: never calls get(); only the startup timer may mint
+    const p2 = makeWireTokenProvider(env, fetch, { log: () => {}, startupKeepAlive: { minMs: 50, maxMs: 400 } });
+    await new Promise((r) => setTimeout(r, Number(process.env.T_STARTUP)));
+    const pend = p2.keepAlivePending(); p2.stopKeepAlive(); p.stopKeepAlive();
+    process.stdout.write(JSON.stringify({ ok: true, pend }));
+    process.exit(0);
+  }
   try { const a = await p.get(); p.stopKeepAlive(); process.stdout.write(JSON.stringify({ ok: true, access: a })); }
   catch (e) { process.stdout.write(JSON.stringify({ ok: false, err: e.message, code: e.code || null })); }
   process.exit(0);
@@ -257,6 +264,139 @@ console.log("\ncase 6: tombstone seen by a sibling; stale/live locks");
   writeFileSync(f("lk", ".lock"), JSON.stringify({ pid: process.pid, host: "other-host", t: Date.now() - 120_000, n: "old" }), { mode: 0o600 });
   const r = await withWireLock("lk", async () => "got-it", { timeoutMs: 2000 });
   ok(r === "got-it" && !existsSync(f("lk", ".lock")), "lock older than staleMs is broken");
+}
+
+// ── startup-keepalive: the first keep-alive refresh fires at process start, not only after a mint ──
+console.log("\ncase 7: startup keep-alive (Ekam 7-day sliding refresh idle)");
+const waitFor = async (cond, ms = 3000) => { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10)); return cond(); };
+{
+  // stored token → exactly one startup refresh, minimal body, then a normal renew is scheduled
+  wireRefreshSet("sk1", "rt-s1");
+  const bodies = [];
+  const p = makeWireTokenProvider(ENV("sk1"), async (_u, init) => { bodies.push(JSON.parse(init.body)); return json(200, { access_token: "acc-s1", refresh_token: "rt-s2", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 20 } });
+  ok(p.keepAlivePending().startup && bodies.length === 0, "startup timer armed at construction; no network call yet");
+  await waitFor(() => bodies.length >= 1 && !p.keepAlivePending().startup);
+  await new Promise((r) => setTimeout(r, 100));
+  ok(bodies.length === 1, `startup keep-alive fired exactly once with a stored token (got ${bodies.length})`);
+  ok(bodies[0] && Object.keys(bodies[0]).sort().join(",") === "client_id,grant_type,refresh_token" && bodies[0].refresh_token === "rt-s1", "refresh body unchanged: {grant_type, refresh_token, client_id} only");
+  ok(wireRefreshGet("sk1") === "rt-s2", "rotated refresh persisted by the startup refresh");
+  const pend = p.keepAlivePending();
+  ok(!pend.startup && pend.renew, "after the startup refresh the regular ~75% renew timer takes over");
+  ok((await p.get()) === "acc-s1" && bodies.length === 1, "first tool call reuses the startup token — no extra mint");
+  p.stopKeepAlive();
+}
+{
+  // no stored token → nothing scheduled, never any call (and never an interactive login)
+  let calls = 0;
+  const p = makeWireTokenProvider(ENV("sk-none"), async () => { calls++; return json(200, { access_token: "x", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 5 } });
+  await new Promise((r) => setTimeout(r, 80));
+  ok(calls === 0 && !p.keepAlivePending().startup && !p.keepAlivePending().renew, "no stored token → no startup timer, no /oauth/token call");
+  // env-only seed (no <id>.tok) → also no startup refresh (only a STORED token qualifies)
+  const q = makeWireTokenProvider(ENV("sk-envonly", { BUZZ_WIRE_REFRESH: "seed-only" }), async () => { calls++; return json(200, { access_token: "x", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 5 } });
+  await new Promise((r) => setTimeout(r, 80));
+  ok(calls === 0 && !q.keepAlivePending().startup, "env-only seed (no .tok) → no startup refresh");
+  // static token alongside a stored refresh → no startup refresh
+  wireRefreshSet("sk-static", "rt-st");
+  const r = makeWireTokenProvider(ENV("sk-static", { BUZZ_EKAM_HUMAN_TOKEN: "static-tok" }), async () => { calls++; return json(200, { access_token: "x", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 5 } });
+  await new Promise((r2) => setTimeout(r2, 80));
+  ok(calls === 0 && !r.keepAlivePending().startup, "static BUZZ_EKAM_HUMAN_TOKEN → no startup refresh");
+  // tombstoned id → no startup refresh
+  writeFileSync(f("sk-dead", ".dead"), JSON.stringify({ at: "x", reason: "invalid_grant", seed: null }), { mode: 0o600 });
+  const d = makeWireTokenProvider(ENV("sk-dead"), async () => { calls++; return json(200, { access_token: "x", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 5 } });
+  await new Promise((r2) => setTimeout(r2, 80));
+  ok(calls === 0 && !d.keepAlivePending().startup && d.needsSignIn(), "signed-out (tombstone) → no startup refresh");
+  // provider default (opt not set) → off: only resolveSigner (stdio wire mode) turns it on
+  wireRefreshSet("sk-default", "rt-d");
+  const e = makeWireTokenProvider(ENV("sk-default"), async () => { calls++; return json(200, { access_token: "x", expires_in: 900 }); }, quiet);
+  ok(!e.keepAlivePending().startup, "makeWireTokenProvider without startupKeepAlive → no startup timer (opt-in)");
+}
+{
+  // two signers sharing one token file at startup → exactly ONE mint; the other adopts via the lock
+  wireRefreshSet("sk2", "rt-a");
+  const sent = [];
+  const fetchFn = async (_u, init) => { const rt = JSON.parse(init.body).refresh_token; sent.push(rt); await new Promise((r) => setTimeout(r, 150)); return rt === "rt-a" && sent.length === 1 ? json(200, { access_token: "acc-a", refresh_token: "rt-b", expires_in: 900 }) : IG(); };
+  const a = makeWireTokenProvider(ENV("sk2"), fetchFn, { ...quiet, startupKeepAlive: { delayMs: 10 } });
+  const b = makeWireTokenProvider(ENV("sk2"), fetchFn, { ...quiet, startupKeepAlive: { delayMs: 12 } });
+  await waitFor(() => !a.keepAlivePending().startup && !b.keepAlivePending().startup && a.keepAlivePending().renew && b.keepAlivePending().renew);
+  ok(sent.length === 1 && sent[0] === "rt-a", `two signers at startup → exactly one /oauth/token call (got ${sent.length})`);
+  ok((await a.get()) === "acc-a" && (await b.get()) === "acc-a" && sent.length === 1, "both hold the same fresh access token; the loser adopted it from shared storage");
+  ok(wireRefreshGet("sk2") === "rt-b" && !existsSync(f("sk2", ".lock")), "rotated refresh on disk; lock released");
+  a.stopKeepAlive(); b.stopKeepAlive();
+  // a third signer starting now adopts the shared access token at construction → renew only, no startup mint
+  const c = makeWireTokenProvider(ENV("sk2"), fetchFn, { ...quiet, startupKeepAlive: { delayMs: 5 } });
+  await new Promise((r) => setTimeout(r, 60));
+  ok(sent.length === 1 && !c.keepAlivePending().startup && c.keepAlivePending().renew, "a later signer adopts the sibling's access token → schedules a renew, makes no call");
+  c.stopKeepAlive();
+}
+{
+  // two PROCESSES starting together, neither making a tool call → exactly one mint (cross-process lock)
+  const calls = [];
+  const srv = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+    calls.push(JSON.parse(b).refresh_token);
+    setTimeout(() => { res.writeHead(calls.length === 1 ? 200 : 400, { "content-type": "application/json" }); res.end(calls.length === 1 ? JSON.stringify({ access_token: "acc-x1", refresh_token: "rt-x1", expires_in: 900 }) : '{"error":"invalid_grant"}'); }, 200);
+  }); });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  wireRefreshSet("skx", "rt-x0");
+  const runChild = () => new Promise((resolve) => {
+    const p = spawn(process.execPath, [SELF, "--child"], { env: { ...process.env, HOME, T_BASE: base, T_ID: "skx", T_STARTUP: "1500" }, stdio: ["ignore", "pipe", "inherit"] });
+    let out = ""; p.stdout.on("data", (d) => (out += d)); p.on("close", () => { try { resolve(JSON.parse(out)); } catch { resolve({ ok: false, err: out }); } });
+  });
+  const [x, y] = await Promise.all([runChild(), runChild()]);
+  ok(x.ok && y.ok && calls.length === 1 && calls[0] === "rt-x0", `two shim processes at startup → exactly ONE /oauth/token call (got ${calls.length})`);
+  ok(wireRefreshGet("skx") === "rt-x1" && x.pend.renew && y.pend.renew && !x.pend.startup && !y.pend.startup, "both processes moved on to the regular renew timer");
+  srv.close();
+}
+{
+  // stopKeepAlive clears the startup timer (nothing fires afterwards)
+  wireRefreshSet("sk3", "rt-c");
+  let calls = 0;
+  const p = makeWireTokenProvider(ENV("sk3"), async () => { calls++; return json(200, { access_token: "acc-c", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 40 } });
+  ok(p.keepAlivePending().startup, "startup timer pending");
+  p.stopKeepAlive();
+  await new Promise((r) => setTimeout(r, 120));
+  ok(!p.keepAlivePending().startup && calls === 0, "stopKeepAlive() cleared the startup timer — no refresh fired");
+  // a tool call before the startup timer fires supersedes it (no second mint)
+  const q = makeWireTokenProvider(ENV("sk3"), async () => { calls++; return json(200, { access_token: "acc-c2", refresh_token: "rt-c2", expires_in: 900 }); }, { ...quiet, startupKeepAlive: { delayMs: 60 } });
+  ok((await q.get()) === "acc-c2" && calls === 1 && !q.keepAlivePending().startup, "an early tool call mints once and cancels the pending startup timer");
+  await new Promise((r) => setTimeout(r, 120));
+  ok(calls === 1, "no second mint from the cancelled startup timer");
+  q.stopKeepAlive();
+}
+{
+  // failure at startup → logged to stderr-style log, falls back to on-demand
+  wireRefreshSet("sk4", "rt-f");
+  const logs = [];
+  let calls = 0;
+  const p = makeWireTokenProvider(ENV("sk4"), async () => { calls++; return json(503, { error: "temporarily_unavailable" }); }, { log: (m) => logs.push(m), startupKeepAlive: { delayMs: 5 } });
+  await waitFor(() => logs.length > 0);
+  ok(calls === 1 && logs.some((m) => /startup keep-alive failed .*retry on next call/.test(m)), "startup failure is logged and falls back to on-demand");
+  ok(wireRefreshGet("sk4") === "rt-f" && !p.needsSignIn(), "a transient startup failure keeps the stored refresh");
+  p.stopKeepAlive();
+}
+{
+  // delay helper: jittered within [min, max]
+  ok(S.startupKeepAliveDelayMs(() => 0) === S.STARTUP_KEEPALIVE_MIN_MS && S.startupKeepAliveDelayMs(() => 0.999999) <= S.STARTUP_KEEPALIVE_MAX_MS && S.STARTUP_KEEPALIVE_MIN_MS >= 1000 && S.STARTUP_KEEPALIVE_MAX_MS <= 60_000, "startup delay is jittered in [3s, 60s]");
+  ok(S.wireStartupKeepAliveEnabled({}) && !S.wireStartupKeepAliveEnabled({ BUZZ_WIRE_STARTUP_KEEPALIVE: "0" }) && !S.wireStartupKeepAliveEnabled({ BUZZ_WIRE_STARTUP_KEEPALIVE: "off" }), "BUZZ_WIRE_STARTUP_KEEPALIVE=0/off opts out");
+}
+{
+  // resolveSigner (stdio wire mode) turns it on; the env opt-out turns it off; a static token never arms it
+  wireRefreshSet("sk5", "rt-r");
+  const PK = "a".repeat(64);
+  const wenv = { BUZZ_WIRE_SIGN: "1", BUZZ_WIRE_ID: "sk5", BUZZ_USER_PUBKEY: PK, BUZZ_EKAM_BASE: "https://ekam.test", BUZZ_EKAM_CLIENT_ID: "cid" };
+  let calls = 0;
+  const fetchFn = async () => { calls++; return json(200, { access_token: "acc-r", refresh_token: "rt-r2", expires_in: 900 }); };
+  const s1 = await S.resolveSigner({ env: wenv, fetch: fetchFn, wireTokenOpts: { log: () => {}, startupKeepAlive: { delayMs: 10 } } });
+  await waitFor(() => calls >= 1);
+  ok(calls === 1 && s1.keepAlivePending().renew, "resolveSigner (stdio wire) → startup refresh fired once, renew scheduled");
+  s1.wipe();
+  ok(!s1.keepAlivePending().renew && !s1.keepAlivePending().startup, "signer.wipe() (shutdown) stops the keep-alive timers");
+  const s2 = await S.resolveSigner({ env: { ...wenv, BUZZ_WIRE_STARTUP_KEEPALIVE: "0" }, fetch: fetchFn, wireTokenOpts: { log: () => {}, startupKeepAlive: { delayMs: 10 } } });
+  ok(!s2.keepAlivePending().startup, "BUZZ_WIRE_STARTUP_KEEPALIVE=0 → no startup timer via resolveSigner");
+  s2.wipe();
+  const s3 = await S.resolveSigner({ env: { ...wenv, BUZZ_WIRE_ID: "sk5-static", BUZZ_EKAM_HUMAN_TOKEN: "st" }, fetch: fetchFn, wireTokenOpts: { log: () => {}, startupKeepAlive: { delayMs: 10 } } });
+  ok(!s3.keepAlivePending().startup, "static token via resolveSigner → no startup timer");
+  s3.wipe();
 }
 
 console.log(`\n${failed ? "FAIL" : "ALL PASS"}: ${passed} passed, ${failed} failed`);
