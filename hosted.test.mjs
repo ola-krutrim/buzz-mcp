@@ -153,7 +153,7 @@ const baseEnv = {
   BUZZ_PRIVATE_KEY: "11".repeat(32), BUZZ_AUTH_TAG: "should-never-be-used", // must be IGNORED by hosted cores
 };
 async function boot(extra = {}, opts = {}) {
-  const srv = await startHttpServer({ createBuzzServer, version: "0.2.36", env: { ...baseEnv, ...extra }, listen: false, log: (o) => logs.push(JSON.stringify(o)), ...opts });
+  const srv = await startHttpServer({ createBuzzServer, version: "0.2.37", env: { ...baseEnv, ...extra }, listen: false, log: (o) => logs.push(JSON.stringify(o)), ...opts });
   const port = await listenAny(srv.httpServer);
   return { srv, base: `http://127.0.0.1:${port}` };
 }
@@ -174,7 +174,7 @@ const { srv, base } = await boot();
   const prm2 = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
   ok(prm2.status === 200, "PRM also served at the /mcp path-suffixed location");
   const h = await (await fetch(`${base}/healthz`)).json();
-  ok(h.ok === true && h.version === "0.2.36" && h.name === "Ola Buzz", "/healthz ok with version");
+  ok(h.ok === true && h.version === "0.2.37" && h.name === "Ola Buzz", "/healthz ok with version");
   const r = await rawInit(base);
   const www = r.headers.get("www-authenticate") || "";
   ok(r.status === 401 && www.includes(`resource_metadata="${RESOURCE}/.well-known/oauth-protected-resource"`), "no token → 401 + WWW-Authenticate resource_metadata");
@@ -211,7 +211,7 @@ const A = await connect(base, TA), B = await connect(base, TB);
   ok(post && !("attachment" in post.inputSchema.properties), "hosted buzz_post has no local `attachment` path");
   const wa = await A.call("buzz_whoami"), wb = await B.call("buzz_whoami");
   ok(/Ola Buzz — posting as you \(Alice A\)/.test(wa.text) && wa.text.includes(USERS.alice.pk), "alice whoami: posting as you (Alice A) + her pubkey");
-  ok(/v0\.2\.36 \(hosted\)/.test(wa.text), "whoami shows shim version (hosted)");
+  ok(/v0\.2\.37 \(hosted\)/.test(wa.text), "whoami shows shim version (hosted)");
   ok(/posting as you \(Bob B\)/.test(wb.text) && wb.text.includes(USERS.bob.pk) && !wb.text.includes(USERS.alice.pk), "bob whoami: his identity, never alice's");
   const ca = await A.call("buzz_channels"), cb = await B.call("buzz_channels");
   ok(/room-alice/.test(ca.text) && !/room-bob/.test(ca.text), "alice's channel cache holds only her channels");
@@ -337,7 +337,7 @@ for (const entry of ["buzz-mcp.mjs", "dist/buzz-mcp.mjs"]) {
   let out = "";
   const port = await new Promise((res) => { const to = setTimeout(() => res(null), 15000); child.stdout.on("data", (d) => { out += d; const m = /"evt":"listening","port":(\d+)/.exec(out); if (m) { clearTimeout(to); res(Number(m[1])); } }); });
   let h = null; if (port) try { h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json(); } catch {}
-  ok(h && h.ok === true && h.version === "0.2.36", `${entry} --http → listening, /healthz ok`);
+  ok(h && h.ok === true && h.version === "0.2.37", `${entry} --http → listening, /healthz ok`);
   child.kill("SIGTERM");
   const k = setTimeout(() => child.kill("SIGKILL"), 5000);
   await new Promise((r) => (child.exitCode != null ? r() : child.once("exit", r))); clearTimeout(k);
@@ -545,7 +545,7 @@ console.log("\nhosted 16: exchange client secret is required (Ekam #481 confiden
   ok(SIGNIN_CLIENT_ID === "buzz-mcp-hosted" && EXCHANGE_CLIENT_ID === "buzz-mcp-hosted-exchange", "client ids match Ekam #481 (sign-in vs exchange)");
 
   // startHttpServer refuses (in-process), even with listen:false
-  let e5 = null; try { await startHttpServer({ createBuzzServer, version: "0.2.36", env: { ...baseEnv, BUZZ_HOSTED_CLIENT_SECRET: "" }, listen: false, log: () => {} }); } catch (e) { e5 = e; }
+  let e5 = null; try { await startHttpServer({ createBuzzServer, version: "0.2.37", env: { ...baseEnv, BUZZ_HOSTED_CLIENT_SECRET: "" }, listen: false, log: () => {} }); } catch (e) { e5 = e; }
   ok(e5 && /BUZZ_HOSTED_CLIENT_SECRET is missing or empty/.test(e5.message), "startHttpServer without the secret → throws before serving");
 
   // the real entry refuses: exit 78, clear stderr, nothing on stdout, never listens

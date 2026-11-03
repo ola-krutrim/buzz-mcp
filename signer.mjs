@@ -50,7 +50,7 @@ export const wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter
 // The offline_access refresh is single-use/rotating; we persist the rotated one so the
 // next session doesn't replay a spent token (which would revoke the family → lockout).
 //
-// refresh-singleflight (cross-PROCESS refresh lock, after v0.2.36). Files per wire id, all 0600 in a 0700 dir:
+// refresh-singleflight (cross-PROCESS refresh lock, v0.2.37). Files per wire id, all 0600 in a 0700 dir:
 //   <id>.tok   the current rotating refresh (unchanged format: the bare token)
 //   <id>.acc   the current short-TTL access token + its expiry, bound to the refresh that minted it
 //              (fingerprint only), so a SECOND shim process adopts it instead of refreshing again
@@ -214,7 +214,7 @@ export function wireNameSet(id, name) {
 // Defensive re ekam's two still-open details: persist a rotated refresh IFF returned;
 // pre-empt expiry IFF expires_in returned, else fall back on the 401→re-mint retry.
 //
-// refresh-singleflight (after v0.2.36) — refresh is serialized ACROSS PROCESSES (repeated 400 invalid_grant
+// refresh-singleflight (v0.2.37) — refresh is serialized ACROSS PROCESSES (repeated 400 invalid_grant
 // refresh calls and token-family revocations for replay were seen in production). Every MCP
 // client session spawns its own stdio shim; each one used to read <id>.tok ONCE at startup and keep
 // the refresh in memory. Process A rotated (file updated), process B still held the spent token and

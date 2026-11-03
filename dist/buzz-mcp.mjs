@@ -20679,7 +20679,7 @@ function clientVersionStatus(running, advertised) {
 var SHIM_VERSION;
 var init_clientversion = __esm({
   "clientversion.mjs"() {
-    SHIM_VERSION = "0.2.36";
+    SHIM_VERSION = "0.2.37";
   }
 });
 

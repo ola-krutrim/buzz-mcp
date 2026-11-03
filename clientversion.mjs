@@ -15,13 +15,13 @@
 // package.json). buzz-mcp.mjs re-exports it as SHIM_VERSION_EXPORT; signer.mjs / wirelogin.mjs /
 // hosted-auth.mjs use it for the Ekam User-Agent below. Lives here because this module is pure
 // (no import-time side effects), so every module and test can import it.
-export const SHIM_VERSION = "0.2.36";
+export const SHIM_VERSION = "0.2.37";
 
 // User-Agent for every HTTP call the shim makes to Ekam (refresh/mint, login code exchange,
 // wire-sign, wire-key, directory, and the hosted server's metadata/JWKS/introspection/exchange).
 // Without it Ekam logs see node's bare default and can't tell shim versions apart.
-//   stdio:  buzz-mcp/0.2.36 (node/20.x.y; linux)
-//   hosted: buzz-mcp/0.2.36 hosted (node/20.x.y; linux)
+//   stdio:  buzz-mcp/0.2.37 (node/20.x.y; linux)
+//   hosted: buzz-mcp/0.2.37 hosted (node/20.x.y; linux)
 // Deliberately carries NO user, host, client-id or token identifier — version, runtime, OS only.
 export function shimUserAgent({ hosted = false } = {}) {
   const node = (typeof process !== "undefined" && process.versions && process.versions.node) || "unknown";

@@ -83,7 +83,7 @@ function openUrlCommand(url, platform = process.platform) {
 }
 
 // clientversion.mjs
-var SHIM_VERSION = "0.2.36";
+var SHIM_VERSION = "0.2.37";
 function shimUserAgent({ hosted = false } = {}) {
   const node = typeof process !== "undefined" && process.versions && process.versions.node || "unknown";
   const plat = typeof process !== "undefined" && process.platform || "unknown";
