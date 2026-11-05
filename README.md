@@ -125,16 +125,27 @@ lifetime cap fixed at first login; when it expires, re-run the one-time login on
 
 **Many sessions, one login.** Every MCP session runs its own shim process, and they all share
 `wire-refresh/<id>.tok`. The refresh is single-use, so minting is serialized: one mint at a time per
-process, and across processes an exclusive `<id>.lock` (stale after 60s or a dead pid). Under the
+process, and across processes an exclusive `<id>.lock` (stale after 60s or a dead pid; breaking a
+stale lock is itself serialized by an exclusive `<id>.lock.break`, and the shim re-checks that it still
+owns the lock and that `.tok` still holds the same refresh right before it calls Ekam). Under the
 lock the shim re-reads `.tok` and adopts a token another process already rotated (and that process's
 short-lived access token, `<id>.acc`, 0600) instead of replaying the spent one. Writes are atomic
-(0600 temp file, then rename). If Ekam refuses the refresh (`invalid_grant`), the shim retries a
-bounded number of times (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`, default 3, max 10; ~2s / ~8s / ~32s
-apart), re-reading `.tok` before each try; after that it clears the stored refresh, leaves an
+(0600 temp file, then rename). If Ekam refuses the refresh (`invalid_grant`), the shim does not retry
+by default: a retry sends the same refresh again and cannot succeed. `BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`
+allows up to 3 attempts (~2s / ~8s apart, re-reading `.tok` before each try), but a refusal whose
+description says "replay" or "family revoked" is always final at once. Then it clears the stored refresh, leaves an
 `<id>.dead` marker so no session (or restart) retries it, and asks you to sign in again
 (`buzz_login` / `buzz-mcp-login`). Network / 5xx / 429 errors back off exponentially with jitter
 (at least 30s after repeated failures, honouring `Retry-After`, capped at 5 min); the window is kept
 in `<id>.state`, so a restarted shim does not start the cycle over.
+
+**Keep-alive from startup.** Ekam expires a refresh that sits unused for 7 days (sliding idle). So a
+stdio shim with a stored `.tok` does one refresh shortly after it starts (a jittered 3s–60s, on an
+unref'd timer), and then renews at ~75% of the access token's life. Before, this only began after the
+first tool call. The startup refresh uses the same lock / single-flight / adopt path, so N sessions
+starting together still mint once. With no stored login it does nothing (it never opens a sign-in),
+and a failure is logged to stderr and left to the next call. Hosted (`--http`) mode does not use it.
+Opt out with `BUZZ_WIRE_STARTUP_KEEPALIVE=0`.
 
 Scope: the wire-sign allowlist is `{9, 22242, 27235, 41010, 41011, 7, 24242, 9000, 9001, 9005,
 9007, 9002, 9021, 40003, 9022}` — messages, NIP-98 auth, DM open / add-member, NIP-25 reactions
@@ -581,17 +592,38 @@ in the published `files[]` — the end-user install stays no-npm and runs only t
 
 ## Changelog
 
-### Unreleased (refresh-singleflight, after v0.2.36)
-- **Wire mode: rotating-refresh races fixed.** Cross-process `O_EXCL` lock + in-process single-flight
+### v0.2.37
+- Version bump to 0.2.37. Ships #31 (refresh single-flight) plus the follow-ups below.
+- **buzz_security must-fixes on #31:**
+  - **Stale-lock break is serialized.** Two processes breaking the same stale `<id>.lock` could remove
+    each other's new lock, so two holders POSTed the same refresh (a replay → Ekam revokes the family).
+    A breaker now takes an exclusive `<id>.lock.break` (own 5s stale time), re-reads the lock inside it
+    and removes it only if its nonce is still the stale one. Right before the refresh POST the holder
+    re-checks that it still owns the lock and that `.tok` still holds the refresh it is sending;
+    otherwise it sends nothing and goes round again.
+  - **`invalid_grant` retries: default 1 attempt (no retry), cap 3** (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`,
+    was default 3, max 10). An `error_description` with "replay" / "family revoked" is final at once,
+    whatever the setting.
+- **Wire mode: rotating-refresh races fixed** (#31). Cross-process `O_EXCL` lock + in-process single-flight
   around the Ekam refresh, re-read and adopt under the lock, atomic 0600 writes. Previously each MCP
   session's shim read the refresh once at startup, so a second session replayed a spent token
   (`invalid_grant`, Ekam family revocation for `refresh_token_replay`) and kept POSTing it on every
   signed request.
-- `invalid_grant` / `invalid_client`: bounded retries (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`, default 3),
-  then the stored refresh is cleared and the error asks you to sign in (`code: WIRE_SIGNIN_REQUIRED`).
+- `invalid_grant` / `invalid_client`: bounded retries (`BUZZ_WIRE_INVALID_GRANT_ATTEMPTS`, default 1, cap 3
+  since the must-fix above), then the stored refresh is cleared and the error asks you to sign in (`code: WIRE_SIGNIN_REQUIRED`).
   Transient errors back off (`code: WIRE_REFRESH_BACKOFF`) with a persistent window.
 - Tests: new `refresh.test.mjs` (mocked token endpoint, real child processes). `bridge.test.mjs` no
   longer sends a refresh to prod Ekam during `npm test`.
+- **Wire keep-alive starts at process start** (Ekam 7-day sliding refresh idle). With a stored `.tok`,
+  the stdio shim refreshes once after a jittered 3–60s delay, through the same lock and single-flight,
+  then the normal ~75% renew takes over. No token means nothing happens; failures fall back to on-demand.
+  Off in hosted mode. Opt out with `BUZZ_WIRE_STARTUP_KEEPALIVE=0`.
+- **Ekam calls send the shim version in `User-Agent`** (previously node's bare default): refresh/mint,
+  login code exchange, wire-sign, wire-key and directory calls send
+  `buzz-mcp/<version> (node/<node version>; <platform>)`; the hosted server's metadata, JWKS,
+  introspection and token-exchange calls send `buzz-mcp/<version> hosted (...)`. No user, host, client
+  or token identifiers. The version comes from `SHIM_VERSION` in `clientversion.mjs`, now the single
+  source that `buzz-mcp.mjs` re-exports. Relay calls are unchanged (they already send `x-buzz-client`).
 
 ### v0.2.36
 - Version bump to 0.2.36. The changes below are already on `main` (#27, #22, #28); this release tags them.

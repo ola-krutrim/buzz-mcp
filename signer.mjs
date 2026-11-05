@@ -16,6 +16,7 @@
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import * as nip19 from "nostr-tools/nip19";
 import { resolveKey } from "./loadkey_v2.mjs";
+import { shimUserAgent } from "./clientversion.mjs";
 import { getConversationKey as nip44ConvKey, encrypt as nip44Encrypt, decrypt as nip44Decrypt } from "./nip44.mjs";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -49,7 +50,7 @@ export const wireBleedVars = (env) => ["BUZZ_IDENTITY_NAME", "BUZZ_NAME"].filter
 // The offline_access refresh is single-use/rotating; we persist the rotated one so the
 // next session doesn't replay a spent token (which would revoke the family → lockout).
 //
-// refresh-singleflight (cross-PROCESS refresh lock, after v0.2.36). Files per wire id, all 0600 in a 0700 dir:
+// refresh-singleflight (cross-PROCESS refresh lock, v0.2.37). Files per wire id, all 0600 in a 0700 dir:
 //   <id>.tok   the current rotating refresh (unchanged format: the bare token)
 //   <id>.acc   the current short-TTL access token + its expiry, bound to the refresh that minted it
 //              (fingerprint only), so a SECOND shim process adopts it instead of refreshing again
@@ -105,11 +106,50 @@ export const wireDeadGet = (id) => readJson(wireDeadFile(id));
 const wireDeadSet = (id, info) => { try { atomicWrite0600(wireDeadFile(id), JSON.stringify(info)); return true; } catch { return false; } };
 
 // ── cross-process refresh lock (O_EXCL lock file). Holds {pid, host, t, n}. A lock is STALE when its
-// holder pid is gone (same host) or it is older than staleMs — then it is broken via an atomic rename
-// so only one waiter wins the break. The /oauth/token call made under the lock has its own timeout
-// (< staleMs), so a live holder never looks stale.
+// holder pid is gone (same host) or it is older than staleMs. The /oauth/token call made under the lock has
+// its own timeout (< staleMs), so a live holder never looks stale.
+//
+// v0.2.37 (buzz_security must-fix 1 on #31): breaking a stale lock is SERIALIZED. Before, two breakers could
+// both see the same stale lock; the first broke it and took a new lock, then the second's rename removed that
+// NEW lock, so two holders POSTed the same refresh (a replay → Ekam revokes the whole family). Now a breaker
+// must first take an O_EXCL "<lock>.break" file (its own short stale time, breakStaleMs), re-read the lock
+// INSIDE it and only remove it if its nonce n is still the stale one it saw; anything else is left alone. As a
+// second guard, fn gets { owns() } and lockedAttempt re-checks ownership (n matches) and that .tok still holds
+// the refresh it is about to send, right before the POST (see lockedAttempt).
 const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === "EPERM"); } };
-export async function withWireLock(id, fn, { timeoutMs = 45_000, staleMs = 60_000, pollMs = 50, now = Date.now } = {}) {
+// Break the lock at `lf` only if it is still the stale lock the caller saw (nonce `staleN`, or — for an
+// unreadable/empty lock — still unreadable and older than staleMs). Returns true iff this call removed it.
+export function breakStaleLock(lf, staleN, { staleMs = 60_000, breakStaleMs = 5_000, now = Date.now } = {}) {
+  const bf = `${lf}.break`;
+  const mine = randomBytes(8).toString("hex");
+  try {
+    const fd = openSync(bf, "wx", 0o600);
+    try { writeSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), t: now(), n: mine })); } finally { closeSync(fd); }
+  } catch (e) {
+    if (!e || e.code !== "EEXIST") throw e;
+    // another breaker is mid-break; clear its .break only if that one is itself stale (crashed breaker)
+    try {
+      if (now() - statSync(bf).mtimeMs > breakStaleMs) {
+        const grave = `${bf}.stale-${randomBytes(6).toString("hex")}`;
+        renameSync(bf, grave); unlinkQuiet(grave);
+      }
+    } catch { /* vanished: the other breaker finished */ }
+    return false; // caller loops and re-evaluates the lock from scratch
+  }
+  try {
+    const cur = readJson(lf);
+    let same;
+    if (staleN == null) { // the lock we saw was unreadable: still unreadable AND still old by mtime
+      try { same = !cur && now() - statSync(lf).mtimeMs > staleMs; } catch { same = false; }
+    } else same = !!(cur && cur.n === staleN);
+    if (!same) return false;
+    return unlinkQuiet(lf);
+  } finally {
+    const b = readJson(bf);
+    if (b && b.n === mine) unlinkQuiet(bf);
+  }
+}
+export async function withWireLock(id, fn, { timeoutMs = 45_000, staleMs = 60_000, breakStaleMs = 5_000, pollMs = 50, now = Date.now, onAcquire = null } = {}) {
   mkdirSync(WIRE_REFRESH_DIR, { recursive: true, mode: 0o700 });
   const lf = wireLockFile(id);
   const me = { pid: process.pid, host: hostname(), t: now(), n: randomBytes(8).toString("hex") };
@@ -127,18 +167,20 @@ export async function withWireLock(id, fn, { timeoutMs = 45_000, staleMs = 60_00
     if (!held) { try { stale = now() - statSync(lf).mtimeMs > staleMs; } catch { continue; /* vanished → retry now */ } }
     else stale = (now() - Number(held.t || 0) > staleMs) || (held.host === hostname() && Number.isInteger(held.pid) && !pidAlive(held.pid));
     if (stale) {
-      const again = readJson(lf);
-      if ((again && held && again.n === held.n) || (!again && !held)) {
-        const grave = `${lf}.stale-${randomBytes(6).toString("hex")}`;
-        try { renameSync(lf, grave); unlinkQuiet(grave); } catch { /* someone else broke it */ }
+      if (!breakStaleLock(lf, held ? held.n : null, { staleMs, breakStaleMs, now })) {
+        // lost the break race (or the lock changed) — brief pause, then re-evaluate from scratch
+        await new Promise((r) => setTimeout(r, pollMs + Math.floor(Math.random() * pollMs)));
       }
+      if (now() >= deadline) { const err = new Error("wire:sign token refresh: another buzz-mcp process holds the refresh lock (timed out waiting) — try again shortly"); err.transient = true; throw err; }
       continue;
     }
     if (now() >= deadline) { const err = new Error("wire:sign token refresh: another buzz-mcp process holds the refresh lock (timed out waiting) — try again shortly"); err.transient = true; throw err; }
     await new Promise((r) => setTimeout(r, pollMs + Math.floor(Math.random() * pollMs)));
   }
-  try { return await fn(); }
-  finally { const cur = readJson(lf); if (cur && cur.n === me.n) unlinkQuiet(lf); }
+  const owns = () => { const cur = readJson(lf); return !!(cur && cur.n === me.n); };
+  if (onAcquire) onAcquire({ lockFile: lf, n: me.n }); // tests only: simulate a race right after acquiring
+  try { return await fn({ owns }); }
+  finally { if (owns()) unlinkQuiet(lf); }
 }
 
 // The user's pubkey captured at login (so wire mode needs no hand-set BUZZ_USER_PUBKEY).
@@ -172,7 +214,7 @@ export function wireNameSet(id, name) {
 // Defensive re ekam's two still-open details: persist a rotated refresh IFF returned;
 // pre-empt expiry IFF expires_in returned, else fall back on the 401→re-mint retry.
 //
-// refresh-singleflight (after v0.2.36) — refresh is serialized ACROSS PROCESSES (repeated 400 invalid_grant
+// refresh-singleflight (v0.2.37) — refresh is serialized ACROSS PROCESSES (repeated 400 invalid_grant
 // refresh calls and token-family revocations for replay were seen in production). Every MCP
 // client session spawns its own stdio shim; each one used to read <id>.tok ONCE at startup and keep
 // the refresh in memory. Process A rotated (file updated), process B still held the spent token and
@@ -183,15 +225,19 @@ export function wireNameSet(id, name) {
 //   2. under the lock, re-read <id>.tok / <id>.acc: if another process already rotated, adopt its
 //      refresh + access token instead of refreshing (no second /oauth/token call);
 //   3. rotated tokens are written atomically (0600 temp + rename);
-//   4. invalid_grant / invalid_client / unauthorized_client: bounded retries (default 3 attempts
-//      total, BUZZ_WIRE_INVALID_GRANT_ATTEMPTS, ~2s / ~8s / ~32s + jitter), re-reading the token file
+//   4. invalid_grant / invalid_client / unauthorized_client: bounded retries (v0.2.37: default 1 attempt
+//      total, i.e. no retry; BUZZ_WIRE_INVALID_GRANT_ATTEMPTS up to 3, ~2s / ~8s + jitter; an
+//      error_description saying "replay" / "family revoked" is final at once), re-reading the token file
 //      under the lock before each retry (if another process rotated, use that and stop). When the
 //      attempts are exhausted: clear the stored refresh, write a <id>.dead tombstone and ask the user
 //      to sign in again — no further /oauth/token calls from ANY process until a fresh login;
 //   5. network / 5xx / 429: exponential backoff with jitter, Retry-After honoured, ≥30s after repeated
 //      failures, capped; persisted in <id>.state (bound to the refresh fingerprint) so a restarted
 //      process does not instantly restart the cycle.
-export const WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT = 3;
+export const WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT = 1; // v0.2.37 (buzz_security Decision 1): retries resend the same refresh
+export const WIRE_INVALID_GRANT_ATTEMPTS_MAX = 3;     // and can never succeed (Ekam reuse grace is off), so 1 by default, 3 at most
+// error_description that means the refresh family is already gone: final at once, whatever the attempt setting.
+export const WIRE_FINAL_REFUSAL_RE = /replay|family[\s_-]*(?:was\s+|is\s+|has\s+been\s+)?revoked/i;
 const TERMINAL_OAUTH_ERRORS = new Set(["invalid_grant", "invalid_client", "unauthorized_client"]);
 const IG_BACKOFF_BASE_MS = 2_000;       // invalid_grant retries: ~2s, ~8s, ~32s (×4), ±25% jitter
 const TR_BACKOFF_BASE_MS = 2_000;       // transient: 2s, then ≥30s, doubling, full-ish jitter
@@ -199,9 +245,20 @@ const TR_MIN_REPEAT_MS = 30_000;        // never faster than this after ≥2 con
 const TR_BACKOFF_CAP_MS = 5 * 60_000;   // cap for computed backoff (and for non-retryable 4xx)
 const RETRY_AFTER_CAP_MS = 60 * 60_000; // never honour a Retry-After beyond an hour
 const MINT_TIMEOUT_MS = 20_000;         // < lock staleMs (60s), so a live holder never looks stale
+// startup-keepalive (after refresh-singleflight): Ekam keeps a 7-day SLIDING refresh idle limit, so a running
+// stdio shim keeps the refresh family alive from process start, not only after its first tool call. The first
+// keep-alive fires after a jittered delay in [MIN, MAX] (so N shims launched together don't stampede; the
+// lock + single-flight still make it one mint), unref'd so it never holds the process open.
+export const STARTUP_KEEPALIVE_MIN_MS = 3_000;
+export const STARTUP_KEEPALIVE_MAX_MS = 60_000;
+export function startupKeepAliveDelayMs(rand = Math.random, minMs = STARTUP_KEEPALIVE_MIN_MS, maxMs = STARTUP_KEEPALIVE_MAX_MS) {
+  return Math.floor(minMs + Math.max(0, maxMs - minMs) * rand());
+}
+// BUZZ_WIRE_STARTUP_KEEPALIVE=0|false|no|off opts out (back to "first refresh on the first tool call").
+export const wireStartupKeepAliveEnabled = (env) => !/^(0|false|no|off)$/i.test(String((env && env.BUZZ_WIRE_STARTUP_KEEPALIVE) ?? "").trim());
 export function wireInvalidGrantAttempts(env) {
   const n = parseInt(String((env && env.BUZZ_WIRE_INVALID_GRANT_ATTEMPTS) ?? "").trim(), 10);
-  return Number.isFinite(n) ? Math.min(10, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
+  return Number.isFinite(n) ? Math.min(WIRE_INVALID_GRANT_ATTEMPTS_MAX, Math.max(1, n)) : WIRE_INVALID_GRANT_ATTEMPTS_DEFAULT;
 }
 export function parseRetryAfter(v, nowMs = Date.now()) {
   const s = String(v ?? "").trim();
@@ -257,7 +314,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
   let accessExp = access ? Infinity : 0; // static token: valid until a 401 says otherwise
   let deadErr = (!refresh && dead0 && !staticTok) ? signInError(`refresh refused earlier (${dead0.reason || "invalid_grant"})`) : null;
   // a sibling process may already hold a fresh access token for this refresh → adopt, no mint at startup
-  if (!staticTok && refresh) adoptDiskAccess(false);
+  const adopted0 = !!(!staticTok && refresh && adoptDiskAccess(false));
 
   function adoptDiskAccess(force, rejected) {
     const acc = wireAccessGet(persistId);
@@ -279,7 +336,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
   function markDead(detail, reason) {
     deadErr = signInError(detail);
     refresh = null; access = staticTok; accessExp = staticTok ? Infinity : 0;
-    if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    clearTimers();
     return deadErr;
   }
   function cooldownError(st) {
@@ -294,9 +351,13 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
 
   // Single-flight + proactive keep-alive (v0.2.8). `inflightMint` dedupes in-process; the lock below
   // dedupes across processes. `renewTimer` refreshes at ~75% of the access token's life (unref'd).
-  let inflightMint = null, renewTimer = null;
-  function scheduleRenew() {
+  let inflightMint = null, renewTimer = null, startupTimer = null;
+  function clearTimers() {
     if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; }
+    if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
+  }
+  function scheduleRenew() {
+    clearTimers(); // a real renew supersedes the pending startup keep-alive
     if (!refresh || !isFinite(accessExp)) return; // need a refresh + a real expires_in to time a renew
     const delay = Math.max(30_000, Math.floor((accessExp - nowMs()) * 0.75)); // ~75% of remaining life
     renewTimer = setTimeout(() => { getToken(true).catch((e) => log(`wire keep-alive renew failed (will retry on next call): ${e.message}`)); }, delay);
@@ -305,7 +366,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
 
   // ONE locked attempt. Returns "ok" | "adopted" | {retryIn} (invalid_grant, attempts left). Throws otherwise.
   async function lockedAttempt(force, rejected) {
-    return withWireLock(persistId, async () => {
+    return withWireLock(persistId, async ({ owns }) => {
       // Re-read under the lock: another process may have rotated (or a fresh login landed).
       const d = wireRefreshGet(persistId);
       if (d && d !== refresh) { refresh = d; onDisk = true; if (adoptDiskAccess(force, rejected)) return "adopted"; }
@@ -320,6 +381,11 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
       if (st && nowMs() < st.nextAt) throw cooldownError(st);
 
       if (!clientId) throw new Error("wire mode: BUZZ_EKAM_CLIENT_ID required to mint a wire:sign token from a refresh");
+      // v0.2.37 (buzz_security must-fix 1): right before the POST, re-check that we STILL own the lock (our
+      // nonce) and that <id>.tok still holds the refresh we are about to send. If a racing breaker removed our
+      // lock, or a sibling rotated / a fresh login landed, do NOT POST — go round again (re-acquire, re-read).
+      const dNow = wireRefreshGet(persistId);
+      if (!owns() || (onDisk ? dNow !== refresh : (dNow && dNow !== refresh))) return { lost: true };
       // Minimal refresh body per ekam step ④ — scope stays wire:sign and resource stays
       // pinned to ISSUER from the ORIGINAL login grant; the endpoint rejects extra keys
       // (live: HTTP 400 "Unrecognized key: resource"), and refresh can only ever narrow,
@@ -327,7 +393,7 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
       let res, text;
       try {
         res = await fetchFn(`${base}/oauth/token`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
           body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, refresh_token: refresh }),
           signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(MINT_TIMEOUT_MS) : undefined,
         });
@@ -346,14 +412,16 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
         const label = `HTTP ${res.status}: ${detail}`;
         if (code && TERMINAL_OAUTH_ERRORS.has(code)) {
           const attempt = ((st && st.igAttempts) || 0) + 1;
-          if (attempt >= maxIgAttempts) {
+          // v0.2.37 (buzz_security must-fix 2): "replay detected" / "family revoked" can never recover — final now.
+          const finalNow = WIRE_FINAL_REFUSAL_RE.test(String(detail || ""));
+          if (finalNow || attempt >= maxIgAttempts) {
             const refused = refresh;
             wireRefreshClear(persistId, refused);
             wireStateClear(persistId);
             wireDeadSet(persistId, { at: new Date(nowMs()).toISOString(), reason: code, seed: envSeed ? tokFp(envSeed) : null });
             onDisk = true; // a tombstone now governs this id
-            log(`wire: Ekam refused the refresh (${code}) ${attempt}× — stored refresh cleared; sign in again (buzz_login / buzz-mcp-login)`);
-            throw markDead(`${label} (after ${attempt} attempt${attempt > 1 ? "s" : ""})`, code);
+            log(`wire: Ekam refused the refresh (${code}${finalNow ? ", final: replay / family revoked" : ""}) ${attempt}× — stored refresh cleared; sign in again (buzz_login / buzz-mcp-login)`);
+            throw markDead(`${label} (after ${attempt} attempt${attempt > 1 ? "s" : ""}${finalNow ? "; final" : ""})`, code);
           }
           const retryIn = invalidGrantBackoffMs(attempt, rand);
           wireStateSet(persistId, { rt: tokFp(refresh), failures: ((st && st.failures) || 0) + 1, igAttempts: attempt, nextAt: nowMs() + retryIn, last: code });
@@ -388,16 +456,44 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
     syncFromDisk();
     if (deadErr) throw deadErr;
     if (!refresh) throw new Error("wire mode: no refresh token to mint from (set BUZZ_WIRE_REFRESH from the one-time wire:sign login)");
+    let lost = 0;
     for (;;) {
       // persistent cooldown pre-check (no lock, no network) — survives restarts, shared by processes
       const st = liveState();
       if (st && nowMs() < st.nextAt) throw cooldownError(st);
       const r = await lockedAttempt(force, rejected);
       if (r === "ok" || r === "adopted") { scheduleRenew(); return; }
+      if (r && r.lost) { // lost the lock / .tok changed just before the POST: nothing was sent; re-acquire and re-read
+        if (++lost > 5) { const e = new Error("wire:sign token refresh: lost the refresh lock to another buzz-mcp process repeatedly — try again shortly"); e.transient = true; throw e; }
+        syncFromDisk();
+        if (deadErr) throw deadErr;
+        continue;
+      }
       // invalid_grant with attempts left: wait (outside the lock), then re-check disk and retry.
       log(`wire: Ekam refused the refresh (${r.label}); attempt ${r.attempt}/${maxIgAttempts}, retrying in ~${Math.ceil(r.retryIn / 1000)}s`);
       await sleep(r.retryIn);
       if (syncFromDisk() && adoptDiskAccess(force, rejected)) { wireStateClear(persistId); scheduleRenew(); return; }
+    }
+  }
+
+  // startup-keepalive: opt-in per provider (resolveSigner turns it on for the stdio wire signer only;
+  // hosted --http mode never builds this provider). Only with a STORED refresh (<id>.tok present, no
+  // tombstone, no static token) — never an env-only seed, never an interactive login. If a sibling's
+  // access token was adopted above, just time a normal renew off it (no mint now). Otherwise, after a
+  // jittered delay, ask for a token the normal way (getToken(false) → single-flight → cross-process
+  // lock → re-read/adopt under the lock), so N shims starting together cause ONE /oauth/token call.
+  // Failures are logged and fall back to on-demand, like the existing keep-alive.
+  const sk = opts.startupKeepAlive;
+  if (sk && !staticTok && refresh && onDisk && !deadErr) {
+    if (adopted0 && isFinite(accessExp)) scheduleRenew();
+    else {
+      const delay = typeof sk === "object" && Number.isFinite(sk.delayMs) ? sk.delayMs
+        : startupKeepAliveDelayMs(rand, sk.minMs ?? STARTUP_KEEPALIVE_MIN_MS, sk.maxMs ?? STARTUP_KEEPALIVE_MAX_MS);
+      startupTimer = setTimeout(() => {
+        startupTimer = null;
+        getToken(false).catch((e) => log(`wire startup keep-alive failed (will retry on next call): ${e.message}`));
+      }, delay);
+      if (startupTimer.unref) startupTimer.unref();
     }
   }
 
@@ -420,7 +516,8 @@ export function makeWireTokenProvider(env, fetchFn, opts = {}) {
     // but every sign fails fast with the sign-in prompt and Ekam is never called.
     needsSignIn: () => !!deadErr,
     get: getToken,
-    stopKeepAlive() { if (renewTimer) { clearTimeout(renewTimer); renewTimer = null; } }, // for clean shutdown/tests
+    stopKeepAlive() { clearTimers(); }, // renew + startup keep-alive timers; for clean shutdown/tests
+    keepAlivePending: () => ({ startup: !!startupTimer, renew: !!renewTimer }), // introspection for tests
   };
 }
 
@@ -1298,10 +1395,10 @@ export function kindNotAllowedMessage(kind, body) {
 //             400 kind_not_allowed, 503 escrow/Vault unavailable — {error,error_description}.
 //             (v0.2.32-pre) 400 kind_not_allowed → kindNotAllowedMessage(): refused kind + Ekam's allowed set.
 // Guarded to fail LOUD on any mismatch, so a wrong/unsigned event never passes silently.
-export async function wireSign(base, token, template, fetchFn = fetch) {
+export async function wireSign(base, token, template, fetchFn = fetch, { hosted = false } = {}) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "User-Agent": shimUserAgent({ hosted }) },
     // {event:{...}} envelope; kind/tags/content ONLY — server stamps created_at and
     // fills pubkey/id/sig from the escrowed wire key.
     body: JSON.stringify({ event: { kind: template.kind, tags: template.tags || [], content: template.content ?? "" } }),
@@ -1359,14 +1456,18 @@ export async function resolveSigner(opts = {}) {
     const pubkey = normalizePubkey(env.BUZZ_USER_PUBKEY) || wirePubkeyGet(wirePersistId(env));
     if (!pubkey)
       throw new Error("buzz-mcp: wire mode has no user identity yet — run the one-time login (it captures your pubkey), or set BUZZ_USER_PUBKEY.");
-    const tokens = makeWireTokenProvider(env, fetchFn);
+    // stdio wire signer: keep the refresh family alive from process start (Ekam 7-day sliding idle limit).
+    // BUZZ_WIRE_STARTUP_KEEPALIVE=0 turns it off; opts.wireTokenOpts is a test seam (timing/log only).
+    const wto = opts.wireTokenOpts || {};
+    const tokens = makeWireTokenProvider(env, fetchFn, { ...wto, startupKeepAlive: wireStartupKeepAliveEnabled(env) ? (wto.startupKeepAlive ?? true) : false });
     if (!tokens.hasRefresh() && !tokens.hasStatic() && !tokens.needsSignIn())
       throw new Error("buzz-mcp: wire mode needs BUZZ_WIRE_REFRESH (+BUZZ_EKAM_CLIENT_ID) from the one-time wire:sign login, or a static BUZZ_EKAM_HUMAN_TOKEN — refusing to start.");
     return {
       mode: "wire",
       pubkey,
       canSign: (kind) => WIRE_ALLOWLIST.has(kind) && !NEVER_SIGN.has(kind),
-      wipe() { /* wire mode holds no key */ },
+      wipe() { tokens.stopKeepAlive(); /* wire mode holds no key; stop the keep-alive timers on shutdown */ },
+      keepAlivePending: () => tokens.keepAlivePending(), // introspection for tests
       // v0.2.33: no encrypt-to-self in wire mode — the user's key is escrowed at Ekam and Ekam offers
       // no NIP-44 endpoint, so NIP-44 features (read state, private saved items) are agent-mode only.
       selfCipher: null,
@@ -1487,10 +1588,10 @@ export function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = 
       let ev;
       // 403 (bare / "forbidden") or a not-provisioned code → the one friendly message; anything else unchanged.
       const mapped = (e) => (e && isBuzzAppSigninError({ status: e.status, error: e.ekamError === "forbidden" ? null : e.ekamError }) ? buzzAppSigninError(e) : hostedWireError(e, template.kind));
-      try { ev = await wireSign(base, await getToken(false), template, fetchFn); }
+      try { ev = await wireSign(base, await getToken(false), template, fetchFn, { hosted: true }); }
       catch (e) {
         if (e.status !== 401) throw mapped(e);
-        try { ev = await wireSign(base, await getToken(true), template, fetchFn); } // one forced re-exchange
+        try { ev = await wireSign(base, await getToken(true), template, fetchFn, { hosted: true }); } // one forced re-exchange
         catch (e2) { throw mapped(e2); }
       }
       if (String(ev.pubkey).toLowerCase() !== pk)
@@ -1504,7 +1605,7 @@ export function makeHostedWireSigner({ pubkey, getToken, base, fetch: fetchFn = 
 // for a non-routable URL and read the pubkey off the signed event (same probe as wirelogin.mjs).
 // The event is never sent anywhere.
 export async function probeWirePubkey(base, token, fetchFn = fetch) {
-  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn);
+  const ev = await wireSign(base, token, { kind: 27235, tags: [["u", `${base}/whoami`], ["method", "GET"], ["payload", ""]], content: "" }, fetchFn, { hosted: true });
   const pk = normalizePubkey(ev.pubkey);
   if (!pk) throw new Error("wire-sign probe returned no usable pubkey");
   return pk;

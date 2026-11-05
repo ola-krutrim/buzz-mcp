@@ -82,6 +82,14 @@ function openUrlCommand(url, platform = process.platform) {
   return { cmd: "xdg-open", args: [href] };
 }
 
+// clientversion.mjs
+var SHIM_VERSION = "0.2.37";
+function shimUserAgent({ hosted = false } = {}) {
+  const node = typeof process !== "undefined" && process.versions && process.versions.node || "unknown";
+  const plat = typeof process !== "undefined" && process.platform || "unknown";
+  return `buzz-mcp/${SHIM_VERSION}${hosted ? " hosted" : ""} (node/${node}; ${plat})`;
+}
+
 // node_modules/@noble/hashes/utils.js
 function isBytes(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
@@ -2616,10 +2624,10 @@ function kindNotAllowedMessage(kind, body) {
   const what = allowed ? `it currently allows {${allowed.join(", ")}}` : `it didn't say which kinds it allows${desc ? ` (Ekam said: "${echo(desc)}")` : ""}`;
   return `Ekam (your signing service) doesn't sign kind ${kind} yet; ${what}. Ask the Ekam owner to add it, or use an agent's own key. (wire-sign HTTP 400 kind_not_allowed)`;
 }
-async function wireSign(base, token, template, fetchFn = fetch) {
+async function wireSign(base, token, template, fetchFn = fetch, { hosted = false } = {}) {
   const res = await fetchFn(`${base}/v1/me/wire-sign`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "User-Agent": shimUserAgent({ hosted }) },
     // {event:{...}} envelope; kind/tags/content ONLY — server stamps created_at and
     // fills pubkey/id/sig from the escrowed wire key.
     body: JSON.stringify({ event: { kind: template.kind, tags: template.tags || [], content: template.content ?? "" } })
@@ -2682,7 +2690,7 @@ function authorizeUrl(base, { clientId, redirectUri, challenge: challenge2, stat
 async function exchangeAuthCode(base, { code, verifier, clientId, redirectUri }, fetchFn = fetch) {
   const res = await fetchFn(`${base}/oauth/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
     body: JSON.stringify({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri })
   });
   const text = await res.text();
@@ -2779,7 +2787,7 @@ ${url}
         console.error(`[wire-login] (pubkey auto-capture skipped: ${e.message} \u2014 set BUZZ_USER_PUBKEY if needed)`);
       }
       try {
-        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}`, "User-Agent": shimUserAgent() } });
         if (wk.ok) {
           const kj = await wk.json().catch(() => null);
           if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name));

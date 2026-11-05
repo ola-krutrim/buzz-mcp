@@ -7,7 +7,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 import * as nip19 from "nostr-tools/nip19";
 import { resolveSigner, BUZZ_APP_SIGNIN_MESSAGE, BUZZ_APP_SIGNIN_RE, reactionTemplate, addMemberTemplate, removeMemberTemplate, deleteMessageTemplate, blossomAuthTemplate, buildImeta, parseImeta, messageAttachments, classifyAttachment, attachmentDisplayName, attachmentContentLine, checkDescriptorMime, parseMediaShaExt, MEDIA_MB, wireNameGet, wirePersistId, ekamBase, wireRefreshGet, wireRefreshSet, wirePubkeyGet, wirePubkeySet, wireNameSet, wireSign, DEFAULT_EKAM_CLIENT_ID, WIRE_REFRESH_DIR, EKAM_REFUSED_BY_DESIGN, NEVER_SIGN } from "./signer.mjs";
 import { IDENTITY_DIR } from "./loadkey_v2.mjs";
-import { pickAdvertised, clientVersionStatus } from "./clientversion.mjs";
+import { pickAdvertised, clientVersionStatus, SHIM_VERSION as SHIM_VERSION_SRC, shimUserAgent } from "./clientversion.mjs";
 import { NAME_INVIS, BIDI_CONTROL, CHANNEL_NAME_FORBIDDEN, CASE_ONLY_IS_AMBIGUOUS, foldName, stripVariationSelectors, matchProfiles, emailError, looksLikeEmail, archivedFromEvents, isPubkeyHex, assertPTags, mentionTokens, resolveMentions, MENTION_MAX_TOKENS, matchChannel, quoteLabel } from "./names.mjs";
 import { verifyEvent } from "nostr-tools/pure";
 // v0.2.31 best-practice guards (each unit-tested in safety.test.mjs).
@@ -17,7 +17,7 @@ import {
   createWriteGuard, writeLimitFromEnv, scrubKeyEnv, minimalChildEnv,
   openUrlCommand, clampLimit, validateArgs, inboundMode, screenInbound,
 } from "./safety.mjs";
-export const SHIM_VERSION_EXPORT = "0.2.36"; // keep in sync with package.json
+export const SHIM_VERSION_EXPORT = SHIM_VERSION_SRC; // single source: clientversion.mjs (keep in sync with package.json)
 const ERROR_TEXT_CAP = 1500; // v0.2.31 re-check: catch-all error text cap (code points)
 import { AsyncLocalStorage } from "node:async_hooks";
 // v0.2.32 Slack-parity helpers (message links, search dates, dry-run previews, open-channel
@@ -976,7 +976,7 @@ async function resolveEmail(email) {
   if (signer.mode !== "wire" || typeof signer.ekamToken !== "function")
     throw new Error(`email addressing needs wire mode ("post as me") — pass an npub, hex pubkey, or exact display name instead`);
   const base = (signer.ekamBase ? signer.ekamBase() : (ENV.BUZZ_EKAM_BASE || "https://ekam.olakrutrim.com")).replace(/\/+$/, "");
-  const res = await fetch(`${base}/v1/directory/resolve?email=${encodeURIComponent(email)}`, { headers: { Authorization: `Bearer ${await signer.ekamToken()}` } });
+  const res = await fetch(`${base}/v1/directory/resolve?email=${encodeURIComponent(email)}`, { headers: { Authorization: `Bearer ${await signer.ekamToken()}`, "User-Agent": shimUserAgent({ hosted: !!signer.hosted }) } });
   const text = await res.text();
   if (res.ok) {
     let j; try { j = JSON.parse(text); } catch { throw new Error(`directory resolve returned non-JSON: ${text.slice(0, 120)}`); }
@@ -2735,7 +2735,7 @@ async function callTool(req) {
           } catch { /* pubkey auto-capture best-effort — BUZZ_USER_PUBKEY remains the fallback */ }
           // capture the person's display name (ekam #335: GET /v1/me/wire-key → name) best-effort
           try {
-            const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+            const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}`, "User-Agent": shimUserAgent() } });
             if (wk.ok) { const kj = await wk.json().catch(() => null); if (kj && kj.name) wireNameSet(persistId, String(kj.name)); }
           } catch { /* name is a nicety; the auto-handle remains the fallback */ }
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });

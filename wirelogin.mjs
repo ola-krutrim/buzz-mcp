@@ -17,6 +17,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { openUrlCommand, minimalChildEnv } from "./safety.mjs";
+import { shimUserAgent } from "./clientversion.mjs";
 import { ekamBase, wireRefreshSet, wirePersistId, wirePubkeySet, wireNameSet, wireBleedVars, wireSign, DEFAULT_EKAM_CLIENT_ID } from "./signer.mjs";
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -47,7 +48,7 @@ export function authorizeUrl(base, { clientId, redirectUri, challenge, state, re
 export async function exchangeAuthCode(base, { code, verifier, clientId, redirectUri }, fetchFn = fetch) {
   const res = await fetchFn(`${base}/oauth/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": shimUserAgent() },
     body: JSON.stringify({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri }),
   });
   const text = await res.text();
@@ -126,7 +127,7 @@ if (__entry === fileURLToPath(import.meta.url) && /wirelogin\.mjs$/.test(__entry
       // Capture the person's display name (ekam #335: /v1/me/wire-key returns `name`), so the
       // shim shows the human's name instead of an auto-handle. Best-effort; login still succeeds.
       try {
-        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}` } });
+        const wk = await fetch(`${base}/v1/me/wire-key`, { headers: { authorization: `Bearer ${tok.access_token}`, "User-Agent": shimUserAgent() } });
         if (wk.ok) { const kj = await wk.json().catch(() => null); if (kj && kj.name) wireNameSet(wirePersistId(env), String(kj.name)); }
       } catch { /* name is a nicety; the auto-handle remains the fallback */ }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
