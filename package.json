@@ -45,7 +45,7 @@
   "devDependencies": {
     "esbuild": "^0.28.2",
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "nostr-tools": "^2.25.4",
+    "nostr-tools": "^2.26.0",
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0"
